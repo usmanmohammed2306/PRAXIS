@@ -128,6 +128,8 @@ class ValenceAgent(Agent):
         total_cost: float = 0.0
         done = False
         step_error: str = ""
+        consecutive_compile_failures = 0
+        MAX_COMPILE_FAILURES = 3
 
         for step in range(max_num_steps):
             remaining = max_num_steps - step
@@ -165,33 +167,56 @@ class ValenceAgent(Agent):
             raw_text = (msg.content or "").strip()
             messages.append({"role": "assistant", "content": raw_text})
 
-            action_id = kernel.parse_choice(raw_text)
+            action_id, free_args = kernel.parse_choice_full(raw_text)
             kernel.ingest_assistant_choice(action_id or "", raw=raw_text)
-            compiled = kernel.compile_action(action_id)
+            compiled = kernel.compile_action(action_id, free_args=free_args)
 
-            # Fail-closed fallback: if no valid action chosen, force a
-            # final/respond with whatever short text the model produced.
+            # Fail-closed: invalid / non-executable choice. Do NOT terminate
+            # by routing the raw JSON as a user-facing respond — that destroys
+            # the trajectory. Instead, append a hint and retry. After
+            # MAX_COMPILE_FAILURES consecutive misses, finalize with a generic
+            # message so we don't burn the entire step budget.
             if compiled is None:
-                content = raw_text[:RESPOND_MAX_CHARS] if raw_text else \
-                    "Unable to determine a verified next step."
-                try:
-                    env_resp = env.step(Action(name=RESPOND_TOOL_NAME,
-                                               kwargs={"content": content}))
-                except Exception as env_exc:
-                    if _is_context_overflow(env_exc):
-                        step_error = f"env_respond_context_overflow: {env_exc}"
+                consecutive_compile_failures += 1
+                if consecutive_compile_failures >= MAX_COMPILE_FAILURES:
+                    try:
+                        env_resp = env.step(Action(
+                            name=RESPOND_TOOL_NAME,
+                            kwargs={"content": (
+                                "I'm unable to determine a verified next step "
+                                "for this request. Could you clarify or "
+                                "provide additional details (e.g., order ID)?"
+                            )},
+                        ))
+                    except Exception as env_exc:
+                        if _is_context_overflow(env_exc):
+                            step_error = f"env_respond_context_overflow: {env_exc}"
+                            break
+                        raise
+                    user_reply = _obs_text(env_resp)
+                    if user_reply:
+                        messages.append({"role": "user", "content": user_reply})
+                        kernel.ingest_user_message(user_reply)
+                    reward = _float(getattr(env_resp, "reward", reward), reward)
+                    info = getattr(env_resp, "info", info) or info
+                    done = bool(getattr(env_resp, "done", False))
+                    consecutive_compile_failures = 0
+                    if done:
                         break
-                    raise
-                user_reply = _obs_text(env_resp)
-                if user_reply:
-                    messages.append({"role": "user", "content": user_reply})
-                    kernel.ingest_user_message(user_reply)
-                reward = _float(getattr(env_resp, "reward", reward), reward)
-                info = getattr(env_resp, "info", info) or info
-                done = bool(getattr(env_resp, "done", False))
-                if done:
-                    break
+                    continue
+                # Soft retry: nudge the model with a clarifying instruction.
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[VALENCE] Your previous response was not a valid "
+                        "menu choice. Reply with ONLY JSON like "
+                        "{\"action_id\":\"A1\"} (optionally include "
+                        "\"args\":{...} for read/search params marked "
+                        "'you fill')."
+                    ),
+                })
                 continue
+            consecutive_compile_failures = 0
 
             # Validate (mutations gated; non-mutations pass through).
             vr = kernel.validate_mutation(compiled)
@@ -220,8 +245,17 @@ class ValenceAgent(Agent):
             })
 
             if compiled.kind == "final" or compiled.tool_name == RESPOND_TOOL_NAME:
-                content = raw_text[:RESPOND_MAX_CHARS] if raw_text else \
-                    "Final answer."
+                # Prefer a model-supplied final_text/content; never echo the
+                # raw `{"action_id":...}` JSON as the user-facing reply.
+                final_text = ""
+                for k in ("final_text", "content", "message", "text", "answer"):
+                    v = (free_args or {}).get(k) if free_args else None
+                    if isinstance(v, str) and v.strip():
+                        final_text = v.strip()
+                        break
+                if not final_text:
+                    final_text = "Is there anything else I can help you with?"
+                content = final_text[:RESPOND_MAX_CHARS]
                 try:
                     env_resp = env.step(Action(name=RESPOND_TOOL_NAME,
                                                kwargs={"content": content}))

@@ -60,6 +60,10 @@ class Affordance:
     arguments: Dict[str, Any] = field(default_factory=dict)
     argument_refs: Dict[str, str] = field(default_factory=dict)  # arg -> handle_id / "user_text"
     missing_requirements: List[str] = field(default_factory=list)
+    # Params the model is allowed to supply free-form (non-mutation only).
+    # Restricted to string-typed params with no schema enum and no typed-handle hint.
+    free_form_params: List[str] = field(default_factory=list)
+    param_schema: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     provenance: Dict[str, Any] = field(default_factory=dict)
     is_executable: bool = True
 
@@ -193,18 +197,23 @@ def build_affordances(*, tool_schemas: List[Dict[str, Any]],
         bound: Dict[str, Any] = {}
         refs: Dict[str, str] = {}
         missing: List[str] = []
+        free_form: List[str] = []
 
         for p in required:
             prop = props.get(p, {})
             res = _bind_param(p, prop, handles, user_text_handles)
             if res is None:
-                # For read/search, allow unbound non-typed params (the
-                # model is asked to select the action; the kernel will
-                # leave the param empty if no handle exists). We still
-                # record it as "missing" so the menu shows the gap, but
-                # mark non-mutations executable when at least one bound
-                # arg exists or the schema allows empty params.
                 missing.append(p)
+                # A param is "free-form fillable" when it's a string with no
+                # schema enum and no typed-handle hint — the model may supply
+                # it for read/search/ask. Mutations always require a handle.
+                pname = p.lower()
+                ptype = (prop or {}).get("type") if isinstance(prop, dict) else None
+                penum = (prop or {}).get("enum") if isinstance(prop, dict) else None
+                if (pname not in _PARAM_TYPE_HINT
+                        and not penum
+                        and (ptype in (None, "string"))):
+                    free_form.append(p)
                 continue
             value, ref, _h = res
             bound[p] = value
@@ -212,25 +221,30 @@ def build_affordances(*, tool_schemas: List[Dict[str, Any]],
 
         # Sub-kind decided by tool prefix and binding state.
         if kind_class == "mutation":
+            # Mutations: every required arg must come from a handle.
             executable = (len(missing) == 0)
             kind = "mutation"
+            free_form = []  # never allow free-form on mutations
         elif name == respond_tool_name or name in _NEUTRAL_TOOLS:
             kind = "final" if name == respond_tool_name else "ask"
             executable = True
         else:
-            # read / search
+            # read / search / lookup
             kind = "search" if name.startswith(("search_", "find_", "lookup_")) else "read"
-            # Read/search are executable when *all* required typed params bind
-            # OR when the missing params are free-form strings we leave empty.
-            # Simpler rule: executable iff every required param is bound.
-            executable = (len(missing) == 0)
+            # Executable iff every missing required param is free-form fillable
+            # (the model will supply it via the choice JSON). This unblocks
+            # information-gathering tools that need a query string the user
+            # only described in natural language (e.g. "black jacket").
+            unfilled = [p for p in missing if p not in free_form]
+            executable = (len(unfilled) == 0)
 
         sig = _sig(name, bound)
         if executable and kind == "mutation" and sig in executed:
             # Duplicate mutation suppression at the menu level.
             continue
 
-        display = _format_display(kind, name, bound, missing, _short_desc(schema))
+        display = _format_display(kind, name, bound, missing, _short_desc(schema),
+                                  free_form=free_form)
         out.append(Affordance(
             action_id=next_id(),
             kind=kind,
@@ -239,6 +253,8 @@ def build_affordances(*, tool_schemas: List[Dict[str, Any]],
             arguments=bound,
             argument_refs=refs,
             missing_requirements=missing,
+            free_form_params=list(free_form),
+            param_schema={p: props.get(p, {}) for p in required},
             provenance={"binding": dict(refs), "remaining_steps": remaining_steps},
             is_executable=executable,
         ))
@@ -264,16 +280,19 @@ def _sig(name: str, kwargs: Dict[str, Any]) -> str:
 
 
 def _format_display(kind: str, name: str, bound: Dict[str, Any],
-                    missing: List[str], desc: str) -> str:
-    if not bound and not missing:
-        argsig = ""
-    elif missing and not bound:
-        argsig = f"(missing: {', '.join(missing)})"
-    elif missing:
-        bound_str = ", ".join(f"{k}={bound[k]}" for k in bound)
-        argsig = f"({bound_str}; missing: {', '.join(missing)})"
-    else:
-        argsig = "(" + ", ".join(f"{k}={bound[k]}" for k in bound) + ")"
+                    missing: List[str], desc: str,
+                    free_form: Optional[List[str]] = None) -> str:
+    free_form = free_form or []
+    needed = [p for p in missing if p not in free_form]
+    fillable = [p for p in missing if p in free_form]
+    parts: List[str] = []
+    if bound:
+        parts.append(", ".join(f"{k}={bound[k]}" for k in bound))
+    if fillable:
+        parts.append("you fill: " + ", ".join(fillable))
+    if needed:
+        parts.append("missing: " + ", ".join(needed))
+    argsig = "(" + "; ".join(parts) + ")" if parts else ""
     head = {"read": "read", "search": "search", "ask": "ask",
             "mutation": "mutation", "final": "final"}.get(kind, kind)
     base = f"{head}: {name}{argsig}"

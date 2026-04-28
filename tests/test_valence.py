@@ -286,10 +286,51 @@ class TestUngroundedRejection(unittest.TestCase):
         self.assertIsNone(k.compile_action(cancel.action_id))
 
 
+class TestReadSearchFreeForm(unittest.TestCase):
+    """Read/search tools must be executable even when their free-form string
+    args (e.g. ``query``) have no typed handle — the model supplies them via
+    the choice-JSON ``args`` field. Mutations remain handle-only."""
+
+    def test_search_with_free_form_query_is_executable(self):
+        k = AffordanceKernel()
+        k.ingest_user_message("I want a black jacket")
+        affs = k.build_affordances([SEARCH_ITEMS], remaining_steps=10)
+        k.render_menu(affs, k=8, remaining_steps=10)
+        search = next(a for a in affs if a.tool_name == "search_items")
+        self.assertTrue(search.is_executable,
+                        "search_items must be executable with free-form query")
+        self.assertIn("query", search.free_form_params)
+        # Compile with a model-supplied query.
+        compiled = k.compile_action(search.action_id,
+                                    free_args={"query": "black jacket"})
+        self.assertIsNotNone(compiled)
+        self.assertEqual(compiled.kwargs.get("query"), "black jacket")
+
+    def test_mutation_ignores_model_free_form_args(self):
+        # Even if the model tries to supply args for a mutation, only handle
+        # values count. cancel_order with no order_id handle stays unexecutable.
+        k = AffordanceKernel()
+        k.ingest_user_message("please cancel my order")
+        affs = k.build_affordances([CANCEL_ORDER], remaining_steps=10)
+        k.render_menu(affs, k=8, remaining_steps=10)
+        cancel = next(a for a in affs if a.tool_name == "cancel_order")
+        self.assertFalse(cancel.is_executable)
+        self.assertEqual(cancel.free_form_params, [])
+        compiled = k.compile_action(cancel.action_id,
+                                    free_args={"order_id": "O9999"})
+        self.assertIsNone(compiled)
+
+    def test_choice_parser_extracts_args(self):
+        aid, args = AffordanceKernel.parse_choice_full(
+            '{"action_id":"A4","args":{"query":"black jacket"}}')
+        self.assertEqual(aid, "A4")
+        self.assertEqual(args.get("query"), "black jacket")
+
+
 class TestTinyPrompt(unittest.TestCase):
     def test_tiny_prompt_is_compact(self):
         # Tiny prompt: no theory, no chain-of-thought directive.
-        self.assertLess(len(TINY_SYSTEM_PROMPT), 400)
+        self.assertLess(len(TINY_SYSTEM_PROMPT), 600)
         self.assertIn("action_id", TINY_SYSTEM_PROMPT)
         self.assertNotIn("Think step", TINY_SYSTEM_PROMPT)
 
