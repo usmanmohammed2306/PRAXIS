@@ -33,21 +33,24 @@ from .transaction import CompiledAction, TransactionValidator, ValidationResult
 # Compact tiny prompt — never embed VALENCE theory.
 TINY_SYSTEM_PROMPT = (
     "You must choose exactly one verified action_id from the menu. "
-    "Do not invent tool arguments. If no executable mutation is available, "
-    "choose read/search/ask/final. Return only JSON: {\"action_id\":\"A1\"}."
+    "For mutation actions, do not invent arguments — they are pre-bound. "
+    "For read/search actions whose menu line says 'you fill: X', supply X "
+    "in an optional \"args\" object; otherwise omit args. "
+    "If no executable mutation is available, choose read/search/ask/final. "
+    "Return only JSON: {\"action_id\":\"A1\"} "
+    "or {\"action_id\":\"A4\",\"args\":{\"query\":\"black jacket\"}}."
 )
 
 
-_JSON_OBJ_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+_JSON_OBJ_RE = re.compile(r"\{(?:[^{}]|\{[^{}]*\})*\}", re.DOTALL)
 
 
-def _extract_action_id(text: str) -> Optional[str]:
+def _extract_choice(text: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Return (action_id, args_dict). args is empty if not provided."""
     if not text:
-        return None
+        return None, {}
     s = text.strip()
-    # Strip code fences
     s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.IGNORECASE | re.MULTILINE)
-    # Try direct JSON parse first.
     for candidate in (s,) + tuple(_JSON_OBJ_RE.findall(s)):
         try:
             obj = json.loads(candidate)
@@ -56,10 +59,16 @@ def _extract_action_id(text: str) -> Optional[str]:
         if isinstance(obj, dict):
             aid = obj.get("action_id") or obj.get("id") or obj.get("action")
             if isinstance(aid, str) and aid:
-                return aid.strip()
-    # Last resort: regex for An token.
+                args = obj.get("args") or obj.get("arguments") or {}
+                if not isinstance(args, dict):
+                    args = {}
+                return aid.strip(), args
     m = re.search(r"\bA\d+\b", s)
-    return m.group(0) if m else None
+    return (m.group(0) if m else None), {}
+
+
+def _extract_action_id(text: str) -> Optional[str]:
+    return _extract_choice(text)[0]
 
 
 @dataclass
@@ -167,7 +176,13 @@ class AffordanceKernel:
     def parse_choice(model_response: str) -> Optional[str]:
         return _extract_action_id(model_response)
 
-    def compile_action(self, action_id: Optional[str]) -> Optional[CompiledAction]:
+    @staticmethod
+    def parse_choice_full(model_response: str) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Parse both action_id and any model-supplied free-form args."""
+        return _extract_choice(model_response)
+
+    def compile_action(self, action_id: Optional[str],
+                       free_args: Optional[Dict[str, Any]] = None) -> Optional[CompiledAction]:
         """Compile a model-chosen action_id into a CompiledAction.
 
         Hallucinated IDs (not present in the rendered menu) cannot compile.
@@ -183,11 +198,31 @@ class AffordanceKernel:
         if not aff.is_executable:
             self.stats.compile_failures += 1
             return None
+        kwargs = dict(aff.arguments)
+        refs = dict(aff.argument_refs)
+        # Merge model-supplied free-form args ONLY for non-mutation actions
+        # AND ONLY for params declared free-form by the lattice. Mutation
+        # invariant is preserved: their kwargs come exclusively from handles.
+        if free_args and aff.kind != "mutation":
+            for p in aff.free_form_params:
+                if p in free_args and free_args[p] is not None:
+                    val = free_args[p]
+                    if not isinstance(val, str):
+                        try:
+                            val = str(val)
+                        except Exception:
+                            continue
+                    val = val.strip()
+                    if not val:
+                        continue
+                    # Cap size to keep tau-bench tool args sane.
+                    kwargs[p] = val[:200]
+                    refs[p] = "model_free_form"
         compiled = CompiledAction(
             action_id=aff.action_id,
             tool_name=aff.tool_name or self.respond_tool_name,
-            kwargs=dict(aff.arguments),
-            argument_refs=dict(aff.argument_refs),
+            kwargs=kwargs,
+            argument_refs=refs,
             kind=aff.kind,
         )
         return compiled

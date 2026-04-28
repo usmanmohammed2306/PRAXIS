@@ -74,12 +74,24 @@ def run_valence(
             raw_text = (msg.content or "").strip()
             messages.append({"role": "assistant", "content": raw_text})
 
-            action_id = kernel.parse_choice(raw_text)
+            action_id, free_args = kernel.parse_choice_full(raw_text)
             kernel.ingest_assistant_choice(action_id or "", raw=raw_text)
-            compiled = kernel.compile_action(action_id)
+            compiled = kernel.compile_action(action_id, free_args=free_args)
             if compiled is None:
-                # No valid action — finalize.
-                break
+                # Soft retry with a hint; only break after 3 consecutive misses.
+                _ace_consec = locals().get("_ace_consec", 0) + 1
+                if _ace_consec >= 3:
+                    break
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[VALENCE] Your previous response was not a valid "
+                        "menu choice. Reply with ONLY JSON like "
+                        "{\"action_id\":\"A1\"}."
+                    ),
+                })
+                continue
+            _ace_consec = 0
 
             vr = kernel.validate_mutation(compiled)
             if not vr.ok:

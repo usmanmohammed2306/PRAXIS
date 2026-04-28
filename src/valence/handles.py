@@ -43,13 +43,15 @@ class Handle:
 # Conservative patterns. False positives are tolerable for search/read; only
 # mutation kwargs require typed-handle binding, and the schema-driven minting
 # from tool observations is the primary source for those.
-_RE_ORDER = re.compile(r"\b(?:order[_ -]?#?\s*)?(#?[Oo]\d{4,})\b")
-_RE_RESERVATION = re.compile(r"\b(?:reservation[_ -]?#?\s*)?(#?[Rr]\d{4,})\b")
-_RE_BOOKING = re.compile(r"\b(?:booking[_ -]?#?\s*)?(#?[Bb]\d{4,})\b")
+_RE_ORDER = re.compile(r"\b(?:order[_ -]?#?\s*)?(#?[Oo]\d{3,})\b")
+_RE_RESERVATION = re.compile(r"\b(?:reservation[_ -]?#?\s*)?(#?[Rr]\d{3,})\b")
+_RE_BOOKING = re.compile(r"\b(?:booking[_ -]?#?\s*)?(#?[Bb]\d{3,})\b")
 _RE_USER = re.compile(r"\b([a-z]+_[a-z]+_\d{1,6})\b")  # tau-bench user_id pattern
 _RE_EMAIL = re.compile(r"\b([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})\b")
 _RE_MONEY = re.compile(r"\$\s?(\d+(?:\.\d{1,2})?)")
 _RE_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+# Quoted spans become generic string handles — useful for search queries.
+_RE_QUOTED = re.compile(r"[\"“‘']([^\"”’']{2,80})[\"”’']")
 
 
 def _strip(token: str) -> str:
@@ -93,6 +95,16 @@ def mint_handles_from_user_text(text: str, event_id: str,
             source_path=f"user_text[{m.start()}:{m.end()}]",
             confidence=CONF_EXACT,
             provenance={"source": "user_text", "literal": m.group(0)},
+        ))
+    for m in _RE_QUOTED.finditer(s):
+        out.append(Handle(
+            handle_id=next_id.next("string"),
+            type="string",
+            value=m.group(1),
+            source_event_id=event_id,
+            source_path=f"user_text[{m.start()}:{m.end()}]",
+            confidence=CONF_EXACT,
+            provenance={"source": "user_text", "kind": "quoted"},
         ))
     for m in _RE_DATE.finditer(s):
         out.append(Handle(
