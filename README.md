@@ -138,8 +138,52 @@ same model across every condition.
 
 ```bash
 bash setup_env.sh
-bash run_project.sh
+bash run_project.sh                       # auto-detect GPUs, pick sensible defaults
 ```
+
+By default, `run_project.sh` detects available GPUs and picks a model
+tier and a workload profile to match. Override anything you like via
+flags (also accepted as environment variables — run `bash run_project.sh
+--help` for the full reference):
+
+```bash
+# Just sanity-check the resolved configuration without running anything:
+bash run_project.sh --dry-run
+
+# 1 GPU, smaller model, tiny sweep (~10–15 min):
+bash run_project.sh --gpus 0 --model 7b --profile smoke
+
+# 2 GPUs, 32B with TP=2, full 15h-budget sweep:
+bash run_project.sh --gpus 0,1 --model 32b --profile full
+
+# Run only τ-bench retail with just CARGO + ReAct, skip ACEBench:
+bash run_project.sh --tau-only retail --controllers react,cargo --skip-acebench
+
+# Fine overrides (take precedence over the profile):
+bash run_project.sh --gpus 0,1 --tau-tasks 20 --tau-trials 2 --max-concurrency 16
+```
+
+### Auto-selected defaults
+
+| Detected GPUs | `--model auto` picks | Notes |
+|---:|---|---|
+| 1 | `7b` (Qwen2.5-7B-Instruct) | TP=1, primary `max_model_len=16384` |
+| ≥ 2 | `32b` (Qwen2.5-32B-Instruct) → 7B fallback | TP=count, primary `max_model_len=12288` |
+
+### Workload profiles
+
+| `--profile` | tasks/env | trials | ACE limit | concurrency | rough wall-clock |
+|---|---:|---:|---:|---:|---|
+| `smoke` | 5 | 1 | 5 | 2 | ~10–15 min |
+| `small` | 15 | 3 | 15 | 4 | ~1–2 h |
+| `medium` (default) | 30 | 3 | 20 | 4 | ~3–6 h |
+| `full` | 50 | 4 | 40 | 8 | ~8–14 h |
+
+`--max-concurrency` is doubled automatically when ≥ 2 GPUs are present
+(vLLM batches across replicas, so higher concurrency fills the GPUs
+without extra Python overhead). Per-knob CLI flags (`--tau-tasks`,
+`--tau-trials`, `--ace-limit`, `--max-concurrency`, `--max-model-len`,
+`--gpu-mem-util`) take precedence over the profile.
 
 Outputs:
 
