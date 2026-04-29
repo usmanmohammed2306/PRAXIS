@@ -21,6 +21,26 @@
 # Produces outputs/summary/{summary.json,summary.md}.
 #
 # The venv created by setup_env.sh must already exist.
+#
+# Usage examples
+# --------------
+#   bash run_project.sh                       # auto-detect GPUs and use sensible defaults
+#   bash run_project.sh --gpus 0              # force 1-GPU mode
+#   bash run_project.sh --gpus 0,1            # force 2-GPU tensor-parallel mode
+#   bash run_project.sh --model 7b            # smaller model (1-GPU friendly)
+#   bash run_project.sh --model 32b           # 32B (recommended on 2× GPUs)
+#   bash run_project.sh --profile smoke       # tiny sanity sweep (~10–15 min)
+#   bash run_project.sh --profile small       # 15 tasks × 3 trials (~1–2 h)
+#   bash run_project.sh --profile medium      # 30 tasks × 3 trials (~3–6 h)  [default]
+#   bash run_project.sh --profile full        # 50 tasks × 4 trials (~8–14 h, full 15h budget)
+#   bash run_project.sh --tau-tasks 20 --tau-trials 2 --ace-limit 10
+#   bash run_project.sh --controllers baseline,react,cargo --skip-acebench
+#   bash run_project.sh --tau-only retail --controllers cargo
+#   bash run_project.sh --dry-run             # print resolved config and exit
+#
+# Run `bash run_project.sh --help` for the full flag reference. Every CLI
+# flag also has an environment-variable equivalent (see --help) so the
+# script is friendly to job schedulers that prefer env vars over argv.
 # ============================================================================
 set -euo pipefail
 
@@ -28,6 +48,261 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
 log() { echo "[run] $*"; }
+
+# ---------------------------------------------------------------------------
+# CLI argument parsing
+#
+# All flags also accept an environment-variable form. Precedence is:
+#     CLI flag > environment variable > built-in default.
+# ---------------------------------------------------------------------------
+print_help() {
+  cat <<'HELP'
+Usage: bash run_project.sh [OPTIONS]
+
+GPU and model:
+  --gpus LIST            Comma-separated GPU indices (default: auto-detect via nvidia-smi).
+                         Examples: "0", "0,1". Tensor-parallel size is derived from the count.
+                         Env: GPUS=0,1
+  --model TIER           Model tier: 7b | 32b | auto (default: auto).
+                         auto = 32b when ≥2 GPUs are available, else 7b.
+                         7b   = Qwen2.5-7B-Instruct → Qwen3-4B fallbacks.
+                         32b  = Qwen2.5-32B-Instruct → 7B → 4B fallbacks.
+                         Env: MODEL_TIER=7b
+  --tp N                 Override tensor-parallel-size (default: number of --gpus).
+                         Env: TENSOR_PARALLEL_SIZE=2
+  --max-model-len N      Max context length (default depends on tier; 32b uses smaller).
+                         Env: MAX_MODEL_LEN=16384
+  --gpu-mem-util F       GPU memory utilization 0..1 (default 0.80, lowered for 32B/TP=1).
+                         Env: GPU_MEM_UTIL=0.85
+
+Workload:
+  --profile NAME         Workload profile: smoke | small | medium | full (default: medium).
+                           smoke   =   5 tasks ×  1 trial,  ace=5,  conc=2  (~10–15 min)
+                           small   =  15 tasks ×  3 trials, ace=15, conc=4  (~1–2 h)
+                           medium  =  30 tasks ×  3 trials, ace=20, conc=4  (~3–6 h)
+                           full    =  50 tasks ×  4 trials, ace=40, conc=8  (~8–14 h)
+                         Env: PROFILE=medium
+  --tau-tasks N          Override τ-bench tasks per env (start=0, end=N).
+                         Env: TAU_END_INDEX=N (uses TAU_START_INDEX=0)
+  --tau-trials N         Override τ-bench trial count.   Env: TAU_NUM_TRIALS=N
+  --ace-limit N          Override ACEBench task count.   Env: ACE_LIMIT=N
+  --max-concurrency N    Override per-runner max concurrency. Env: MAX_CONCURRENCY=N
+  --tau-max-steps N      Cap τ-bench steps per trajectory.    Env: TAU_MAX_STEPS=N
+  --ace-max-steps N      Cap ACEBench steps per trajectory.   Env: ACE_MAX_STEPS=N
+
+Controller filter:
+  --controllers LIST     Comma-separated subset of {baseline,act,react,cargo}.
+                         Default: baseline,act,react,cargo. Env: CONTROLLERS=...
+  --skip-acebench        Skip ACEBench cells; run only τ-bench retail+airline.
+                         Env: SKIP_ACEBENCH=1
+  --tau-only ENV         Run only one τ-bench env (retail|airline). Env: TAU_ONLY=...
+
+Server:
+  --port N               vLLM port (default: 8001). Env: PORT=N
+  --served-name STR      vLLM served-model-name (default: qwen-agent). Env: SERVED_NAME=...
+
+Misc:
+  --dry-run              Print resolved configuration and exit. Env: DRY_RUN=1
+  --help, -h             Show this help and exit.
+HELP
+}
+
+# Default flag values (overridable via env or CLI).
+GPUS_OPT="${GPUS:-}"
+MODEL_TIER="${MODEL_TIER:-auto}"
+TP_OPT="${TENSOR_PARALLEL_SIZE:-}"
+PROFILE="${PROFILE:-medium}"
+CONTROLLERS_OPT="${CONTROLLERS:-baseline,act,react,cargo}"
+SKIP_ACEBENCH="${SKIP_ACEBENCH:-0}"
+TAU_ONLY="${TAU_ONLY:-}"
+DRY_RUN="${DRY_RUN:-0}"
+
+# Per-knob overrides (these take precedence over the profile).
+TAU_END_INDEX_OPT=""
+TAU_NUM_TRIALS_OPT=""
+ACE_LIMIT_OPT=""
+MAX_CONCURRENCY_OPT=""
+TAU_MAX_STEPS_OPT=""
+ACE_MAX_STEPS_OPT=""
+MAX_MODEL_LEN_OPT=""
+GPU_MEM_UTIL_OPT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gpus)            GPUS_OPT="$2"; shift 2 ;;
+    --gpus=*)          GPUS_OPT="${1#*=}"; shift ;;
+    --model)           MODEL_TIER="$2"; shift 2 ;;
+    --model=*)         MODEL_TIER="${1#*=}"; shift ;;
+    --tp)              TP_OPT="$2"; shift 2 ;;
+    --tp=*)            TP_OPT="${1#*=}"; shift ;;
+    --profile)         PROFILE="$2"; shift 2 ;;
+    --profile=*)       PROFILE="${1#*=}"; shift ;;
+    --tau-tasks)       TAU_END_INDEX_OPT="$2"; shift 2 ;;
+    --tau-tasks=*)     TAU_END_INDEX_OPT="${1#*=}"; shift ;;
+    --tau-trials)      TAU_NUM_TRIALS_OPT="$2"; shift 2 ;;
+    --tau-trials=*)    TAU_NUM_TRIALS_OPT="${1#*=}"; shift ;;
+    --ace-limit)       ACE_LIMIT_OPT="$2"; shift 2 ;;
+    --ace-limit=*)     ACE_LIMIT_OPT="${1#*=}"; shift ;;
+    --max-concurrency) MAX_CONCURRENCY_OPT="$2"; shift 2 ;;
+    --max-concurrency=*) MAX_CONCURRENCY_OPT="${1#*=}"; shift ;;
+    --tau-max-steps)   TAU_MAX_STEPS_OPT="$2"; shift 2 ;;
+    --tau-max-steps=*) TAU_MAX_STEPS_OPT="${1#*=}"; shift ;;
+    --ace-max-steps)   ACE_MAX_STEPS_OPT="$2"; shift 2 ;;
+    --ace-max-steps=*) ACE_MAX_STEPS_OPT="${1#*=}"; shift ;;
+    --max-model-len)   MAX_MODEL_LEN_OPT="$2"; shift 2 ;;
+    --max-model-len=*) MAX_MODEL_LEN_OPT="${1#*=}"; shift ;;
+    --gpu-mem-util)    GPU_MEM_UTIL_OPT="$2"; shift 2 ;;
+    --gpu-mem-util=*)  GPU_MEM_UTIL_OPT="${1#*=}"; shift ;;
+    --controllers)     CONTROLLERS_OPT="$2"; shift 2 ;;
+    --controllers=*)   CONTROLLERS_OPT="${1#*=}"; shift ;;
+    --skip-acebench)   SKIP_ACEBENCH=1; shift ;;
+    --tau-only)        TAU_ONLY="$2"; shift 2 ;;
+    --tau-only=*)      TAU_ONLY="${1#*=}"; shift ;;
+    --port)            PORT_OPT="$2"; shift 2 ;;
+    --port=*)          PORT_OPT="${1#*=}"; shift ;;
+    --served-name)     SERVED_NAME_OPT="$2"; shift 2 ;;
+    --served-name=*)   SERVED_NAME_OPT="${1#*=}"; shift ;;
+    --dry-run)         DRY_RUN=1; shift ;;
+    --help|-h)         print_help; exit 0 ;;
+    --)                shift; break ;;
+    *) echo "Unknown flag: $1" >&2; echo "Use --help for usage." >&2; exit 1 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# GPU detection
+# ---------------------------------------------------------------------------
+detect_gpu_csv() {
+  if [[ -n "$GPUS_OPT" ]]; then
+    echo "$GPUS_OPT"; return
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local n
+    n=$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 2 )); then echo "0,1"
+    elif [[ "$n" =~ ^[0-9]+$ ]] && (( n == 1 )); then echo "0"
+    else echo "0"  # last-resort default; vLLM will error if no GPU present
+    fi
+  else
+    echo "0"
+  fi
+}
+GPUS_CSV="$(detect_gpu_csv)"
+NUM_GPUS=$(awk -F, '{print NF}' <<<"$GPUS_CSV")
+if [[ -n "$TP_OPT" ]]; then
+  TP="$TP_OPT"
+else
+  TP="$NUM_GPUS"
+fi
+
+# ---------------------------------------------------------------------------
+# Tier resolution: auto → 32b (≥2 GPUs) | 7b (1 GPU)
+# ---------------------------------------------------------------------------
+case "$MODEL_TIER" in
+  auto)
+    if (( NUM_GPUS >= 2 )); then MODEL_TIER="32b"; else MODEL_TIER="7b"; fi
+    ;;
+  7b|32b) ;;
+  *) echo "ERROR: --model must be one of: 7b, 32b, auto (got '$MODEL_TIER')" >&2; exit 1 ;;
+esac
+
+# Pick model candidate chain by tier. The first that serves successfully
+# is used for ALL controllers.
+if [[ "$MODEL_TIER" == "32b" ]]; then
+  MODEL_CANDIDATES=(
+    "Qwen/Qwen2.5-32B-Instruct"
+    "Qwen/Qwen2.5-7B-Instruct"
+    "Qwen/Qwen3-4B-Instruct-2507-FP8"
+  )
+  # 32B: smaller default context for KV-cache headroom; lower mem util on TP=1.
+  TIER_DEFAULT_MAX_LEN=12288
+  if (( TP <= 1 )); then TIER_DEFAULT_MEM_UTIL="0.92"; else TIER_DEFAULT_MEM_UTIL="0.85"; fi
+else
+  MODEL_CANDIDATES=(
+    "Qwen/Qwen2.5-7B-Instruct"
+    "Qwen/Qwen3-4B-Instruct-2507-FP8"
+    "Qwen/Qwen3-4B-Instruct-2507"
+  )
+  TIER_DEFAULT_MAX_LEN=16384
+  TIER_DEFAULT_MEM_UTIL="0.80"
+fi
+
+# ---------------------------------------------------------------------------
+# Profile resolution (workload sizing)
+# ---------------------------------------------------------------------------
+case "$PROFILE" in
+  smoke)   P_TAU_END=5;  P_TAU_TRIALS=1; P_ACE_LIMIT=5;  P_CONC=2; P_TAU_STEPS=20; P_ACE_STEPS=15 ;;
+  small)   P_TAU_END=15; P_TAU_TRIALS=3; P_ACE_LIMIT=15; P_CONC=4; P_TAU_STEPS=30; P_ACE_STEPS=20 ;;
+  medium)  P_TAU_END=30; P_TAU_TRIALS=3; P_ACE_LIMIT=20; P_CONC=4; P_TAU_STEPS=30; P_ACE_STEPS=20 ;;
+  full)    P_TAU_END=50; P_TAU_TRIALS=4; P_ACE_LIMIT=40; P_CONC=8; P_TAU_STEPS=30; P_ACE_STEPS=20 ;;
+  *) echo "ERROR: --profile must be smoke|small|medium|full (got '$PROFILE')" >&2; exit 1 ;;
+esac
+
+# Multi-GPU bumps the default concurrency since vLLM batches across replicas.
+if (( NUM_GPUS >= 2 )); then
+  P_CONC=$(( P_CONC * 2 ))
+fi
+
+# Apply per-knob overrides (CLI > env > profile).
+TAU_END_INDEX="${TAU_END_INDEX_OPT:-${TAU_END_INDEX:-$P_TAU_END}}"
+TAU_NUM_TRIALS="${TAU_NUM_TRIALS_OPT:-${TAU_NUM_TRIALS:-$P_TAU_TRIALS}}"
+ACE_LIMIT="${ACE_LIMIT_OPT:-${ACE_LIMIT:-$P_ACE_LIMIT}}"
+TAU_MAX_CONCURRENCY="${MAX_CONCURRENCY_OPT:-${MAX_CONCURRENCY:-${TAU_MAX_CONCURRENCY:-$P_CONC}}}"
+ACE_MAX_CONCURRENCY="${MAX_CONCURRENCY_OPT:-${MAX_CONCURRENCY:-${ACE_MAX_CONCURRENCY:-$P_CONC}}}"
+TAU_MAX_STEPS="${TAU_MAX_STEPS_OPT:-${TAU_MAX_STEPS:-$P_TAU_STEPS}}"
+ACE_MAX_STEPS="${ACE_MAX_STEPS_OPT:-${ACE_MAX_STEPS:-$P_ACE_STEPS}}"
+
+# Tier-aware vLLM serving knobs.
+PRIMARY_MAX_LEN="${MAX_MODEL_LEN_OPT:-${MAX_MODEL_LEN:-$TIER_DEFAULT_MAX_LEN}}"
+PRIMARY_MEM_UTIL="${GPU_MEM_UTIL_OPT:-${GPU_MEM_UTIL:-$TIER_DEFAULT_MEM_UTIL}}"
+
+# ---------------------------------------------------------------------------
+# Validate --controllers / --tau-only up-front so typos fail fast (also
+# during --dry-run).
+# ---------------------------------------------------------------------------
+ALLOWED_CONTROLLERS=("baseline" "act" "react" "cargo")
+IFS=',' read -r -a REQUESTED_CONTROLLERS <<<"$CONTROLLERS_OPT"
+for c in "${REQUESTED_CONTROLLERS[@]}"; do
+  c="$(echo "$c" | tr -d '[:space:]')"
+  [[ -z "$c" ]] && continue
+  ok=0
+  for a in "${ALLOWED_CONTROLLERS[@]}"; do [[ "$a" == "$c" ]] && { ok=1; break; }; done
+  if [[ $ok -eq 0 ]]; then
+    echo "ERROR: unknown controller '$c'. Allowed: ${ALLOWED_CONTROLLERS[*]}" >&2
+    exit 1
+  fi
+done
+case "${TAU_ONLY:-}" in
+  ""|"both"|retail|airline) ;;
+  *) echo "ERROR: --tau-only must be retail|airline (got '$TAU_ONLY')" >&2; exit 1 ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Early dry-run gate.
+#
+# Print the GPU/tier/profile config and exit before touching the venv or
+# loading cluster modules. Useful on a login node to validate the flag
+# combinations before submitting the actual job.
+# ---------------------------------------------------------------------------
+if [[ "$DRY_RUN" == "1" ]]; then
+  cat <<INFO
+---------- Resolved configuration (dry-run) ----------
+GPUS=$GPUS_CSV   NUM_GPUS=$NUM_GPUS   TP=$TP
+MODEL_TIER=$MODEL_TIER
+  primary_max_len=$PRIMARY_MAX_LEN   gpu_mem_util=$PRIMARY_MEM_UTIL
+PROFILE=$PROFILE
+  TAU: tasks=[${TAU_START_INDEX:-0}..${TAU_END_INDEX}) trials=$TAU_NUM_TRIALS conc=$TAU_MAX_CONCURRENCY max_steps=$TAU_MAX_STEPS
+  ACE: limit=$ACE_LIMIT conc=$ACE_MAX_CONCURRENCY max_steps=$ACE_MAX_STEPS
+CONTROLLERS=$CONTROLLERS_OPT
+SKIP_ACEBENCH=$SKIP_ACEBENCH
+TAU_ONLY=${TAU_ONLY:-(both)}
+MODEL_CANDIDATES:
+$(printf '  - %s\n' "${MODEL_CANDIDATES[@]}")
+------------------------------------------------------
+Dry-run requested; exiting before cluster setup.
+INFO
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Paths (must match setup_env.sh)
@@ -121,11 +396,10 @@ log "Python: $(python --version) at $(command -v python)"
 log "vllm:   $(command -v vllm || echo not-found)"
 
 # ---------------------------------------------------------------------------
-# Runtime configuration (overridable)
+# Runtime configuration (sizing already resolved from CLI / profile / GPUs)
 # ---------------------------------------------------------------------------
-SERVED_NAME="${SERVED_NAME:-qwen-agent}"
-PORT="${PORT:-8001}"
-GPU="${GPU:-0}"
+SERVED_NAME="${SERVED_NAME_OPT:-${SERVED_NAME:-qwen-agent}}"
+PORT="${PORT_OPT:-${PORT:-8001}}"
 DTYPE="${DTYPE:-bfloat16}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
 VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-1800}"
@@ -134,91 +408,75 @@ export VLLM_ENGINE_READY_TIMEOUT_S="$VLLM_READY_TIMEOUT"
 # Matched-compile-off config from the known-good baseline run.
 VLLM_COMPILATION_CONFIG='{"mode":0,"custom_ops":["none"],"pass_config":{"fuse_norm_quant":false,"fuse_act_quant":false,"fuse_attn_quant":false}}'
 
-# Primary + fallback (max_model_len, gpu_memory_utilization, model-impl, eager).
-# Rung 1 (eager, primary context):  the known-good config. Default.
-# Rung 2 (eager, smaller context):  for OOM at primary context.
-# Rung 3 (transformers backend):    last-resort path with no CUDA-graph deps.
-#
-# Why not try CUDA graphs first?
+# Why we keep --enforce-eager:
 #   We pin compilation_config.mode=0 (NO_COMPILATION) for stability. vLLM 0.18
 #   then auto-overrides cudagraph_mode -> NONE anyway, so dropping
 #   --enforce-eager gains zero speed but routes through a different warmup
 #   path (_dummy_run) that hits cudaErrorNoKernelImageForDevice in FlashAttn
 #   on cu130 builds. Net: eager is strictly the safe and equivalent choice.
 #   Set ENFORCE_EAGER=0 to opt back into the experimental fast rung.
-PRIMARY_MAX_LEN="${MAX_MODEL_LEN:-16384}"
-PRIMARY_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
 PRIMARY_IMPL="${MODEL_IMPL:-auto}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
-FALLBACK1_IMPL="auto";         FALLBACK1_MAX_LEN="12288"; FALLBACK1_MEM_UTIL="0.75"
-FALLBACK2_IMPL="transformers"; FALLBACK2_MAX_LEN="8192";  FALLBACK2_MEM_UTIL="0.65"
+# Fallback rungs (smaller context / transformers backend) on top of the
+# tier-derived primary. These are tier-agnostic — vLLM only cares about
+# (max_model_len, gpu_memory_utilization, model-impl) being something it
+# can satisfy on the assigned device(s).
+FALLBACK1_IMPL="auto"
+FALLBACK1_MAX_LEN=$(( PRIMARY_MAX_LEN > 12288 ? 12288 : (PRIMARY_MAX_LEN * 3 / 4) ))
+FALLBACK1_MEM_UTIL="$(awk -v u="$PRIMARY_MEM_UTIL" 'BEGIN{printf "%.2f", u-0.05}')"
+FALLBACK2_IMPL="transformers"
+FALLBACK2_MAX_LEN=$(( PRIMARY_MAX_LEN > 8192 ? 8192 : PRIMARY_MAX_LEN ))
+FALLBACK2_MEM_UTIL="$(awk -v u="$PRIMARY_MEM_UTIL" 'BEGIN{printf "%.2f", u-0.15}')"
 
-# Truncation patch is sized for the 16 K context. The hard budget triggers
-# the patch's iterative shrink: if a normal pass leaves the prompt over
-# HARD_BUDGET chars, the patch keeps shrinking until it fits.
-#
-# Truncation budget calibration for a 16 384-token model context.
-#
-# Token accounting (rough, tau-retail worst case):
-#   ~20 tool specs                → ~6 000 tokens  (~10 500 chars at JSON density)
-#   system prompt (CARGO proposer block + wiki) → ~1 500 tokens (~ 2 500 chars)
-#   decode headroom               → ~1 500 tokens
-#   -----------------------------------------
-#   available for message content → ~7 384 tokens
-#   at 1.75 chars/token           → ~12 900 chars
-#
-# openai_client.py passes the tools JSON length as extra_chars to
-# _shrink_messages, which subtracts it from the budgets.  The defaults
-# below are therefore the *base* content budget (excluding tools).
-#
-# Soft budget: start truncating individual oversized observations.
-# Hard budget: shrink iteratively until this is met.
+# Truncation budgets — sized for a 16 K-token model context. _shrink_messages
+# subtracts the tools JSON length from the per-message budgets at runtime, so
+# the values here are the *base* content budget (excluding tools). 32B at
+# 12K context auto-tightens via the patch's iterative shrink.
 export TAU_PATCH_MAX_TOOL_CHARS="${TAU_PATCH_MAX_TOOL_CHARS:-2000}"
 export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-20000}"
 export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-12000}"
 
-# Qwen2.5-7B first — stable 32K context, best tool-calling quality at this size.
-MODEL_CANDIDATES=(
-  "Qwen/Qwen2.5-7B-Instruct"
-  "Qwen/Qwen3-4B-Instruct-2507-FP8"
-  "Qwen/Qwen3-4B-Instruct-2507"
-)
-
-# Sized to fit the 12-condition pipeline (4 controllers × 3 benchmarks) with
-# 3 trials per task on a single A100. We keep --enforce-eager for stability
-# (cu130 + FlashAttn CUDA-graph capture is fragile on this build) and recover
-# the wall-clock by running tasks CONCURRENTLY against the vLLM server. vLLM
-# batches incoming requests internally, so 4-way task concurrency is
-# essentially free on a single A100 (the GPU is the bottleneck, not the
-# model code).
+# Wall-clock notes (per controller × benchmark cell, eager BF16):
+#   1×A100 / 7B  : ~22 LLM calls/τ-traj × 30 tasks × 3 trials, conc=4 → ~1.5 h/cell
+#   2×A100 / 32B : ~22 calls × 30 × 3, TP=2, conc=8 → ~1.0–1.5 h/cell
+#   12 cells total + ACE + summary slack → fits in the 10–15 h budget.
 #
-# Wall-clock estimate (eager Qwen2.5-7B, TAU_MAX_CONCURRENCY=4):
-#   tau-bench:  15 tasks × 3 trials × 2 envs × 4 controllers = 360 trajs
-#               avg ~22 LLM calls/traj  →  serial 11 h  →  4-way ≈ 3.0-3.5 h
-#   ACEBench:   20 tasks × 4 controllers = 80 trajs
-#               avg ~10 LLM calls/traj  →  serial 1.1 h →  4-way ≈ 0.4 h
-#   vLLM start + summary: ~0.3 h
-#   Total: ~4 h with concurrency, vs ~12 h serial.
+# These are static knobs that the profile / CLI never override.
 TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-test}"
 TAU_START_INDEX="${TAU_START_INDEX:-0}"
-TAU_END_INDEX="${TAU_END_INDEX:-15}"
-TAU_NUM_TRIALS="${TAU_NUM_TRIALS:-3}"
-TAU_MAX_CONCURRENCY="${TAU_MAX_CONCURRENCY:-4}"
 TAU_TEMPERATURE="${TAU_TEMPERATURE:-0.0}"
-TAU_MAX_STEPS="${TAU_MAX_STEPS:-30}"
-
-ACE_LIMIT="${ACE_LIMIT:-20}"
-ACE_MAX_STEPS="${ACE_MAX_STEPS:-20}"
-ACE_MAX_CONCURRENCY="${ACE_MAX_CONCURRENCY:-4}"
 ACE_LANGUAGE="${ACE_LANGUAGE:-en}"
 
-# OpenAI SDK timeout for direct in-process calls. 60 s is enough for any
-# normal Qwen2.5-7B response on 1×A100; shorter than the SDK's 600 s default
-# so a stuck/overflow request fails fast instead of blocking the loop.
-export OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-60}"
+# OpenAI SDK timeout for direct in-process calls. 60 s is enough for a 7B
+# response on 1×A100. 32B on TP=2 stays under 90 s for normal workloads.
+if [[ "$MODEL_TIER" == "32b" ]]; then
+  export OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-120}"
+else
+  export OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-60}"
+fi
 
 OUTPUTS_DIR="${OUTPUTS_DIR:-${REPO_ROOT}/outputs}"
 mkdir -p "$OUTPUTS_DIR/summary"
+
+# ---------------------------------------------------------------------------
+# Resolved-config dump (also runs as the body of --dry-run).
+# ---------------------------------------------------------------------------
+print_resolved_config() {
+  cat <<INFO
+---------- Resolved configuration ----------
+GPUS=$GPUS_CSV   NUM_GPUS=$NUM_GPUS   TP=$TP
+MODEL_TIER=$MODEL_TIER   primary_max_len=$PRIMARY_MAX_LEN   gpu_mem_util=$PRIMARY_MEM_UTIL
+PROFILE=$PROFILE
+  TAU: tasks=[$TAU_START_INDEX..$TAU_END_INDEX) trials=$TAU_NUM_TRIALS conc=$TAU_MAX_CONCURRENCY max_steps=$TAU_MAX_STEPS
+  ACE: limit=$ACE_LIMIT conc=$ACE_MAX_CONCURRENCY max_steps=$ACE_MAX_STEPS
+CONTROLLERS=$CONTROLLERS_OPT  SKIP_ACEBENCH=$SKIP_ACEBENCH  TAU_ONLY=${TAU_ONLY:-(both)}
+PORT=$PORT  SERVED_NAME=$SERVED_NAME  ENFORCE_EAGER=$ENFORCE_EAGER
+MODEL_CANDIDATES:
+$(printf '  - %s\n' "${MODEL_CANDIDATES[@]}")
+--------------------------------------------
+INFO
+}
+print_resolved_config
 
 for cmd in curl lsof vllm python; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: missing command: $cmd" >&2; exit 1; }
@@ -283,7 +541,7 @@ start_vllm_once () {
   if [[ "$eager" == "1" ]]; then
     eager_flag="--enforce-eager"
   fi
-  log "Starting vLLM [$label] model=$model impl=$impl max_len=$max_len mem_util=$mem_util eager=$eager${attn_backend:+ attn=$attn_backend}"
+  log "Starting vLLM [$label] model=$model impl=$impl max_len=$max_len mem_util=$mem_util TP=$TP gpus=$GPUS_CSV eager=$eager${attn_backend:+ attn=$attn_backend}"
   # NOTE: $eager_flag is intentionally unquoted so the empty case expands to
   #       nothing (vllm sees no extra arg). When set, it's a single flag with
   #       no spaces, so word-splitting is safe.
@@ -292,7 +550,7 @@ start_vllm_once () {
   # using the `env VAR=val cmd` prefix form which limits the variable's scope
   # to the subprocess (avoids polluting the shell for subsequent rungs).
   if [[ -n "$attn_backend" ]]; then
-    CUDA_VISIBLE_DEVICES="$GPU" VLLM_ATTENTION_BACKEND="$attn_backend" \
+    CUDA_VISIBLE_DEVICES="$GPUS_CSV" VLLM_ATTENTION_BACKEND="$attn_backend" \
       vllm serve "$model" \
         --served-model-name "$SERVED_NAME" \
         --port "$PORT" \
@@ -300,6 +558,7 @@ start_vllm_once () {
         --dtype "$DTYPE" \
         --max-model-len "$max_len" \
         --gpu-memory-utilization "$mem_util" \
+        --tensor-parallel-size "$TP" \
         --enable-auto-tool-choice \
         --tool-call-parser "$TOOL_CALL_PARSER" \
         --disable-log-stats \
@@ -307,7 +566,7 @@ start_vllm_once () {
         --compilation-config "$VLLM_COMPILATION_CONFIG" \
         > "$log_file" 2>&1 &
   else
-    CUDA_VISIBLE_DEVICES="$GPU" \
+    CUDA_VISIBLE_DEVICES="$GPUS_CSV" \
       vllm serve "$model" \
         --served-model-name "$SERVED_NAME" \
         --port "$PORT" \
@@ -315,6 +574,7 @@ start_vllm_once () {
         --dtype "$DTYPE" \
         --max-model-len "$max_len" \
         --gpu-memory-utilization "$mem_util" \
+        --tensor-parallel-size "$TP" \
         --enable-auto-tool-choice \
         --tool-call-parser "$TOOL_CALL_PARSER" \
         --disable-log-stats \
@@ -450,18 +710,35 @@ run_ace () {
   fi
 }
 
-run_tau retail  baseline
-run_tau retail  act
-run_tau retail  react
-run_tau retail  cargo
-run_tau airline baseline
-run_tau airline act
-run_tau airline react
-run_tau airline cargo
-run_ace baseline
-run_ace act
-run_ace react
-run_ace cargo
+# ---------------------------------------------------------------------------
+# Filtered run list: which controllers and which benchmarks to execute.
+# (REQUESTED_CONTROLLERS and the --tau-only / --controllers values were
+# already validated near the top of the script.)
+# ---------------------------------------------------------------------------
+case "${TAU_ONLY:-}" in
+  ""|"both") TAU_ENVS=("retail" "airline") ;;
+  retail)    TAU_ENVS=("retail") ;;
+  airline)   TAU_ENVS=("airline") ;;
+esac
+
+for env_name in "${TAU_ENVS[@]}"; do
+  for c in "${REQUESTED_CONTROLLERS[@]}"; do
+    c="$(echo "$c" | tr -d '[:space:]')"
+    [[ -z "$c" ]] && continue
+    run_tau "$env_name" "$c"
+  done
+done
+
+# ACEBench cells (controller-only).
+if [[ "$SKIP_ACEBENCH" != "1" ]]; then
+  for c in "${REQUESTED_CONTROLLERS[@]}"; do
+    c="$(echo "$c" | tr -d '[:space:]')"
+    [[ -z "$c" ]] && continue
+    run_ace "$c"
+  done
+else
+  log "Skipping ACEBench cells (--skip-acebench)."
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
