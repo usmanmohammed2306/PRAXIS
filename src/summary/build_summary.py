@@ -5,21 +5,22 @@ Renders a four-way comparison across the same fixed base model:
   1. baseline — vanilla tool-calling (minimal system prompt)
   2. act      — Act (Yao et al. 2022): action-only, no reasoning prose
   3. react    — ReAct (Yao et al. 2022): one-line Thought before each Action
-  4. valence  — Verified Affordance Lattice for Efficient Non-hallucinating
-                Control (this project's contribution): the LLM picks one
-                verified ``action_id`` from a compact menu and the kernel
-                compiles it into a real benchmark tool call. Mutation
-                arguments are typed handles minted from prior tool evidence
-                or exact user-text spans; ungrounded mutations are rejected
-                before they reach the env.
+  4. cargo    — CARGO (this project's contribution): Calibrated Action-Risk
+                Gating with Outcome-rollouts. A JSON-emitting proposer
+                declares a risk class + pre/post-conditions for each step;
+                deterministic gates check argument grounding and
+                pre-conditions, and a calibrated self-consistency vote
+                (+ counterfactual rollout for IRREVERSIBLE / FINAL) decides
+                whether to commit, retry with a critique, ask the user, or
+                finalize. Mutations execute only after every gate passes.
 
 Each section renders a row per metric for all four conditions. Missing runs
 are reported as ``status=missing`` so the table never collapses on partial
 data.
 
-The summary also computes a ``deltas`` block per benchmark — VALENCE minus
-the strongest non-VALENCE controller on the headline metric (success rate
-for tau-bench, completion rate for ACEBench) and VALENCE vs. baseline — to
+The summary also computes a ``deltas`` block per benchmark — CARGO minus
+the strongest non-CARGO controller on the headline metric (success rate
+for tau-bench, completion rate for ACEBench) and CARGO vs. baseline — to
 make the wins immediately visible.
 """
 from __future__ import annotations
@@ -39,31 +40,31 @@ SECTIONS: List[Tuple[str, Dict[str, str]]] = [
         "baseline": "tau_retail_baseline",
         "act": "tau_retail_act",
         "react": "tau_retail_react",
-        "valence": "tau_retail_valence",
+        "cargo": "tau_retail_cargo",
     }),
     ("tau-bench airline", {
         "baseline": "tau_airline_baseline",
         "act": "tau_airline_act",
         "react": "tau_airline_react",
-        "valence": "tau_airline_valence",
+        "cargo": "tau_airline_cargo",
     }),
     ("ACEBench Agent", {
         "baseline": "acebench_agent_baseline",
         "act": "acebench_agent_act",
         "react": "acebench_agent_react",
-        "valence": "acebench_agent_valence",
+        "cargo": "acebench_agent_cargo",
     }),
 ]
 
-CONDITIONS: List[str] = ["baseline", "act", "react", "valence"]
+CONDITIONS: List[str] = ["baseline", "act", "react", "cargo"]
 CONDITION_LABELS: Dict[str, str] = {
     "baseline": "Vanilla TC",
     "act": "Act",
     "react": "ReAct",
-    "valence": "VALENCE (ours)",
+    "cargo": "CARGO (ours)",
 }
 
-OURS = "valence"
+OURS = "cargo"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -147,7 +148,7 @@ def _headline_metric_key(label: str) -> str:
 
 
 def _strongest_baseline(by_cond: Dict[str, Dict[str, Any]], key: str) -> Tuple[Optional[str], Optional[float]]:
-    """Return (condition_name, value) for the best non-VALENCE controller on ``key``."""
+    """Return (condition_name, value) for the best non-CARGO controller on ``key``."""
     best_cond: Optional[str] = None
     best_val: Optional[float] = None
     for c in ("baseline", "act", "react"):
@@ -202,7 +203,7 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
             "metric": key,
             "best_baseline": best_cond,
             "best_baseline_value": best_val,
-            "valence_value": ours_val_f,
+            "cargo_value": ours_val_f,
             "baseline_value": baseline_val_f,
             "delta_vs_best_baseline": (
                 ours_val_f - best_val
@@ -221,7 +222,7 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
 
 def render_markdown(summary: Dict[str, Any]) -> str:
     lines: List[str] = []
-    lines.append("# Vanilla / Act / ReAct / VALENCE — Comparison Summary")
+    lines.append("# Vanilla / Act / ReAct / CARGO — Comparison Summary")
     lines.append("")
     lines.append(f"- Active model: `{summary.get('active_model') or '(unknown)'}`")
     lines.append(f"- Served name:  `{summary.get('served_name') or '(unknown)'}`")
@@ -231,27 +232,29 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         "Vanilla TC = minimal system prompt with native function-calling. "
         "Act = action-only, no reasoning prose (Yao et al. 2022). "
         "ReAct = one-line Thought before each Action (Yao et al. 2022). "
-        "VALENCE = Verified Affordance Lattice for Efficient Non-hallucinating "
-        "Control: the LLM picks one verified `action_id` from a compact menu "
-        "and the kernel compiles it into a real benchmark tool call; mutation "
-        "arguments are typed handles minted from prior tool evidence or exact "
-        "user-text spans (this project's contribution)."
+        "CARGO = Calibrated Action-Risk Gating with Outcome-rollouts: a "
+        "JSON-emitting proposer declares a risk class + pre/post-conditions "
+        "for each step; deterministic gates check argument grounding and "
+        "pre-conditions, and a calibrated self-consistency vote "
+        "(+ counterfactual rollout for IRREVERSIBLE / FINAL) decides whether "
+        "to commit, retry with a critique, ask the user, or finalize. "
+        "Mutations execute only after every gate passes."
     )
     lines.append("")
-    lines.append("## Headline deltas (VALENCE vs. best of vanilla / Act / ReAct, and vs. baseline)")
+    lines.append("## Headline deltas (CARGO vs. best of vanilla / Act / ReAct, and vs. baseline)")
     lines.append("")
-    lines.append("| Benchmark | Metric | Best baseline | Best baseline val | VALENCE | Δ vs best | Δ vs baseline |")
+    lines.append("| Benchmark | Metric | Best baseline | Best baseline val | CARGO | Δ vs best | Δ vs baseline |")
     lines.append("|---|---|---|---|---|---|---|")
     for d in summary.get("deltas", []):
         bb = d.get("best_baseline") or "n/a"
         bb_label = CONDITION_LABELS.get(bb, bb)
         bbv = d.get("best_baseline_value")
-        vgv = d.get("valence_value")
+        cgv = d.get("cargo_value")
         dv = d.get("delta_vs_best_baseline")
         dvb = d.get("delta_vs_baseline")
         is_pct_metric = d.get("metric") in ("success_rate", "completion_rate", "tool_name_coverage")
         bbv_s = _pct(bbv) if is_pct_metric else _num(bbv)
-        vgv_s = _pct(vgv) if is_pct_metric else _num(vgv)
+        cgv_s = _pct(cgv) if is_pct_metric else _num(cgv)
 
         def _fmt(x):
             if x is None:
@@ -259,7 +262,7 @@ def render_markdown(summary: Dict[str, Any]) -> str:
             return f"{100.0 * x:+.1f} pp" if is_pct_metric else f"{x:+.2f}"
 
         lines.append(f"| {d.get('section')} | {d.get('metric')} | {bb_label} | "
-                     f"{bbv_s} | {vgv_s} | {_fmt(dv)} | {_fmt(dvb)} |")
+                     f"{bbv_s} | {cgv_s} | {_fmt(dv)} | {_fmt(dvb)} |")
     lines.append("")
     lines.append("## Per-benchmark detail")
     lines.append("")
@@ -272,6 +275,24 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         else:
             lines.extend(_ace_rows(label, by_cond))
         lines.append("")
+    # CARGO-specific diagnostics block.
+    lines.append("## CARGO diagnostics")
+    lines.append("")
+    lines.append("| Benchmark | Trajectories w/ stats | Abstain | Retry | AskUser | Finalize | JSON parse fail | Actions executed |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for section in summary["sections"]:
+        label = section["label"]
+        by_cond = section.get("by_condition") or {}
+        cargo_data = (by_cond.get(OURS) or {}).get("metrics") or {}
+        cd = cargo_data.get("cargo_diagnostics") or {}
+        lines.append(
+            f"| {label} | {cd.get('trajectories_with_stats', 0)} | "
+            f"{cd.get('abstain_total', 0)} | {cd.get('repair_retry', 0)} | "
+            f"{cd.get('repair_ask_user', 0)} | {cd.get('repair_finalize', 0)} | "
+            f"{cd.get('json_parse_failures', 0)} | "
+            f"{cd.get('actions_executed', 0)} |"
+        )
+    lines.append("")
     lines.append("## Notes")
     lines.append("")
     for section in summary["sections"]:
@@ -284,23 +305,26 @@ def render_markdown(summary: Dict[str, Any]) -> str:
     lines.append("## Method notes")
     lines.append("- Same fixed base model, same temperature, same max-steps, same "
                  "truncation budget across all four controllers. Baselines call the "
-                 "raw tool surface; VALENCE replaces that surface with a compact "
-                 "verified menu but executes the same benchmark tools.")
+                 "raw tool surface; CARGO replaces native function-calling with a "
+                 "JSON proposer + risk-typed verification stack but executes the "
+                 "same benchmark tools.")
     lines.append("- Vanilla TC: minimal role + policy in the system prompt; native "
                  "function-calling does the rest.")
     lines.append("- Act: prompt instructs the model to emit tool calls only, no "
                  "reasoning prose.")
     lines.append("- ReAct: prompt requires one short `Thought:` line before each tool "
                  "call (capped to ~20 words to keep prompt growth bounded).")
-    lines.append("- VALENCE: zero extra LLM calls per step. The kernel ingests "
-                 "user/tool events, mints typed handles (order_id, user_id, "
-                 "money, datetime, ...) from prior tool evidence or exact user-text "
-                 "spans, builds an affordance lattice over the available tools, and "
-                 "renders a top-k=8 menu. The model returns "
-                 "`{\"action_id\":\"...\"}`; the kernel compiles that into a real "
-                 "benchmark tool call. Mutations are *only* executable when every "
-                 "required argument is handle- or resolver-backed; ungrounded or "
-                 "duplicate mutations are rejected before reaching the env.")
+    lines.append("- CARGO: per-step proposer call returns "
+                 "`{thought, action:{name, args, declared_class, declared_pre, "
+                 "declared_post, informational_intent, user_text}}`. READ tools take "
+                 "the fast path and execute immediately. WRITE / IRREVERSIBLE / FINAL "
+                 "tools pass through repeat-loop, pre-condition (declared NL + "
+                 "required-args) and argument-grounding (regex-checked ID values must "
+                 "appear in `user_facts ∪ db_facts ∪ last_obs`) gates, then a "
+                 "calibrated self-consistency vote (k=3 samples at T=0.7), then a "
+                 "counterfactual rollout for IRREVERSIBLE / FINAL only. On ABSTAIN, "
+                 "a deterministic repair policy chooses RETRY (with critique), "
+                 "ASK_USER (clarifying question), or FINALIZE_GENERIC.")
     lines.append("- ACEBench metrics here are diagnostic. For the official score, "
                  "re-run upstream `score_agent.py` against the saved trajectories.")
     return "\n".join(lines) + "\n"

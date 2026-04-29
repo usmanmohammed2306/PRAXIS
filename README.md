@@ -1,4 +1,4 @@
-# VALENCE — Verified Affordance Lattice for Efficient Non-hallucinating Control
+# CARGO — Calibrated Action-Risk Gating with Outcome-rollouts
 
 Lightweight prototype that compares **four** agent controllers **on the
 same fixed base model** across **τ-bench retail**, **τ-bench airline**,
@@ -6,90 +6,121 @@ and **ACEBench Agent**:
 
 | # | Controller | What it adds over the layer above |
 |---|---|---|
-| 1 | **Vanilla TC** (`baseline`)  | Native function-calling, minimal system prompt. |
-| 2 | **Act** (`act`)              | Yao et al. 2022 ablation: action-only, no reasoning prose. |
-| 3 | **ReAct** (`react`)          | Yao et al. 2022: one-line `Thought:` before each Action. |
-| 4 | **VALENCE** (`valence`, *ours*) | The LLM never generates raw mutation tool calls; instead it picks one verified `action_id` from a compact, deterministically-built affordance menu, and the kernel compiles that into a real benchmark tool call. |
+| 1 | **Vanilla TC** (`baseline`) | Native function-calling, minimal system prompt. |
+| 2 | **Act** (`act`)             | Yao et al. 2022 ablation: action-only, no reasoning prose. |
+| 3 | **ReAct** (`react`)         | Yao et al. 2022: one-line `Thought:` before each Action. |
+| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; deterministic gates check argument grounding and pre-conditions, and a calibrated self-consistency vote (+ counterfactual rollout for IRREVERSIBLE / FINAL) decides whether to commit, retry, ask, or finalize. Mutations execute only after every gate passes. |
 
 All four conditions share the **same in-process loop, model,
-temperature, tool schemas, max-steps, and truncation budget**. The only
-varying axis is the controller — for VALENCE, the deterministic
-`AffordanceKernel` that compiles a model-chosen `action_id` into the
-real tool call.
+temperature, max-steps, and truncation budget**. The only varying axis is
+the controller — for CARGO, the risk-typed gate stack. The `respond`
+contract that tau-bench / ACEBench use as the user-facing channel is
+unchanged.
 
-## The invariant
+## The architecture
 
-> **No state-changing API call may receive an argument unless that value
-> was minted by the VALENCE kernel from one of: prior tool evidence,
-> exact user-text span, schema enum, deterministic resolver output,
-> verified arithmetic/selection over grounded values, or
-> sandbox/transaction-validated transformation.**
+```
+                    ┌────────────────────────────────────────────┐
+                    │             TASK ENVIRONMENT (τ-bench)     │
+                    │    user simulator  +  tool sandbox  +  DB  │
+                    └──────────────────▲─────────────────────┬───┘
+                                       │ obs                 │ action
+                                       │                     ▼
+            ┌──────────────────────────┴──────────────────────────────┐
+            │                  CARGO AGENT LOOP                       │
+            │                                                         │
+            │  (0)  Tool-effect schema cache (built once at init)     │
+            │       per tool t → {class, pre, post, irreversible}     │
+            │       Rule-based by name prefix; LLM augmentation       │
+            │       optional via CARGO_INDUCE_VIA_LLM=1.              │
+            │                                                         │
+            │  (1)  Typed Working Memory  (deterministic)             │
+            │       slots: goal, user_revealed_facts,                 │
+            │              db_confirmed_facts, assumptions,           │
+            │              pending_obligations, last_obs,             │
+            │              last_error, budget_steps                   │
+            │                                                         │
+            │  (2)  Proposer  (1 LLM call, JSON output)               │
+            │       Output: {thought, action:{name, args,             │
+            │                declared_class, declared_pre,            │
+            │                declared_post, informational_intent,     │
+            │                user_text}}                              │
+            │                                                         │
+            │  (3)  Risk Router  (deterministic, O(1))                │
+            │       READ  → fast path → execute                       │
+            │       WRITE / IRREV / FINAL → calibrated gate           │
+            │                                                         │
+            │  (4)  Calibrated Gate                                   │
+            │       (4-) repeat-loop check (cheap; runs always)       │
+            │       (4a) declared-pre ⊆ user_facts ∪ db_facts         │
+            │       (4b) ID-typed args grounded in evidence (regex)   │
+            │       (4c) self-consistency: k=3 samples at T=0.7,      │
+            │            agreement ≥ τ_c                              │
+            │       (4d) counterfactual rollout (IRREV/FINAL only)    │
+            │                                                         │
+            │  (5)  Repair on ABSTAIN  (deterministic)                │
+            │       grounding/precond  → ASK_USER                     │
+            │       low SC / CF block  → RETRY w/ critique (≤2)       │
+            │       repeat-loop / out-of-budget → FINALIZE_GENERIC    │
+            │                                                         │
+            │  (6)  Execute → obs                                     │
+            │  (7)  Post-condition check (advisory)                   │
+            │  (8)  WM update (db_facts ← scalar keys in obs)         │
+            │  (9)  Loop until FINAL passes the gate.                 │
+            └─────────────────────────────────────────────────────────┘
+```
 
-If provenance is missing, mutations **fail closed** — they don't appear
-as executable in the menu, they don't compile, and (belt-and-braces) the
-transaction validator rejects them at the boundary even if they slip
-through.
+## The five risk classes
 
-## How VALENCE works (per step)
+| Class | Examples | Treatment |
+|---|---|---|
+| `READ` | `get_*`, `list_*`, `find_*`, `search_*`, `lookup_*`, `view_*` | Fast path. Repeat-loop check only. |
+| `WRITE` | `update_*`, `modify_*`, `add_*`, `edit_*`, `set_*`, `place_*`, `book_*` | Pre-cond + arg-grounding + SC. |
+| `IRREVERSIBLE` | `cancel_*`, `delete_*`, `refund_*`, `charge_*`, `send_*`, `transfer_*` | Pre-cond + arg-grounding + SC + CF rollout. |
+| `FINAL` | `respond` (when committing the user's task) | Pre-cond + SC + CF rollout. |
+| `ASK_USER` | `respond` (when asking a clarifying question) | Pass-through. |
 
-1. **Ingest**: the kernel records the user message and any tool
-   observations as immutable `Event`s.
-2. **Mint handles**: typed values (`order_id`, `user_id`,
-   `payment_method_id`, `money`, `datetime`, …) are extracted from
-   tool-result JSON (preferred) and from exact user-text spans (regex).
-   Each handle carries a pointer back to the source event.
-3. **Build affordances**: for each available tool the kernel tries to
-   bind every required parameter to a handle. Mutations are *executable*
-   only when every required risky arg is bound; otherwise they appear
-   non-executable and the menu surfaces useful read/search/ask/final
-   alternatives.
-4. **Render menu**: top-k=8 deterministic ranking, e.g.
+Auto-induction is rule-based (name prefix + parameter shape) by default —
+identical across τ-bench retail, τ-bench airline, and ACEBench Agent.
+Setting `CARGO_INDUCE_VIA_LLM=1` runs an additional one-shot LLM
+classification per ambiguous tool at startup.
 
-   ```
-   Available verified actions:
-   A1 mutation: cancel_order(order_id=O1234) — cancel an existing order
-   A2 read: get_order_details(order_id=O1234) — fetch order details
-   A3 read: get_user_details(user_id=alex_smith_42) — fetch user
-   A4 search: search_items(query=black jacket) — search catalog
-   A5 final: produce a short final answer to the user.
-   Budget: 12 steps left.
-   ```
-5. **LLM call** with the *tiny* system prompt:
+## Calibrated thresholds
 
-   > You must choose exactly one verified action_id from the menu.
-   > Do not invent tool arguments. If no executable mutation is
-   > available, choose read/search/ask/final.
-   > Return only JSON: `{"action_id":"A1"}`.
+Defaults (overridable via env vars):
 
-6. **Compile + validate**: `kernel.compile_action("A1")` → a
-   `CompiledAction(tool_name=..., kwargs=..., argument_refs=...)`. If
-   the action_id was not in the rendered menu (hallucination), or the
-   chosen affordance was non-executable, compile returns `None`. For
-   mutations, `validate_mutation` re-checks that every kwarg has a
-   provenance ref and that this exact `(tool, kwargs)` signature has
-   not been executed before in this episode.
-7. **Translate + execute**: the validated call goes through `env.step`
-   exactly like the baselines, so the upstream scorer (tau-bench reward,
-   ACEBench `score_agent.py`) sees the *real* tool name and arguments.
+| Class | k samples | SC threshold τ_c | Counterfactual? |
+|---|---:|---:|:---:|
+| WRITE | 3 | 0.66 | no |
+| IRREVERSIBLE | 3 | 0.66 | yes |
+| FINAL | 3 | 0.66 | yes |
+
+Override per class with `CARGO_SC_TAU_WRITE`, `CARGO_SC_TAU_IRREV`,
+`CARGO_SC_TAU_FINAL`, `CARGO_SC_K_*`, and `CARGO_CF_IRREV` /
+`CARGO_CF_FINAL`. Calibration on logged baseline rollouts is the v2 step
+(`src/cargo/calibration.py:fit_thresholds`).
 
 ## Diagnostics (per controller, per cell)
 
-`info.valence_stats` records:
+`info.cargo_stats` records:
 
-- `grounded_mutation_rate`        — fraction of mutation attempts that validated
-- `rejected_ungrounded_mutations` — mutations blocked for missing provenance
-- `duplicate_mutation_rejections` — same `(tool, kwargs)` already executed
-- `valence_compile_failures`      — hallucinated / non-executable choices
-- `action_menu_size_mean`         — average top-k size shown to the model
-- `mutation_attempts`, `total_actions`
+- `steps_total`, `steps_fast_path`, `steps_gated`
+- `gate_runs` and `gate_fails` per gate name
+- `abstain_total`, `repair_retry`, `repair_ask_user`, `repair_finalize`
+- `json_parse_failures`
+- `actions_executed`, `executed_by_class`
+- `per_step` (capped at 200) — per-step proposer thought, declared class,
+  gates run / failed, SC agreement, CF blocking flag
+
+The summary builder aggregates these across trajectories.
 
 ## Fixed base model (priority order)
 
-| Priority | Hugging Face ID                  | Notes |
+| Priority | Hugging Face ID | Notes |
 |---|---|---|
-| 1 | `Qwen/Qwen2.5-7B-Instruct`        | Primary. 32 K context, stable tool-calling. |
+| 1 | `Qwen/Qwen2.5-7B-Instruct` | Primary. 32 K context, stable tool-calling. |
 | 2 | `Qwen/Qwen3-4B-Instruct-2507-FP8` | FP8 fallback. |
-| 3 | `Qwen/Qwen3-4B-Instruct-2507`     | Non-FP8 last-resort fallback. |
+| 3 | `Qwen/Qwen3-4B-Instruct-2507` | Non-FP8 last-resort fallback. |
 
 `run_project.sh` tries the candidates in order and runs **the first one
 that serves successfully** for *all four* controllers — guaranteeing the
@@ -116,37 +147,54 @@ Outputs:
 outputs/
   active_model.txt
   vllm.log
-  tau_retail_baseline/   tau_retail_act/   tau_retail_react/   tau_retail_valence/
-  tau_airline_baseline/  tau_airline_act/  tau_airline_react/  tau_airline_valence/
-  acebench_agent_baseline/ acebench_agent_act/ acebench_agent_react/ acebench_agent_valence/
+  tau_retail_baseline/   tau_retail_act/   tau_retail_react/   tau_retail_cargo/
+  tau_airline_baseline/  tau_airline_act/  tau_airline_react/  tau_airline_cargo/
+  acebench_agent_baseline/ acebench_agent_act/ acebench_agent_react/ acebench_agent_cargo/
   summary/
-    summary.json   # 4-way comparison + VALENCE-vs-best-baseline + VALENCE-vs-baseline deltas
+    summary.json   # 4-way comparison + CARGO-vs-best-baseline + CARGO-vs-baseline deltas
     summary.md     # rendered table
 ```
 
 ## Tests
 
-The invariant is covered by offline unit tests (no live model needed):
+The architecture is covered by offline unit tests + an integration smoke
+test (no live model needed):
 
 ```bash
-python3 -m unittest tests.test_valence -v
+python3 -m unittest tests.test_cargo -v
 ```
 
-The suite checks: hallucinated `action_id` cannot compile; grounded
-mutations compile and validate; resolver output carries provenance;
-ambiguous resolvers fail closed; selectors only choose among
-tool-returned candidates; duplicate mutations are rejected; the rendered
-menu is bounded; choose-action JSON translates to a real tool call;
-baselines still import; VALENCE controllers initialize.
+The suite checks: rule-based risk classification; tool schema caching;
+working-memory absorption (user text + observation); precondition
+matching (positive and negative); argument-grounding regex coverage;
+repeat-loop detection; self-consistency vote (mock client with `n>1`);
+counterfactual rollout (mock client); post-condition error detection;
+proposer JSON parsing (clean / fenced / malformed / nested); repair
+policy decisions; full agent loop on a mock env that returns scripted
+observations.
 
-## What VALENCE is — and isn't
+## What CARGO is — and isn't
 
-VALENCE is **lightweight on purpose**: no extra LLM call per step, no
-search tree, no policy retriever, no LLM judge, no fine-tuning. The
-novel mechanism is one `AffordanceKernel` (≈ 200 LoC) plus typed
-handles, deterministic resolvers, and a transaction validator.
+CARGO is **lightweight on purpose**:
 
-The same kernel drives both the live tau-bench loop (real `env.step`)
-and the offline-stub ACEBench loop (translated calls preserved for
-upstream scoring). Wall-clock cost is essentially identical to the
-baselines.
+- ~1 LLM call per step on the fast path (READ).
+- 1 + 1 (with `n=3`) = 2 LLM calls on a gated WRITE step.
+- 1 + 1 + 1 = 3 LLM calls on a gated IRREVERSIBLE / FINAL step (proposer
+  + SC + CF). On a 12-turn τ-retail trajectory with ~2 IRREV/FINAL turns,
+  that's ~16 calls vs ReAct's ~12.
+
+It uses **no** tree search, **no** multi-agent debate, **no**
+fine-tuning, **no** external LLM judge, **no** memory / fingerprint
+retrieval (slot reserved for v2).
+
+The novelty story is the *composition*: risk-class typing of tools
+(auto-induced) + class-specific calibrated abstention + selective
+self-consistency only on irreversible/final actions + deterministic
+argument-grounding + named deterministic repair. None of the parts is
+unprecedented; the integration as a coherent training-free architecture
+for parameterized tool-using LLM agents, with **per-class** calibrated
+abstention rather than syntactic guardrails, is what differentiates it
+from NeMo-Guardrails (syntactic, uncalibrated), AdaPlanner (LLM-binary
+in-plan/out-of-plan judge, no class typing), KnowNo (single-skill
+robotics, no parameterized tool calls), AgentPRM/AgentRM (single-head
+PRM, not abstention), and ToolGate (contract-grounded but uncalibrated).

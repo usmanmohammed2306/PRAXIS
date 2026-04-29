@@ -1,0 +1,192 @@
+"""Typed working memory for the CARGO agent.
+
+The agent never edits memory through the LLM; the proposer reads from it,
+and *deterministic* code (tool-result parsing, gate diagnostics) writes to
+it. This is the DST-aware design: facts revealed by the user are kept
+separate from facts confirmed by a tool/DB observation, and only
+DB-confirmed facts are authoritative for irreversible actions.
+"""
+from __future__ import annotations
+
+import json
+import re
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, List, Optional
+
+
+# A short rolling window of recent action signatures (for repeat detection).
+_RECENT_WINDOW = 5
+
+
+@dataclass
+class WorkingMemory:
+    goal: str = ""
+    user_facts: List[str] = field(default_factory=list)
+    db_facts: List[str] = field(default_factory=list)
+    assumptions: List[str] = field(default_factory=list)
+    pending_obligations: List[str] = field(default_factory=list)
+    last_obs: Any = ""
+    last_error: str = ""
+    budget_steps: int = 30
+    recent_signatures: Deque[str] = field(default_factory=lambda: deque(maxlen=_RECENT_WINDOW))
+
+    # ------------------------------------------------------------------
+    # Updates
+    # ------------------------------------------------------------------
+    def absorb_user_message(self, text: str) -> None:
+        """Record facts revealed by the user in NL.
+
+        The user can lie or be mistaken, so these facts are NOT yet
+        authoritative for irreversible actions; they unlock READ tools and
+        seed argument-grounding candidates.
+        """
+        if not text:
+            return
+        clean = text.strip()
+        if not clean:
+            return
+        if clean not in self.user_facts:
+            self.user_facts.append(clean)
+        # Extract atomic candidate values (proper nouns, IDs, emails) as
+        # individual fact lines so arg-grounding has fine-grained anchors.
+        for tok in _extract_id_tokens(clean):
+            if tok not in self.user_facts:
+                self.user_facts.append(tok)
+
+    def absorb_observation(self, obs: Any) -> None:
+        """Promote scalar key/value pairs in a tool observation to db_facts."""
+        if obs is None or obs == "":
+            return
+        self.last_obs = obs
+        struct = _coerce_struct(obs)
+        if isinstance(struct, dict):
+            self._absorb_dict(struct, prefix="")
+        elif isinstance(struct, list):
+            for i, item in enumerate(struct):
+                if isinstance(item, dict):
+                    self._absorb_dict(item, prefix=f"[{i}]")
+        else:
+            # Plain string observation: extract IDs as bare facts.
+            for tok in _extract_id_tokens(str(struct)):
+                self._add_db_fact(tok)
+
+    def _absorb_dict(self, d: Dict[str, Any], prefix: str) -> None:
+        for k, v in d.items():
+            kpath = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, (str, int, float)) and v not in (None, ""):
+                self._add_db_fact(f"{kpath}={v}")
+                # Also store the value alone (helps arg-grounding substring).
+                if isinstance(v, str) and v.strip():
+                    self._add_db_fact(v.strip())
+            elif isinstance(v, dict):
+                self._absorb_dict(v, prefix=kpath)
+            elif isinstance(v, list):
+                for i, item in enumerate(v):
+                    if isinstance(item, dict):
+                        self._absorb_dict(item, prefix=f"{kpath}[{i}]")
+                    elif isinstance(item, (str, int, float)) and item not in (None, ""):
+                        self._add_db_fact(f"{kpath}[{i}]={item}")
+
+    def _add_db_fact(self, fact: str) -> None:
+        if not fact:
+            return
+        fact = fact[:400]  # cap absurd lengths
+        if fact in self.db_facts:
+            return
+        self.db_facts.append(fact)
+        # Hard cap to keep prompts bounded.
+        if len(self.db_facts) > 256:
+            self.db_facts = self.db_facts[-256:]
+
+    def record_action_signature(self, sig: str) -> None:
+        if sig:
+            self.recent_signatures.append(sig)
+
+    # ------------------------------------------------------------------
+    # Queries used by gates
+    # ------------------------------------------------------------------
+    def all_evidence(self) -> str:
+        """Concatenated evidence string used for substring grounding."""
+        return "\n".join(self.user_facts + self.db_facts)
+
+    def render_compact(self, max_chars: int = 1500) -> str:
+        """Compact NL render used in the proposer prompt."""
+        def trim(items: List[str], cap: int = 16) -> List[str]:
+            return items[-cap:]
+        last_obs_str = ""
+        if self.last_obs not in (None, ""):
+            try:
+                last_obs_str = json.dumps(self.last_obs, default=str)[:600]
+            except Exception:
+                last_obs_str = str(self.last_obs)[:600]
+        parts = [
+            f"goal: {self.goal[:200]}" if self.goal else "",
+            "user_revealed_facts:",
+            *(f"  - {f[:160]}" for f in trim(self.user_facts)),
+            "db_confirmed_facts:",
+            *(f"  - {f[:160]}" for f in trim(self.db_facts)),
+        ]
+        if self.assumptions:
+            parts += ["assumptions:", *(f"  - {a[:160]}" for a in trim(self.assumptions))]
+        if self.pending_obligations:
+            parts += ["pending_obligations:",
+                      *(f"  - {o[:160]}" for o in trim(self.pending_obligations))]
+        if last_obs_str:
+            parts.append(f"last_obs: {last_obs_str}")
+        if self.last_error:
+            parts.append(f"last_error: {self.last_error[:300]}")
+        parts.append(f"budget_steps_remaining: {self.budget_steps}")
+        out = "\n".join(p for p in parts if p)
+        return out[:max_chars]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]{3,}")
+_USER_ID_RE = re.compile(r"\b[a-z]+_[a-z]+_\d{1,8}\b")
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+
+
+def _extract_id_tokens(s: str) -> List[str]:
+    if not s:
+        return []
+    out: List[str] = []
+    seen: set = set()
+
+    def _push(tok: str) -> None:
+        if not tok or tok in seen:
+            return
+        seen.add(tok)
+        out.append(tok)
+
+    for m in _USER_ID_RE.finditer(s):
+        _push(m.group(0))
+    for m in _EMAIL_RE.finditer(s):
+        _push(m.group(0))
+    # Capital-prefixed IDs like O123, R4567, B89.
+    for m in re.finditer(r"\b[A-Z]\d{2,}\b", s):
+        _push(m.group(0))
+    # Bare numeric IDs of length >= 4.
+    for m in re.finditer(r"\b\d{4,}\b", s):
+        _push(m.group(0))
+    return out
+
+
+def _coerce_struct(obs: Any) -> Any:
+    """If `obs` is a JSON-serialized string, parse it; else return as-is."""
+    if isinstance(obs, str):
+        s = obs.strip()
+        if not s:
+            return s
+        if s[0] in "[{":
+            try:
+                return json.loads(s)
+            except Exception:
+                return s
+        return s
+    return obs
+
+
+__all__ = ["WorkingMemory"]

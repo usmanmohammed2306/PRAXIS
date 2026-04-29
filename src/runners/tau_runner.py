@@ -8,12 +8,13 @@ varies between them is the agent class instantiated per task:
   * ``act``      — :class:`baselines.ActAgent` (no reasoning prose, action-only)
   * ``react``    — :class:`baselines.ReActAgent` (one-line Thought before each
     Action)
-  * ``valence``  — :class:`valence.tau_agent.ValenceAgent` (Verified
-    Affordance Lattice for Efficient Non-hallucinating Control: the LLM
-    picks one verified action_id from a compact menu, and the kernel
-    compiles it into a real benchmark tool call; mutation arguments must
-    originate from typed handles minted from prior tool evidence or exact
-    user-text spans — this project's contribution)
+  * ``cargo``    — :class:`cargo.cargo_agent.CargoAgent` (Calibrated
+    Action-Risk Gating with Outcome-rollouts: a JSON-emitting proposer
+    declares a risk class + pre/post-conditions for each step; deterministic
+    gates check argument grounding and pre-conditions, and a calibrated
+    self-consistency vote (+ counterfactual rollout for IRREVERSIBLE / FINAL)
+    decides whether to commit, retry with a critique, ask the user, or
+    finalize. Mutations only execute after every gate passes.)
 
 Sharing the loop guarantees the gap between conditions is due to the
 controller and not divergent control flow / tool-result formatting.
@@ -38,7 +39,7 @@ from typing import Any, Dict, List, Tuple
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 
 
-AGENT_CHOICES = ["baseline", "act", "react", "valence"]
+AGENT_CHOICES = ["baseline", "act", "react", "cargo"]
 
 
 def _try_install_litellm_patch() -> None:
@@ -84,9 +85,9 @@ def _resolve_agent_cls(kind: str):
     if kind == "react":
         from ..baselines.agents import ReActAgent
         return ReActAgent
-    if kind == "valence":
-        from ..valence.tau_agent import ValenceAgent
-        return ValenceAgent
+    if kind == "cargo":
+        from ..cargo.cargo_agent import CargoAgent
+        return CargoAgent
     raise ValueError(f"Unknown agent kind: {kind}")
 
 
@@ -127,22 +128,48 @@ def _compute_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         if isinstance(msgs, list):
             step_counts.append(float(len(msgs)))
     info_errors = sum(1 for r in records if isinstance(r.get("info"), dict) and r["info"].get("error"))
-    return {
+
+    # Aggregate CARGO diagnostics if present.
+    abstain_total = 0
+    repair_retry = 0
+    repair_ask = 0
+    repair_final = 0
+    json_parse_failures = 0
+    actions_executed = 0
+    n_with_stats = 0
+    for r in records:
+        info = r.get("info") or {}
+        cs = info.get("cargo_stats") if isinstance(info, dict) else None
+        if isinstance(cs, dict):
+            n_with_stats += 1
+            abstain_total += int(cs.get("abstain_total") or 0)
+            repair_retry += int(cs.get("repair_retry") or 0)
+            repair_ask += int(cs.get("repair_ask_user") or 0)
+            repair_final += int(cs.get("repair_finalize") or 0)
+            json_parse_failures += int(cs.get("json_parse_failures") or 0)
+            actions_executed += int(cs.get("actions_executed") or 0)
+    out: Dict[str, Any] = {
         "num_tasks": len(records),
         "success_rate": safe_mean(successes),
         "avg_reward": safe_mean(rewards),
         "avg_trajectory_messages": safe_mean(step_counts),
         "error_tasks": info_errors,
     }
+    if n_with_stats:
+        out["cargo_diagnostics"] = {
+            "trajectories_with_stats": n_with_stats,
+            "abstain_total": abstain_total,
+            "repair_retry": repair_retry,
+            "repair_ask_user": repair_ask,
+            "repair_finalize": repair_final,
+            "json_parse_failures": json_parse_failures,
+            "actions_executed": actions_executed,
+        }
+    return out
 
 
 def _make_env(ns: argparse.Namespace, task_index: int):
-    """Construct a fresh tau-bench env for ``task_index``.
-
-    tau-bench's ``get_env`` parameter name for the user-side provider has
-    used both ``user_provider`` and ``user_model_provider`` historically;
-    try both.
-    """
+    """Construct a fresh tau-bench env for ``task_index``."""
     from tau_bench.envs import get_env  # type: ignore
 
     kwargs_common = dict(
@@ -164,13 +191,7 @@ def _solve_one(
     task_index: int,
     trial: int,
 ) -> Dict[str, Any]:
-    """Run a single (task_index, trial) and return the record dict.
-
-    Each call constructs its own env + agent (no shared mutable state) so
-    this is safe to call from a thread pool. The vLLM server batches
-    concurrent requests internally, which is what gives us the speed-up
-    without touching the model code.
-    """
+    """Run a single (task_index, trial) and return the record dict."""
     env = _make_env(ns, task_index)
     agent_kwargs: Dict[str, Any] = dict(
         tools_info=getattr(env, "tools_info", []) or [],
@@ -179,7 +200,7 @@ def _solve_one(
         provider=ns.model_provider,
         temperature=float(ns.temperature),
     )
-    if ns.agent == "valence":
+    if ns.agent == "cargo":
         agent_kwargs["env_hint"] = ns.env
     agent = AgentCls(**agent_kwargs)
     try:
@@ -208,15 +229,6 @@ def _solve_one(
 
 
 def _run_inprocess(ns: argparse.Namespace) -> None:
-    """Drive ``ns.agent`` through the in-process tau-bench loop.
-
-    Tasks run concurrently when ``--max-concurrency > 1``: each thread runs
-    its own (env, agent) pair end-to-end and dispatches LLM calls to the
-    shared vLLM server, which batches them internally. The Python work in
-    each thread is dominated by network I/O, so the GIL is released during
-    the `chat.completions.create` call — concurrency scales with vLLM's
-    batch size, not with thread count alone.
-    """
     _try_install_litellm_patch()
     AgentCls = _resolve_agent_cls(ns.agent)
 
