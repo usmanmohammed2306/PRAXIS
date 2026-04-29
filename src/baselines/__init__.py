@@ -2,7 +2,7 @@
 
 The package contains three reference policies that share a single in-process
 tool-calling loop. Differences live ONLY in the system prompt, so the
-comparison against VALENCE varies a single axis (the controller) and keeps
+comparison against CARGO varies a single axis (the controller) and keeps
 the model, tools, max-steps, temperature and truncation identical.
 
 - ``ToolCallingAgent``: vanilla tool-calling. The system prompt only states
@@ -17,6 +17,11 @@ the model, tools, max-steps, temperature and truncation identical.
 """
 from __future__ import annotations
 
-from .agents import ActAgent, ReActAgent, ToolCallingAgent
-
-__all__ = ["ActAgent", "ReActAgent", "ToolCallingAgent"]
+try:
+    from .agents import ActAgent, ReActAgent, ToolCallingAgent
+    __all__ = ["ActAgent", "ReActAgent", "ToolCallingAgent"]
+except ImportError:
+    # tau_bench isn't installed (e.g. unit-test environment). The
+    # ACEBench-side baseline loop in ``ace_loops.py`` has no tau-bench
+    # dependency and remains importable as ``src.baselines.ace_loops``.
+    __all__ = []
