@@ -27,7 +27,8 @@
 #   bash run_project.sh                       # auto-detect GPUs and use sensible defaults
 #   bash run_project.sh --gpus 0              # force 1-GPU mode
 #   bash run_project.sh --gpus 0,1            # force 2-GPU tensor-parallel mode
-#   bash run_project.sh --model 7b            # smaller model (1-GPU friendly)
+#   bash run_project.sh --model 7b            # explicit 7B (for 40 GB GPUs or max speed)
+#   bash run_project.sh --model 14b           # 14B (default on 1×80 GB A100/H100)
 #   bash run_project.sh --model 32b           # 32B (recommended on 2× GPUs)
 #   bash run_project.sh --profile smoke       # tiny sanity sweep (~10–15 min)
 #   bash run_project.sh --profile small       # 15 tasks × 3 trials (~1–2 h)
@@ -63,15 +64,20 @@ GPU and model:
   --gpus LIST            Comma-separated GPU indices (default: auto-detect via nvidia-smi).
                          Examples: "0", "0,1". Tensor-parallel size is derived from the count.
                          Env: GPUS=0,1
-  --model TIER           Model tier: 7b | 32b | auto (default: auto).
-                         auto = 32b when ≥2 GPUs are available, else 7b.
+  --model TIER           Model tier: 7b | 14b | 32b | auto (default: auto).
+                         auto = 32b when ≥2 GPUs are available, else 14b.
                          7b   = Qwen2.5-7B-Instruct → Qwen3-4B fallbacks.
+                                (use on 40 GB GPUs or if you need maximum speed)
+                         14b  = Qwen2.5-14B-Instruct → 7B → 4B fallbacks.
+                                (default for 1×80 GB A100/H100; better JSON quality)
                          32b  = Qwen2.5-32B-Instruct → 7B → 4B fallbacks.
-                         Env: MODEL_TIER=7b
+                                (recommended on ≥2 GPUs with TP=2)
+                         Env: MODEL_TIER=14b
   --tp N                 Override tensor-parallel-size (default: number of --gpus).
                          Env: TENSOR_PARALLEL_SIZE=2
-  --max-model-len N      Max context length (default depends on tier; 32b uses smaller).
-                         Env: MAX_MODEL_LEN=16384
+  --max-model-len N      Max context length in tokens (default: 32768 for all tiers).
+                         All tiers default to 32K; override only if you hit OOM.
+                         Env: MAX_MODEL_LEN=32768
   --gpu-mem-util F       GPU memory utilization 0..1 (default 0.80, lowered for 32B/TP=1).
                          Env: GPU_MEM_UTIL=0.85
 
@@ -196,14 +202,37 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Tier resolution: auto → 32b (≥2 GPUs) | 7b (1 GPU)
+# Tier resolution: auto → 32b (≥2 GPUs) | 14b (1 GPU, 80 GB)
+#
+# Why 14B over 7B on a single 80 GB A100/H100?
+#   • 14B BF16 weights ≈ 28 GB + KV cache at max_model_len=32768 ≈ 24 GB → ~52 GB total
+#     (concurrency=4 × 32K tokens, paged pool). Fits in 80 GB at 0.85 mem util.
+#   • The CARGO proposer must output valid structured JSON reliably. 14B has
+#     measurably better instruction-following and JSON compliance than 7B —
+#     fewer json_parse_failures, more consistent declared_class / declared_pre.
+#   • Self-consistency gate (k=3): quality of the 3 samples matters. 14B produces
+#     more meaningful votes, making the SC gate a better signal.
+#   • Speed cost: ~1.8–2.0× slower than 7B per call, still fits medium profile
+#     in ~5–9 h on a single 80 GB GPU.
+#
+# Why 32K context for all tiers?
+#   • τ-bench trajectories can be long: 30 tasks × up to 30 steps, each step
+#     appending tool-call JSON + observation. At 12K tokens, late-trajectory
+#     turns get truncated and the agent loses earlier DB-confirmed facts.
+#   • Memory budget per tier at 32K:
+#       7B  on 40 GB (0.80): 14 GB weights + ~18 GB KV pool → ~32 GB < 32 GB (✓)
+#       14B on 80 GB (0.85): 28 GB weights + ~24 GB KV pool → ~52 GB < 68 GB (✓)
+#       32B on 2×80 GB TP=2 (0.85): 32 GB/GPU weights + ~36 GB/GPU KV → ~68 GB/GPU < 68 GB (✓)
+#   • Override with --max-model-len if you hit OOM on unusual hardware.
+#
+# Use --model 7b explicitly if you have a 40 GB GPU or need maximum speed.
 # ---------------------------------------------------------------------------
 case "$MODEL_TIER" in
   auto)
-    if (( NUM_GPUS >= 2 )); then MODEL_TIER="32b"; else MODEL_TIER="7b"; fi
+    if (( NUM_GPUS >= 2 )); then MODEL_TIER="32b"; else MODEL_TIER="14b"; fi
     ;;
-  7b|32b) ;;
-  *) echo "ERROR: --model must be one of: 7b, 32b, auto (got '$MODEL_TIER')" >&2; exit 1 ;;
+  7b|14b|32b) ;;
+  *) echo "ERROR: --model must be one of: 7b, 14b, 32b, auto (got '$MODEL_TIER')" >&2; exit 1 ;;
 esac
 
 # Pick model candidate chain by tier. The first that serves successfully
@@ -214,16 +243,28 @@ if [[ "$MODEL_TIER" == "32b" ]]; then
     "Qwen/Qwen2.5-7B-Instruct"
     "Qwen/Qwen3-4B-Instruct-2507-FP8"
   )
-  # 32B: smaller default context for KV-cache headroom; lower mem util on TP=1.
-  TIER_DEFAULT_MAX_LEN=12288
+  # 32B TP=2 on 2×80 GB: 32K context; KV pool ≈ 36 GB/GPU — fits within 68 GB/GPU.
+  # TP=1 (fallback, single GPU, not recommended): uses higher mem util to compensate.
+  TIER_DEFAULT_MAX_LEN=32768
   if (( TP <= 1 )); then TIER_DEFAULT_MEM_UTIL="0.92"; else TIER_DEFAULT_MEM_UTIL="0.85"; fi
+elif [[ "$MODEL_TIER" == "14b" ]]; then
+  MODEL_CANDIDATES=(
+    "Qwen/Qwen2.5-14B-Instruct"
+    "Qwen/Qwen2.5-7B-Instruct"
+    "Qwen/Qwen3-4B-Instruct-2507-FP8"
+  )
+  # 14B on 80 GB: 32K context, KV pool ≈ 24 GB (conc=4) → ~52 GB total < 68 GB.
+  TIER_DEFAULT_MAX_LEN=32768
+  TIER_DEFAULT_MEM_UTIL="0.85"
 else
+  # 7b — explicit preference for speed or 40 GB GPUs.
   MODEL_CANDIDATES=(
     "Qwen/Qwen2.5-7B-Instruct"
     "Qwen/Qwen3-4B-Instruct-2507-FP8"
     "Qwen/Qwen3-4B-Instruct-2507"
   )
-  TIER_DEFAULT_MAX_LEN=16384
+  # 7B on 40 GB: 32K context, KV pool ≈ 18 GB (conc=4) → ~32 GB total < 32 GB (tight; 0.80).
+  TIER_DEFAULT_MAX_LEN=32768
   TIER_DEFAULT_MEM_UTIL="0.80"
 fi
 
@@ -390,6 +431,50 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
+# ---------------------------------------------------------------------------
+# GPU preflight: detect compute capability and auto-rebuild vLLM if the
+# installed build was compiled for a different GPU arch.
+#
+# Rationale: cluster schedulers often assign different GPU types across
+# jobs. A vLLM built for sm_80 (A100) fails to load on sm_90 (H100) with
+# cudaErrorNoKernelImageForDevice during _dummy_run warmup. Detecting this
+# early and triggering a rebuild avoids a silent failure hours into a run.
+# ---------------------------------------------------------------------------
+log "Running GPU preflight for vLLM compatibility"
+
+CURRENT_CAP=$(python - <<'PY'
+import torch
+if torch.cuda.is_available():
+    cap = torch.cuda.get_device_capability(0)
+    print(f"{cap[0]}.{cap[1]}")
+PY
+)
+
+log "Detected GPU capability: ${CURRENT_CAP:-unknown}"
+
+BUILD_SIG_FILE="$VENV_DIR/.vllm-build-signature"
+NEED_REBUILD=0
+
+if [[ -f "$BUILD_SIG_FILE" ]]; then
+  if ! grep -q "\"capability\": \"$CURRENT_CAP\"" "$BUILD_SIG_FILE"; then
+    log "Detected mismatch between vLLM build and current GPU — triggering rebuild"
+    NEED_REBUILD=1
+  else
+    log "vLLM build matches current GPU (sm_${CURRENT_CAP//./})"
+  fi
+else
+  log "No vLLM build signature found — triggering rebuild"
+  NEED_REBUILD=1
+fi
+
+if [[ "$NEED_REBUILD" == "1" ]]; then
+  log "Rebuilding vLLM for GPU sm_${CURRENT_CAP//./}"
+  export TORCH_CUDA_ARCH_LIST="$CURRENT_CAP"
+  SETUP_SKIP_GIT_FETCH=1 FORCE_REBUILD=1 bash setup_env.sh
+  log "Rebuild complete — re-activating environment"
+  source "$VENV_DIR/bin/activate"
+fi
+
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 log "Python: $(python --version) at $(command -v python)"
@@ -422,19 +507,24 @@ ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 # (max_model_len, gpu_memory_utilization, model-impl) being something it
 # can satisfy on the assigned device(s).
 FALLBACK1_IMPL="auto"
-FALLBACK1_MAX_LEN=$(( PRIMARY_MAX_LEN > 12288 ? 12288 : (PRIMARY_MAX_LEN * 3 / 4) ))
+# Fallback rung 1: step down to 16K to recover from OOM at 32K.
+FALLBACK1_MAX_LEN=$(( PRIMARY_MAX_LEN > 16384 ? 16384 : (PRIMARY_MAX_LEN * 3 / 4) ))
 FALLBACK1_MEM_UTIL="$(awk -v u="$PRIMARY_MEM_UTIL" 'BEGIN{printf "%.2f", u-0.05}')"
 FALLBACK2_IMPL="transformers"
+# Fallback rung 2: minimal 8K context, HF transformers backend — last resort.
 FALLBACK2_MAX_LEN=$(( PRIMARY_MAX_LEN > 8192 ? 8192 : PRIMARY_MAX_LEN ))
 FALLBACK2_MEM_UTIL="$(awk -v u="$PRIMARY_MEM_UTIL" 'BEGIN{printf "%.2f", u-0.15}')"
 
-# Truncation budgets — sized for a 16 K-token model context. _shrink_messages
+# Truncation budgets — sized for a 32 K-token model context. _shrink_messages
 # subtracts the tools JSON length from the per-message budgets at runtime, so
-# the values here are the *base* content budget (excluding tools). 32B at
-# 12K context auto-tightens via the patch's iterative shrink.
+# the values here are the *base* content budget (excluding tools). If vLLM
+# falls back to a smaller rung (16K/8K), the patch's iterative shrink loop
+# will tighten these automatically.
+#   SOFT = warn + trim oldest turns at this char count (~24K chars ≈ 32K tokens).
+#   HARD = hard-truncate remaining content to fit — keeps the last few turns intact.
 export TAU_PATCH_MAX_TOOL_CHARS="${TAU_PATCH_MAX_TOOL_CHARS:-2000}"
-export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-20000}"
-export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-12000}"
+export TAU_PATCH_SOFT_BUDGET="${TAU_PATCH_SOFT_BUDGET:-40000}"
+export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-24000}"
 
 # Wall-clock notes (per controller × benchmark cell, eager BF16):
 #   1×A100 / 7B  : ~22 LLM calls/τ-traj × 30 tasks × 3 trials, conc=4 → ~1.5 h/cell
@@ -447,12 +537,18 @@ TAU_START_INDEX="${TAU_START_INDEX:-0}"
 TAU_TEMPERATURE="${TAU_TEMPERATURE:-0.0}"
 ACE_LANGUAGE="${ACE_LANGUAGE:-en}"
 
-# OpenAI SDK timeout for direct in-process calls. 60 s is enough for a 7B
-# response on 1×A100. 32B on TP=2 stays under 90 s for normal workloads.
+# OpenAI SDK timeout for direct in-process calls.
+# At 32K context, prefill of a long trajectory can be substantial; timeouts
+# are raised from the 12K-era defaults to accommodate longer sequences.
+#   7B  on 1×A100 (32K): 90 s (was 60 s at 12K).
+#   14B on 1×A100 (32K): 120 s (was 90 s at 12K; still ~1.8–2.0× slower than 7B).
+#   32B on TP=2   (32K): 150 s (was 120 s at 12K).
 if [[ "$MODEL_TIER" == "32b" ]]; then
+  export OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-150}"
+elif [[ "$MODEL_TIER" == "14b" ]]; then
   export OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-120}"
 else
-  export OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-60}"
+  export OPENAI_TIMEOUT="${OPENAI_TIMEOUT:-90}"
 fi
 
 OUTPUTS_DIR="${OUTPUTS_DIR:-${REPO_ROOT}/outputs}"

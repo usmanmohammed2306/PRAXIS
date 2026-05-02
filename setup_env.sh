@@ -517,6 +517,19 @@ if [[ -f "$ACE_DIR/requirements.txt" ]]; then
   ensure_pytorch_stack
 fi
 
+# Download ACEBench agent dataset if not already present.
+ACE_DATA_PATH="$ACE_DIR/data/data_en/data_agent_en.json"
+if [[ ! -f "$ACE_DATA_PATH" ]]; then
+  log "Downloading ACEBench agent dataset..."
+  mkdir -p "$ACE_DIR/data/data_en"
+  curl -L \
+    -o "$ACE_DATA_PATH" \
+    https://huggingface.co/datasets/acebench/resolve/main/data_agent_en.json \
+    || log "WARNING: ACEBench dataset download failed — ace_runner will skip ACEBench cells"
+else
+  log "ACEBench dataset already present at $ACE_DATA_PATH"
+fi
+
 # ---------------------------------------------------------------------------
 # vLLM source + build-if-needed
 # ---------------------------------------------------------------------------
