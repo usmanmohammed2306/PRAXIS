@@ -30,6 +30,13 @@ class WorkingMemory:
     last_error: str = ""
     budget_steps: int = 30
     recent_signatures: Deque[str] = field(default_factory=lambda: deque(maxlen=_RECENT_WINDOW))
+    # Auth-loop guard: how many times we've already asked the user for identity
+    # credentials.  The override stops asking after 2 attempts to avoid an
+    # infinite ASK_USER bounce.
+    auth_ask_count: int = 0
+    # ZIPs that have already been tried with find_user_id_by_name_zip and
+    # returned a not-found / error.  The override skips them on retry.
+    auth_failed_zips: List[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Updates
