@@ -75,20 +75,66 @@ _PLACEHOLDER_EMAIL_RE = re.compile(
 )
 
 # Words that start sentences / common words that appear capitalised in prose
-# but are NOT person first/last names.
+# but are NOT person first/last names.  Includes brand / product words so that
+# user messages like "exchange the smart thermostat for one that works with
+# Google Home" don't get parsed as the name "Google Home".
 _NAME_STOPWORDS = frozenset({
+    # Pronouns / sentence starters / closures
     "I", "My", "The", "A", "An", "Yes", "No", "Hi", "Hello", "Hey",
     "Could", "Can", "Please", "Sure", "Thank", "Thanks", "Will", "Is",
     "This", "That", "Also", "And", "But", "Or", "Not", "Do", "Did",
     "Would", "Should", "Have", "Has", "Had", "Does", "Good", "Great",
     "Ok", "Okay", "Sorry", "Note", "Here", "There", "We", "You", "He",
     "She", "They", "It", "Our", "Your", "His", "Her", "Their", "Its",
+    # Domain nouns (auth)
     "ZIP", "Code", "ID", "Order", "Email", "Name", "Number", "Phone",
+    "User", "Customer", "Account", "Profile", "Address", "Date",
+    # Brand / product / tech nouns (retail domain)
+    "Google", "Apple", "Amazon", "Microsoft", "Sony", "Samsung", "Nintendo",
+    "Bose", "Logitech", "Asus", "Dell", "Lenovo", "Razer", "Bluetooth", "USB",
+    "Home", "Office", "Pro", "Plus", "Max", "Mini", "Lite", "Ultra", "Smart",
+    "Wireless", "Wired", "Mechanical", "Standard", "Premium", "Basic", "Light",
+    "Dark", "Black", "White", "Blue", "Red", "Green", "Yellow", "Pink",
+    "Stainless", "Steel", "Plastic", "Wood", "Glass", "Cotton", "Leather",
+    "RGB", "LED", "OLED", "TV", "PC", "Mac", "Tablet", "Laptop", "Phone",
+    "Keyboard", "Mouse", "Headset", "Charger", "Cable", "Speaker", "Camera",
+    "Watch", "Thermostat", "Vacuum", "Cleaner", "Bottle", "Backpack", "Jacket",
+    "Shirt", "Shoes", "Pants", "Dress", "Hat", "T", "Hoodie", "Sweater",
+    "Switches", "Switch", "Battery", "Display", "Screen", "Buttons", "Charging",
+    # Misc capitalised filler that occurs in commerce text
+    "Color", "Size", "Style", "Type", "Model", "Version", "Series",
+    "First", "Last", "Recent", "New", "Old", "Original",
 })
 
 _EMAIL_RE_MOD = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+# Loose pattern: any two adjacent Title-case words.  Used only as a fallback
+# when we have just asked the user for their name (i.e. they're in
+# "answering an auth question" mode).
 _NAME_PAIR_RE = re.compile(r"\b([A-Z][a-z]{1,20})\s+([A-Z][a-z]{1,20})\b")
+# Strict pattern: only extract names that follow an explicit introduction
+# phrase ("my name is X Y", "I'm X Y", "this is X Y", etc.).  This is the
+# default — it prevents random Title-case bigrams in user prose (e.g.
+# "Google Home", "Smart Thermostat") from being mistaken for person names.
+_NAME_INTRO_RE = re.compile(
+    r"(?:my\s+name\s+(?:is|'s)|i\s+am\b|i'm\b|this\s+is|call\s+me|"
+    r"name(?:\s*[:=]|d\b)|i\s+go\s+by)"
+    r"[\s,]+([A-Z][a-z]{1,20})\s+([A-Z][a-z]{1,20})",
+    re.IGNORECASE,
+)
 _ZIP_RE = re.compile(r"\b(\d{5})\b")
+
+# Goal keywords that indicate a "no auth required" query.  When the goal
+# matches AND no PII is in user_facts, the auth override redirects placeholder
+# find_user_id_by_email proposals to list_all_product_types instead of
+# asking for credentials.
+_PRODUCT_QUERY_RE = re.compile(
+    r"\b(t-?shirt|product|products|store|items?|options?|available|"
+    r"how\s+many|stock|catalog|inventory|browse|brands?)\b",
+    re.IGNORECASE,
+)
+
+# user_id pattern produced by tau-bench retail (e.g. "yusuf_rossi_9620").
+_USER_ID_PATTERN = re.compile(r"\b([a-z]+_[a-z]+_\d{1,8})\b")
 
 # Phrases that indicate the user is refusing to provide authentication info.
 # When any of these are found we stop asking and issue a polite FINAL.
@@ -692,15 +738,24 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if action.name == "find_user_id_by_name_zip":
                 zip_tried = str(action.args.get("zip", ""))
                 obs_lower = tool_obs.lower() if tool_obs else ""
-                if zip_tried and (
+                lookup_failed = zip_tried and (
                     "not found" in obs_lower
                     or '"error"' in obs_lower
                     or obs_lower.lstrip().startswith("error")
                     or "no user" in obs_lower
                     or "invalid" in obs_lower
-                ):
+                )
+                if lookup_failed:
                     if zip_tried not in wm.auth_failed_zips:
                         wm.auth_failed_zips.append(zip_tried)
+
+            # Cache user_id on successful auth lookup so the override can
+            # cleanly suppress subsequent find_user_id_* proposals.
+            if action.name in ("find_user_id_by_email", "find_user_id_by_name_zip"):
+                if tool_obs:
+                    m = _USER_ID_PATTERN.search(tool_obs)
+                    if m and not wm.auth_user_id:
+                        wm.auth_user_id = m.group(1)
             # Post-condition check (advisory).
             try:
                 post_obs = json.loads(tool_obs) if tool_obs.strip().startswith(("{", "[")) else tool_obs
@@ -738,6 +793,131 @@ class CargoAgent(Agent):  # type: ignore[misc]
     # ------------------------------------------------------------------
     # Authentication override
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Identity extraction helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_real_email(facts: List[str]) -> Optional[str]:
+        for fact in facts:
+            m = _EMAIL_RE_MOD.search(fact)
+            if m and not _PLACEHOLDER_EMAIL_RE.match(m.group(0)):
+                return m.group(0)
+        return None
+
+    @staticmethod
+    def _extract_name_pair(
+        facts: List[str], in_response_to_ask: bool
+    ) -> Optional[Tuple[str, str]]:
+        """Return (first_name, last_name) extracted from user facts.
+
+        Strategy:
+        - Always try the strict introduction-anchored pattern first.  This
+          requires the name to follow phrases like "my name is", "I'm",
+          "this is", which prevents random Title-case bigrams in product
+          descriptions ("Google Home", "Smart Thermostat") from being
+          mistaken for a person's name.
+        - Only when ``in_response_to_ask`` is True (we just asked the user
+          for their name) do we fall back to the loose Title-case pattern.
+          Even in fallback we apply the stopword list so brand words don't
+          slip through.
+        """
+        # Strict pass: introduction-anchored
+        for fact in facts:
+            m = _NAME_INTRO_RE.search(fact)
+            if not m:
+                continue
+            fn, ln = m.group(1), m.group(2)
+            if fn not in _NAME_STOPWORDS and ln not in _NAME_STOPWORDS:
+                return fn, ln
+        if not in_response_to_ask:
+            return None
+        # Loose fallback when we just asked for a name
+        for fact in facts:
+            for m in _NAME_PAIR_RE.finditer(fact):
+                fn, ln = m.group(1), m.group(2)
+                if fn not in _NAME_STOPWORDS and ln not in _NAME_STOPWORDS:
+                    return fn, ln
+        return None
+
+    @staticmethod
+    def _extract_zip(facts: List[str], failed_zips: List[str]) -> Optional[str]:
+        for fact in facts:
+            m = _ZIP_RE.search(fact)
+            if m:
+                candidate = m.group(1)
+                if candidate not in failed_zips:
+                    return candidate
+        return None
+
+    @staticmethod
+    def _existing_user_id(wm: "WorkingMemory") -> Optional[str]:
+        """Return a user_id from db_facts (or wm.auth_user_id), if any."""
+        if wm.auth_user_id:
+            return wm.auth_user_id
+        for fact in wm.db_facts:
+            m = _USER_ID_PATTERN.search(fact)
+            if m:
+                return m.group(1)
+        return None
+
+    @staticmethod
+    def _is_no_auth_query(wm: "WorkingMemory") -> bool:
+        """Heuristic: does the goal look like a pure product/store query?"""
+        if not wm.goal:
+            return False
+        return bool(_PRODUCT_QUERY_RE.search(wm.goal))
+
+    def _post_auth_action(self, wm: "WorkingMemory") -> Optional[ProposedAction]:
+        """Build a sensible next action after the user has been authenticated.
+
+        Called when the model proposes find_user_id_* even though we already
+        have a user_id.  Replaces the redundant lookup with a progress action.
+        """
+        user_id = self._existing_user_id(wm)
+        if not user_id:
+            return None
+
+        # If we haven't called get_user_details yet, do that.
+        already_called = any(
+            "get_user_details" in s and user_id in s
+            for s in wm.recent_signatures
+        )
+        if not already_called:
+            return ProposedAction(
+                name="get_user_details",
+                args={"user_id": user_id},
+                declared_class=RiskClass.READ,
+                declared_pre=["user authenticated"],
+                declared_post=["user details retrieved"],
+                informational_intent="fetch authenticated user's profile",
+                raw_thought=(
+                    "Post-auth override: replacing redundant find_user_id_* "
+                    "with get_user_details to make progress on the goal."
+                ),
+                user_text="",
+                raw_response="",
+            )
+
+        # Already have user details.  Route by goal keywords.
+        if self._is_no_auth_query(wm):
+            return ProposedAction(
+                name="list_all_product_types",
+                args={},
+                declared_class=RiskClass.READ,
+                declared_pre=["product query"],
+                declared_post=["product types listed"],
+                informational_intent="list product types for the user",
+                raw_thought="Post-auth override: routing to list_all_product_types for product query.",
+                user_text="",
+                raw_response="",
+            )
+
+        # Default: return None and let the model figure out the next step.
+        return None
+
+    # ------------------------------------------------------------------
+    # Authentication override
+    # ------------------------------------------------------------------
     def _auth_override(
         self,
         action: ProposedAction,
@@ -746,117 +926,168 @@ class CargoAgent(Agent):  # type: ignore[misc]
         """Intercept a placeholder-email lookup and replace it with the
         right action based on what the user has actually told us.
 
-        This is needed because some models are deeply biased toward
-        ``find_user_id_by_email`` and ignore all critiques telling them to
-        use ``find_user_id_by_name_zip`` instead.  The override is purely
-        deterministic — it fires only when the arg is a clear placeholder
-        and the working memory contains better information.
-
-        Guard rails implemented here:
-        - If the user has refused to share identity info → FINAL (no loop).
-        - If we've already asked _MAX_AUTH_ASKS times → FINAL (no loop).
-        - If a ZIP was tried and came back not-found → skip it and ask for a
-          different/corrected ZIP instead of retrying the same one.
+        Failure modes this guards against (each has been observed in traces):
+        - Model is biased toward ``find_user_id_by_email`` and ignores
+          critiques telling it to use ``find_user_id_by_name_zip``.
+        - Model proposes find_user_id_* AFTER successful authentication
+          → loops on placeholder email forever.
+        - User asks a no-auth query (e.g. "how many t-shirts?") → without
+          this override the model still tries to authenticate.
+        - User refuses to share credentials → must transition cleanly to a
+          no-auth pathway, not loop on the same FINAL message.
+        - Greedy name extraction picks up brand/product words ("Google Home",
+          "Smart Thermostat") → the strict intro-anchored extractor below
+          rejects these unless they follow a name introduction phrase.
 
         Return value:
           - A replacement ProposedAction if the override applies.
           - None if the model's proposal should proceed unchanged.
         """
-        # Only override find_user_id_by_email with a placeholder arg.
-        if action.name != "find_user_id_by_email":
-            return None
-        email_val = str(action.args.get("email", ""))
-        is_placeholder = (
-            not email_val
-            or _PLACEHOLDER_EMAIL_RE.match(email_val)
-            or "@example." in email_val.lower()
-            or "@test." in email_val.lower()
-        )
-        if not is_placeholder:
-            return None  # model has a real email — let it proceed
-
-        # Already authenticated? (user_id present in db_facts)
-        if any(
-            re.search(r"\b[a-z]+_[a-z]+_\d{1,8}\b", f)
-            for f in wm.db_facts
-        ):
+        # Only override find_user_id_by_email / find_user_id_by_name_zip.
+        if not action.name.startswith("find_user_id_"):
             return None
 
-        # --- Check if the user has explicitly refused to provide credentials ---
+        # If the model's name-zip call already has clean grounded args (real
+        # name, real zip, neither in failed list), let it through.  Only
+        # override email-with-placeholder.
+        if action.name == "find_user_id_by_name_zip":
+            zp = str(action.args.get("zip", ""))
+            fn = str(action.args.get("first_name", ""))
+            ln = str(action.args.get("last_name", ""))
+            # Block if the model is using stopword-tainted args (e.g. "Google Home")
+            if fn in _NAME_STOPWORDS or ln in _NAME_STOPWORDS:
+                # Tainted — fall through to the placeholder-rewrite logic.
+                pass
+            elif zp in wm.auth_failed_zips:
+                # Reusing a known-bad ZIP — fall through.
+                pass
+            else:
+                # Looks clean — let it proceed.
+                return None
+
+        # ---------------------------------------------------------------
+        # Path 1: Already authenticated (user_id in db_facts).  The model is
+        # in a placeholder-email loop and we need to redirect it.
+        # ---------------------------------------------------------------
+        existing_user_id = self._existing_user_id(wm)
+        if existing_user_id:
+            wm.auth_user_id = existing_user_id  # cache for downstream
+            return self._post_auth_action(wm)
+
+        # ---------------------------------------------------------------
+        # Placeholder check (only applies to find_user_id_by_email)
+        # ---------------------------------------------------------------
+        if action.name == "find_user_id_by_email":
+            email_val = str(action.args.get("email", ""))
+            is_placeholder = (
+                not email_val
+                or _PLACEHOLDER_EMAIL_RE.match(email_val)
+                or "@example." in email_val.lower()
+                or "@test." in email_val.lower()
+            )
+            if not is_placeholder:
+                return None  # model has a real email — let it proceed
+
+        # ---------------------------------------------------------------
+        # Path 2: Auth has been abandoned (refused / ask budget exhausted).
+        # Don't ask again.  If goal is no-auth, redirect; else emit a
+        # one-shot FINAL (guarded so we don't repeat it).
+        # ---------------------------------------------------------------
         all_user_text = " ".join(wm.user_facts).lower()
         user_refused = any(phrase in all_user_text for phrase in _AUTH_REFUSAL_PHRASES)
-        if user_refused:
-            return ProposedAction(
-                name=RESPOND_TOOL_NAME,
-                args={},
-                declared_class=RiskClass.FINAL,
-                declared_pre=[],
-                declared_post=[],
-                informational_intent="user declined to provide credentials",
-                raw_thought="Auth override: user refused to share identity — stopping.",
-                user_text=(
-                    "I understand. I'm unable to access your account without "
-                    "verifying your identity. If you change your mind, feel free "
-                    "to ask again."
-                ),
-                raw_response="",
-            )
+        if user_refused or wm.auth_ask_count >= _MAX_AUTH_ASKS:
+            wm.auth_abandoned = True
 
-        # --- Hard cap on auth asks to prevent infinite bounce ---
-        if wm.auth_ask_count >= _MAX_AUTH_ASKS:
-            return ProposedAction(
-                name=RESPOND_TOOL_NAME,
-                args={},
-                declared_class=RiskClass.FINAL,
-                declared_pre=[],
-                declared_post=[],
-                informational_intent="auth ask limit reached",
-                raw_thought="Auth override: exhausted auth ask budget — stopping.",
-                user_text=(
+        if wm.auth_abandoned:
+            if self._is_no_auth_query(wm):
+                # Pivot to no-auth pathway.
+                return ProposedAction(
+                    name="list_all_product_types",
+                    args={},
+                    declared_class=RiskClass.READ,
+                    declared_pre=["no-auth query"],
+                    declared_post=["product types listed"],
+                    informational_intent="answer product query without auth",
+                    raw_thought=(
+                        "Auth abandoned + product query → list_all_product_types."
+                    ),
+                    user_text="",
+                    raw_response="",
+                )
+            # Otherwise emit a FINAL exactly once.
+            if wm.auth_giveup_emitted:
+                # We've already said this — break the loop by returning a
+                # different short FINAL.
+                return ProposedAction(
+                    name=RESPOND_TOOL_NAME,
+                    args={},
+                    declared_class=RiskClass.FINAL,
+                    declared_pre=[],
+                    declared_post=[],
+                    informational_intent="auth abandoned — terminate",
+                    raw_thought="Auth abandoned, already gave up once — terminating.",
+                    user_text="Is there anything else I can help you with?",
+                    raw_response="",
+                )
+            wm.auth_giveup_emitted = True
+            if user_refused:
+                msg = (
+                    "I understand. I'm unable to access account-specific data "
+                    "without verifying your identity, but if you have a general "
+                    "question I'm happy to help."
+                )
+            else:
+                msg = (
                     "I'm having trouble verifying your identity with the "
                     "information provided. Please try again with your email "
                     "address or the name and ZIP code on your account."
-                ),
+                )
+            return ProposedAction(
+                name=RESPOND_TOOL_NAME,
+                args={},
+                declared_class=RiskClass.FINAL,
+                declared_pre=[],
+                declared_post=[],
+                informational_intent="auth abandoned",
+                raw_thought="Auth override: abandoning auth flow.",
+                user_text=msg,
                 raw_response="",
             )
 
-        # --- Extract what the user has actually told us ---
-        evidence_facts = wm.user_facts  # user-provided, not yet DB-confirmed
+        # ---------------------------------------------------------------
+        # Path 3: No PII at all AND the goal is a no-auth query (product
+        # query) → redirect to list_all_product_types.  This is a critical
+        # fix: without it, the model's reflexive find_user_id_by_email gets
+        # converted to "please give us your credentials" even though the
+        # user only wanted to know how many t-shirts there are.
+        # ---------------------------------------------------------------
+        in_response_to_ask = wm.auth_ask_count > 0
+        evidence = wm.user_facts
+        real_email = self._extract_real_email(evidence)
+        name_pair = self._extract_name_pair(evidence, in_response_to_ask)
+        zip_code = self._extract_zip(evidence, wm.auth_failed_zips)
+        has_any_pii = bool(real_email or name_pair or zip_code)
 
-        # 1. Real email (non-placeholder) from user messages
-        real_email: Optional[str] = None
-        for fact in evidence_facts:
-            m = _EMAIL_RE_MOD.search(fact)
-            if m and not _PLACEHOLDER_EMAIL_RE.match(m.group(0)):
-                real_email = m.group(0)
-                break
+        if not has_any_pii and self._is_no_auth_query(wm):
+            return ProposedAction(
+                name="list_all_product_types",
+                args={},
+                declared_class=RiskClass.READ,
+                declared_pre=["product query, no auth needed"],
+                declared_post=["product types listed"],
+                informational_intent="answer product query directly",
+                raw_thought=(
+                    "Auth override: product query with no PII → "
+                    "list_all_product_types instead of asking for auth."
+                ),
+                user_text="",
+                raw_response="",
+            )
 
-        # 2. Name pair (two adjacent Title-case words not in stopword list)
-        first_name: Optional[str] = None
-        last_name: Optional[str] = None
-        for fact in evidence_facts:
-            for m in _NAME_PAIR_RE.finditer(fact):
-                fn, ln = m.group(1), m.group(2)
-                if fn not in _NAME_STOPWORDS and ln not in _NAME_STOPWORDS:
-                    first_name, last_name = fn, ln
-                    break
-            if first_name:
-                break
-
-        # 3. ZIP code (5 digits) — skip any that already failed
-        zip_code: Optional[str] = None
-        for fact in evidence_facts + wm.db_facts:
-            m = _ZIP_RE.search(fact)
-            if m:
-                candidate = m.group(1)
-                if candidate not in wm.auth_failed_zips:
-                    zip_code = candidate
-                    break
-
-        # --- Decide the override action ---
-
+        # ---------------------------------------------------------------
+        # Path 4: Use the best evidence we have.
+        # ---------------------------------------------------------------
         if real_email:
-            # User actually gave their email — use it (will pass grounding).
             return ProposedAction(
                 name="find_user_id_by_email",
                 args={"email": real_email},
@@ -869,13 +1100,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 raw_response="",
             )
 
-        if first_name and last_name and zip_code:
-            # Full name + zip available — look up by name+zip.
+        if name_pair and zip_code:
             return ProposedAction(
                 name="find_user_id_by_name_zip",
                 args={
-                    "first_name": first_name,
-                    "last_name": last_name,
+                    "first_name": name_pair[0],
+                    "last_name": name_pair[1],
                     "zip": zip_code,
                 },
                 declared_class=RiskClass.READ,
@@ -887,9 +1117,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 raw_response="",
             )
 
-        if first_name and last_name and wm.auth_failed_zips:
-            # We have a name but the ZIP the user gave already failed — ask for
-            # a corrected one rather than retrying the same invalid ZIP.
+        if name_pair and wm.auth_failed_zips:
             wm.auth_ask_count += 1
             failed = wm.auth_failed_zips[-1]
             return ProposedAction(
@@ -901,15 +1129,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 informational_intent="ask user to re-verify zip code",
                 raw_thought=f"Auth override: ZIP {failed} not found — asking for re-verification.",
                 user_text=(
-                    f"I wasn't able to find an account for {first_name} {last_name} "
+                    f"I wasn't able to find an account for {name_pair[0]} {name_pair[1]} "
                     f"with ZIP code {failed}. Could you double-check your ZIP code "
                     "and provide the correct one?"
                 ),
                 raw_response="",
             )
 
-        if first_name and last_name:
-            # Have name but no zip yet — ask specifically for zip.
+        if name_pair:
             wm.auth_ask_count += 1
             return ProposedAction(
                 name=RESPOND_TOOL_NAME,
@@ -920,13 +1147,13 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 informational_intent="ask user for zip code",
                 raw_thought="Auth override: have name, need zip code.",
                 user_text=(
-                    f"Thank you, {first_name}! To verify your identity, "
+                    f"Thank you, {name_pair[0]}! To verify your identity, "
                     "could you also provide your ZIP code?"
                 ),
                 raw_response="",
             )
 
-        # No usable identity info — ask for email or name+zip.
+        # No usable identity info AND the goal needs auth — ask once.
         wm.auth_ask_count += 1
         return ProposedAction(
             name=RESPOND_TOOL_NAME,

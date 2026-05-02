@@ -982,8 +982,8 @@ class TestAuthOverride(unittest.TestCase):
     def test_user_provides_name_only_asks_for_zip(self) -> None:
         agent = self._make_agent()
         wm = WorkingMemory()
-        # Name but no ZIP in user facts
-        wm.user_facts = ["Yusuf Ali"]
+        # Name introduced via the canonical "my name is" phrase
+        wm.user_facts = ["My name is Yusuf Ali"]
         action = self._placeholder_action()
         result = agent._auth_override(action, wm)
         self.assertIsNotNone(result)
@@ -997,7 +997,7 @@ class TestAuthOverride(unittest.TestCase):
     def test_zip_not_found_asks_reverification(self) -> None:
         agent = self._make_agent()
         wm = WorkingMemory()
-        wm.user_facts = ["Yusuf Ali", "10001"]
+        wm.user_facts = ["My name is Yusuf Ali", "10001"]
         wm.auth_failed_zips = ["10001"]  # simulates a failed lookup
         action = self._placeholder_action()
         result = agent._auth_override(action, wm)
@@ -1013,7 +1013,7 @@ class TestAuthOverride(unittest.TestCase):
     def test_zip_not_found_prevents_same_zip_retry(self) -> None:
         agent = self._make_agent()
         wm = WorkingMemory()
-        wm.user_facts = ["Yusuf Ali", "10001"]
+        wm.user_facts = ["My name is Yusuf Ali", "10001"]
         wm.auth_failed_zips = ["10001"]
         action = self._placeholder_action()
         result = agent._auth_override(action, wm)
@@ -1159,6 +1159,255 @@ class TestAuthOverride(unittest.TestCase):
         )
         result = agent._auth_override(action, wm)
         self.assertIsNone(result)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for trajectories(17) failure patterns
+# ---------------------------------------------------------------------------
+class TestTrajectoryRegressions(unittest.TestCase):
+    """Each test here corresponds to a *specific* failure pattern observed
+    in `trajectories (17).jsonl`.  These tests must pass for the fixes to
+    be considered correct."""
+
+    def _make_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        client = MockClient(scripts=[])
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "test"
+        agent.style_name = "cargo"
+        agent.temperature = 0.0
+        agent.schemas = {}
+        agent.domain_policy = ""
+        return agent
+
+    def _placeholder(self) -> ProposedAction:
+        return ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": "user@example.com"},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+
+    # ------------------------------------------------------------------
+    # Bug A: Greedy name extraction picked "Google Home" from product text.
+    # The user's first message was about exchanging a thermostat, NOT an
+    # auth introduction.  Verify the strict extractor rejects this.
+    # ------------------------------------------------------------------
+    def test_brand_words_not_extracted_as_name(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "exchange the smart thermostat for a model that works with "
+            "Google Home"
+        )
+        wm.absorb_user_message(
+            "I want to exchange the smart thermostat for one that works "
+            "with Google Home."
+        )
+        action = self._placeholder()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        # Must NOT propose find_user_id_by_name_zip with first_name='Google'
+        if result.name == "find_user_id_by_name_zip":  # type: ignore[union-attr]
+            self.fail(
+                "Override extracted brand words 'Google Home' as a name "
+                f"and proposed: {result.args}"  # type: ignore[union-attr]
+            )
+        # And the user_text must not address the user as 'Google'
+        self.assertNotIn("Thank you, Google", result.user_text or "")  # type: ignore[union-attr]
+
+    def test_product_pair_not_extracted_as_name(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("I'd like the Smart Thermostat please.")
+        action = self._placeholder()
+        result = agent._auth_override(action, wm)
+        # Must not propose name+zip lookup using "Smart Thermostat"
+        if result and result.name == "find_user_id_by_name_zip":
+            self.fail(f"Extracted product pair as name: {result.args}")
+
+    # ------------------------------------------------------------------
+    # Bug B: Auth fired on a pure product query.
+    # The fix: when goal matches _PRODUCT_QUERY_RE and no PII is present,
+    # redirect to list_all_product_types.
+    # ------------------------------------------------------------------
+    def test_product_query_no_pii_redirects_to_list_products(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "I'd like to know how many t-shirt options are available in the store."
+        wm.absorb_user_message(wm.goal)
+        action = self._placeholder()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "list_all_product_types")  # type: ignore[union-attr]
+        self.assertEqual(result.declared_class, RiskClass.READ)  # type: ignore[union-attr]
+
+    def test_account_goal_still_asks_for_auth(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "I want to cancel my recent order."
+        wm.absorb_user_message(wm.goal)
+        action = self._placeholder()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        # Account-related goals still require authentication
+        self.assertEqual(result.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertEqual(wm.auth_ask_count, 1)
+
+    # ------------------------------------------------------------------
+    # Bug C: After successful auth, model loops on find_user_id_by_email.
+    # Fix: when user_id exists in db_facts, replace with get_user_details.
+    # ------------------------------------------------------------------
+    def test_post_auth_replaces_with_get_user_details(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        # Simulate that find_user_id_by_name_zip already succeeded
+        wm.db_facts = ["yusuf_rossi_9620"]
+        action = self._placeholder()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_user_details")  # type: ignore[union-attr]
+        self.assertEqual(result.args["user_id"], "yusuf_rossi_9620")  # type: ignore[union-attr]
+
+    def test_post_auth_after_get_user_details_routes_by_goal(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.db_facts = ["yusuf_rossi_9620"]
+        wm.goal = "How many t-shirt options are in the store?"
+        # Pretend get_user_details(yusuf_rossi_9620) was already called
+        wm.recent_signatures.append("get_user_details(user_id=yusuf_rossi_9620)")
+        action = self._placeholder()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "list_all_product_types")  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # Bug D: FINAL respond looped infinitely after refusal.
+    # Fix: emit the giveup FINAL exactly once, then a short different one.
+    # ------------------------------------------------------------------
+    def test_refusal_emits_final_then_different_final(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("I prefer not to share my details.")
+        action = self._placeholder()
+        result1 = agent._auth_override(action, wm)
+        self.assertIsNotNone(result1)
+        self.assertEqual(result1.declared_class, RiskClass.FINAL)  # type: ignore[union-attr]
+        # Second call should NOT return the identical FINAL message
+        result2 = agent._auth_override(action, wm)
+        self.assertIsNotNone(result2)
+        self.assertEqual(result2.declared_class, RiskClass.FINAL)  # type: ignore[union-attr]
+        self.assertNotEqual(result1.user_text, result2.user_text)  # type: ignore[union-attr]
+
+    def test_refusal_then_product_query_pivots(self) -> None:
+        """User refused auth, but their query is a product query.  The
+        override must pivot from ASK_USER → list_all_product_types."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirts are in the store?"
+        wm.absorb_user_message("I prefer not to share that information.")
+        # First call: marks abandoned + emits FINAL
+        result1 = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result1)
+        self.assertTrue(wm.auth_abandoned)
+        # Second call: product-query pivot, NOT another refusal FINAL
+        result2 = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result2)
+        self.assertEqual(result2.name, "list_all_product_types")  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # Bug E: Tainted name+zip args are still re-issued by the model.
+    # If the model proposes find_user_id_by_name_zip with stopword args,
+    # the override must reject them and fall through to safer logic.
+    # ------------------------------------------------------------------
+    def test_stopword_name_args_blocked_in_name_zip(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange smart thermostat that works with Google Home"
+        action = ProposedAction(
+            name="find_user_id_by_name_zip",
+            args={"first_name": "Google", "last_name": "Home", "zip": "10012"},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+        result = agent._auth_override(action, wm)
+        # Must override — the original args contained stopword ("Google", "Home")
+        self.assertIsNotNone(result)
+        if result.name == "find_user_id_by_name_zip":  # type: ignore[union-attr]
+            self.assertNotEqual(result.args.get("first_name"), "Google")  # type: ignore[union-attr]
+            self.assertNotEqual(result.args.get("last_name"), "Home")  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # Bug F: Loose name-pair extraction fires only after we asked.
+    # ------------------------------------------------------------------
+    def test_name_extraction_strict_without_intro(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        # No intro phrase, no prior ask → must NOT extract
+        result = CargoAgent._extract_name_pair(["Yusuf Rossi"], in_response_to_ask=False)
+        self.assertIsNone(result)
+
+    def test_name_extraction_loose_after_ask(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        # No intro phrase but we just asked → loose fallback fires
+        result = CargoAgent._extract_name_pair(["Yusuf Rossi"], in_response_to_ask=True)
+        self.assertIsNotNone(result)
+        self.assertEqual(result, ("Yusuf", "Rossi"))
+
+    def test_name_extraction_with_intro_phrase(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        result = CargoAgent._extract_name_pair(
+            ["My name is Yusuf Rossi and my zip is 19122"],
+            in_response_to_ask=False,
+        )
+        self.assertEqual(result, ("Yusuf", "Rossi"))
+
+    def test_name_extraction_rejects_brand_with_intro(self) -> None:
+        """Even with intro phrase, brand stopwords should be rejected."""
+        from src.cargo.cargo_agent import CargoAgent
+        result = CargoAgent._extract_name_pair(
+            ["my name is Google Home"],  # adversarial
+            in_response_to_ask=True,
+        )
+        # Both tokens are stopwords → fallback rejects too
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # End-to-end auth flow: name+ZIP → user_id → get_user_details
+    # ------------------------------------------------------------------
+    def test_full_auth_flow_progresses(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "Cancel my order"
+        # User just provided full name + zip in a clean introduction
+        wm.absorb_user_message("My name is Yusuf Rossi and my ZIP is 19122.")
+        action = self._placeholder()
+        # Step 1: should propose find_user_id_by_name_zip with the right args
+        result1 = agent._auth_override(action, wm)
+        self.assertIsNotNone(result1)
+        self.assertEqual(result1.name, "find_user_id_by_name_zip")  # type: ignore[union-attr]
+        self.assertEqual(result1.args["first_name"], "Yusuf")  # type: ignore[union-attr]
+        self.assertEqual(result1.args["last_name"], "Rossi")  # type: ignore[union-attr]
+        self.assertEqual(result1.args["zip"], "19122")  # type: ignore[union-attr]
+        # Step 2: simulate that the lookup succeeded and yusuf_rossi_9620 was returned
+        wm.db_facts.append("yusuf_rossi_9620")
+        wm.auth_user_id = "yusuf_rossi_9620"
+        # Now the model still proposes find_user_id_by_email (the bug)
+        result2 = agent._auth_override(action, wm)
+        self.assertIsNotNone(result2)
+        # Must NOT be ASK_USER or another find_user_id_*; must be progress
+        self.assertEqual(result2.name, "get_user_details")  # type: ignore[union-attr]
+        self.assertEqual(result2.args["user_id"], "yusuf_rossi_9620")  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------
