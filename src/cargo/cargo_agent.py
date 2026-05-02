@@ -13,6 +13,7 @@ tau-bench dependency, so it can be unit-tested without a live env.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 try:  # tau-bench is optional at import-time so unit tests can run without it.
@@ -62,6 +63,32 @@ def _get_openai_client():
 
 RESPOND_TOOL_NAME = "respond"
 RESPOND_MAX_CHARS = 800
+
+# ---------------------------------------------------------------------------
+# Authentication-override helpers
+# ---------------------------------------------------------------------------
+# Emails that are clearly fabricated placeholders — never a real user email.
+_PLACEHOLDER_EMAIL_RE = re.compile(
+    r"^(user|customer|test|example|demo|agent|admin|noreply|placeholder)"
+    r"@(example|test|placeholder|sample|dummy|fake|mail)\.",
+    re.I,
+)
+
+# Words that start sentences / common words that appear capitalised in prose
+# but are NOT person first/last names.
+_NAME_STOPWORDS = frozenset({
+    "I", "My", "The", "A", "An", "Yes", "No", "Hi", "Hello", "Hey",
+    "Could", "Can", "Please", "Sure", "Thank", "Thanks", "Will", "Is",
+    "This", "That", "Also", "And", "But", "Or", "Not", "Do", "Did",
+    "Would", "Should", "Have", "Has", "Had", "Does", "Good", "Great",
+    "Ok", "Okay", "Sorry", "Note", "Here", "There", "We", "You", "He",
+    "She", "They", "It", "Our", "Your", "His", "Her", "Their", "Its",
+    "ZIP", "Code", "ID", "Order", "Email", "Name", "Number", "Phone",
+})
+
+_EMAIL_RE_MOD = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+_NAME_PAIR_RE = re.compile(r"\b([A-Z][a-z]{1,20})\s+([A-Z][a-z]{1,20})\b")
+_ZIP_RE = re.compile(r"\b(\d{5})\b")
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +372,29 @@ class CargoAgent(Agent):  # type: ignore[misc]
 
             proposer_messages = self._build_proposer_messages(wm, messages, critique)
             action, raw_text = self._call_proposer(proposer_messages)
+
+            # Authentication override: if the proposer is stuck using a
+            # placeholder email, replace the action with the best alternative
+            # we can construct from what the user has actually provided.
+            # This bypasses the model's inability to follow the name+zip hint
+            # in critiques and is purely deterministic / zero-cost.
+            if action is not None:
+                auth_action = self._auth_override(action, wm)
+                if auth_action is not None:
+                    raw_text = json.dumps({
+                        "thought": auth_action.raw_thought,
+                        "action": {
+                            "name": auth_action.name,
+                            "args": auth_action.args,
+                            "declared_class": auth_action.declared_class.value,
+                            "declared_pre": auth_action.declared_pre,
+                            "declared_post": auth_action.declared_post,
+                            "informational_intent": auth_action.informational_intent,
+                            "user_text": auth_action.user_text,
+                        },
+                    })
+                    action = auth_action
+
             messages.append({"role": "assistant", "content": raw_text or ""})
 
             if action is None:
@@ -603,6 +653,145 @@ class CargoAgent(Agent):  # type: ignore[misc]
             info=info,
             messages=messages,
             total_cost=total_cost,
+        )
+
+    # ------------------------------------------------------------------
+    # Authentication override
+    # ------------------------------------------------------------------
+    def _auth_override(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """Intercept a placeholder-email lookup and replace it with the
+        right action based on what the user has actually told us.
+
+        This is needed because some models are deeply biased toward
+        ``find_user_id_by_email`` and ignore all critiques telling them to
+        use ``find_user_id_by_name_zip`` instead.  The override is purely
+        deterministic — it fires only when the arg is a clear placeholder
+        and the working memory contains better information.
+
+        Return value:
+          - A replacement ProposedAction if the override applies.
+          - None if the model's proposal should proceed unchanged.
+        """
+        # Only override find_user_id_by_email with a placeholder arg.
+        if action.name != "find_user_id_by_email":
+            return None
+        email_val = str(action.args.get("email", ""))
+        is_placeholder = (
+            not email_val
+            or _PLACEHOLDER_EMAIL_RE.match(email_val)
+            or "@example." in email_val.lower()
+            or "@test." in email_val.lower()
+        )
+        if not is_placeholder:
+            return None  # model has a real email — let it proceed
+
+        # Already authenticated? (user_id present in db_facts)
+        if any(
+            re.search(r"\b[a-z]+_[a-z]+_\d{1,8}\b", f)
+            for f in wm.db_facts
+        ):
+            return None
+
+        # --- Extract what the user has actually told us ---
+        evidence_facts = wm.user_facts  # user-provided, not yet DB-confirmed
+
+        # 1. Real email (non-placeholder) from user messages
+        real_email: Optional[str] = None
+        for fact in evidence_facts:
+            m = _EMAIL_RE_MOD.search(fact)
+            if m and not _PLACEHOLDER_EMAIL_RE.match(m.group(0)):
+                real_email = m.group(0)
+                break
+
+        # 2. Name pair (two adjacent Title-case words not in stopword list)
+        first_name: Optional[str] = None
+        last_name: Optional[str] = None
+        for fact in evidence_facts:
+            for m in _NAME_PAIR_RE.finditer(fact):
+                fn, ln = m.group(1), m.group(2)
+                if fn not in _NAME_STOPWORDS and ln not in _NAME_STOPWORDS:
+                    first_name, last_name = fn, ln
+                    break
+            if first_name:
+                break
+
+        # 3. ZIP code (5 digits) — check user_facts then last_error context
+        zip_code: Optional[str] = None
+        for fact in evidence_facts + wm.db_facts:
+            m = _ZIP_RE.search(fact)
+            if m:
+                zip_code = m.group(1)
+                break
+
+        # --- Decide the override action ---
+
+        if real_email:
+            # User actually gave their email — use it (will pass grounding).
+            return ProposedAction(
+                name="find_user_id_by_email",
+                args={"email": real_email},
+                declared_class=RiskClass.READ,
+                declared_pre=["user provided email"],
+                declared_post=["user_id retrieved"],
+                informational_intent="authenticate via user-provided email",
+                raw_thought="Auth override: using real email from user message.",
+                user_text="",
+                raw_response="",
+            )
+
+        if first_name and last_name and zip_code:
+            # Full name + zip available — look up by name+zip.
+            return ProposedAction(
+                name="find_user_id_by_name_zip",
+                args={
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "zip": zip_code,
+                },
+                declared_class=RiskClass.READ,
+                declared_pre=["user provided name and zip"],
+                declared_post=["user_id retrieved"],
+                informational_intent="authenticate via name+zip",
+                raw_thought="Auth override: using user-provided name+zip.",
+                user_text="",
+                raw_response="",
+            )
+
+        if first_name and last_name:
+            # Have name but no zip yet — ask specifically for zip.
+            return ProposedAction(
+                name=RESPOND_TOOL_NAME,
+                args={},
+                declared_class=RiskClass.ASK_USER,
+                declared_pre=[],
+                declared_post=["user provides zip code"],
+                informational_intent="ask user for zip code",
+                raw_thought="Auth override: have name, need zip code.",
+                user_text=(
+                    f"Thank you, {first_name}! To verify your identity, "
+                    "could you also provide your ZIP code?"
+                ),
+                raw_response="",
+            )
+
+        # No usable identity info — ask for email or name+zip.
+        return ProposedAction(
+            name=RESPOND_TOOL_NAME,
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            declared_pre=[],
+            declared_post=["user provides email or name+zip"],
+            informational_intent="ask for authentication credentials",
+            raw_thought="Auth override: need authentication credentials.",
+            user_text=(
+                "To look up your account, could you please provide your "
+                "email address, or your full name and ZIP code?"
+            ),
+            raw_response="",
         )
 
     # ------------------------------------------------------------------
