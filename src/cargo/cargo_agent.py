@@ -240,6 +240,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return rl, diag
 
         if not is_gated(action.declared_class):
+            # Even on the fast path, run arg_grounding so hallucinated
+            # placeholder values (e.g. "user@example.com") are caught before
+            # the tool executes and wastes the first step.
+            ag = check_arg_grounding(action, schema, wm)
+            diag["gates_run"].append("arg_grounding")
+            stats.record_gate(ag)
+            if not ag.ok:
+                diag["gates_failed"].append("arg_grounding")
+                return ag, diag
             return None, diag
 
         # 4a. Pre-conditions
@@ -552,6 +561,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 "name": action.name,
                 "content": tool_obs,
             })
+            # Surface tool-level errors in last_error so the proposer's STATE
+            # block reflects why the previous step failed, not just the
+            # post-condition label.
+            if tool_obs and (
+                tool_obs.lstrip().lower().startswith("error")
+                or '"error"' in tool_obs.lower()
+            ):
+                wm.last_error = tool_obs[:80]
             wm.absorb_observation(tool_obs if not isinstance(env_resp, type(None))
                                   else "")
             # Post-condition check (advisory).

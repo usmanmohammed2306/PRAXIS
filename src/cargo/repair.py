@@ -50,12 +50,21 @@ def decide(
     # Grounding / pre-cond failures → ask the user for the missing fact.
     if gate in ("arg_grounding",):
         ungrounded = failed_gate.diagnostics.get("ungrounded") or []
-        ask = (
-            "Could you confirm the following so I can proceed? "
-            + ", ".join(str(u) for u in ungrounded)
-            if ungrounded
-            else "Could you provide a bit more detail (e.g. the relevant ID) so I can proceed?"
-        )
+        # Detect hallucinated email/credential → give a natural auth prompt
+        # instead of exposing the fake value to the user.
+        email_fields = [u for u in ungrounded if "@" in str(u)]
+        if email_fields:
+            ask = (
+                "To look up your account, could you please provide your email "
+                "address, or your full name and ZIP code?"
+            )
+        elif ungrounded:
+            ask = (
+                "Could you confirm the following so I can proceed? "
+                + ", ".join(str(u) for u in ungrounded)
+            )
+        else:
+            ask = "Could you provide a bit more detail (e.g. the relevant ID) so I can proceed?"
         return RepairDecision(action="ASK_USER", user_message=ask[:600])
 
     if gate == "preconditions":
@@ -129,7 +138,14 @@ def decide(
         else:
             crit = (
                 "You proposed the same action you already attempted recently. "
-                "Pick a different tool, different arguments, or finalize."
+                "DO NOT repeat it.\n"
+                "  - If you are missing required user info (email, name, zip): "
+                "use respond+ASK_USER to request it — NEVER guess or fabricate "
+                "values like 'user@example.com'.\n"
+                "  - If you have the user's info: choose a DIFFERENT tool or use "
+                "different arguments (e.g. find_user_id_by_name_zip instead of "
+                "find_user_id_by_email).\n"
+                "  - Only finalize if the goal is already complete."
             )
         if retries_used < max_retries:
             return RepairDecision(action="RETRY", critique=crit)
