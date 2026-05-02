@@ -907,6 +907,261 @@ class TestRunCargoIntegration(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Auth-override unit tests
+# ---------------------------------------------------------------------------
+class TestAuthOverride(unittest.TestCase):
+    """Tests for CargoAgent._auth_override, _resolve_product_id_name,
+    and _advance_after_product_list without a live environment."""
+
+    def _make_agent(self) -> Any:
+        """Return a minimal object with CargoAgent's override methods bound.
+
+        cargo_agent.py handles missing tau_bench gracefully (Agent = object),
+        so we can import CargoAgent without tau_bench installed.  We avoid
+        calling __init__ (which needs env/client params) by using __new__.
+        """
+        from src.cargo.cargo_agent import CargoAgent
+        client = MockClient(scripts=[])
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "test"
+        agent.style_name = "cargo"
+        agent.temperature = 0.0
+        agent.schemas = {}
+        agent.domain_policy = ""
+        return agent
+
+    def _placeholder_action(self) -> ProposedAction:
+        return ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": "user@example.com"},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+
+    # ------------------------------------------------------------------
+    # 1. User provides name + ZIP → name+zip lookup
+    # ------------------------------------------------------------------
+    def test_user_provides_name_and_zip_uses_name_zip_lookup(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.user_facts = ["My name is Yusuf Ali and my ZIP is 19122"]
+        # Simulate extracting the name pair and zip via absorb_user_message
+        wm.absorb_user_message("My name is Yusuf Ali and my ZIP is 19122")
+        # Manually inject the extracted tokens that _auth_override expects.
+        wm.user_facts.append("Yusuf Ali")
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_name_zip")  # type: ignore[union-attr]
+        self.assertEqual(result.args["first_name"], "Yusuf")  # type: ignore[union-attr]
+        self.assertEqual(result.args["last_name"], "Ali")  # type: ignore[union-attr]
+        self.assertIn("19122", str(result.args.get("zip")))  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # 2. User provides a real email → email lookup
+    # ------------------------------------------------------------------
+    def test_user_provides_real_email_uses_email_lookup(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("My email is alice@gmail.com")
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_email")  # type: ignore[union-attr]
+        self.assertEqual(result.args["email"], "alice@gmail.com")  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # 3. User provides name only (no ZIP) → ASK_USER for zip
+    # ------------------------------------------------------------------
+    def test_user_provides_name_only_asks_for_zip(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        # Name but no ZIP in user facts
+        wm.user_facts = ["Yusuf Ali"]
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertIn("ZIP", result.user_text)  # type: ignore[union-attr]
+        self.assertEqual(wm.auth_ask_count, 1)
+
+    # ------------------------------------------------------------------
+    # 4. ZIP not found → asks for re-verification (not same ZIP again)
+    # ------------------------------------------------------------------
+    def test_zip_not_found_asks_reverification(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.user_facts = ["Yusuf Ali", "10001"]
+        wm.auth_failed_zips = ["10001"]  # simulates a failed lookup
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        # Should mention the failed ZIP and ask for a corrected one
+        self.assertIn("10001", result.user_text)  # type: ignore[union-attr]
+        self.assertIn("ZIP", result.user_text)  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # 5. Already tried ZIP → override does NOT propose name+zip with same ZIP
+    # ------------------------------------------------------------------
+    def test_zip_not_found_prevents_same_zip_retry(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.user_facts = ["Yusuf Ali", "10001"]
+        wm.auth_failed_zips = ["10001"]
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        # Must NOT propose find_user_id_by_name_zip with the failed ZIP
+        self.assertIsNotNone(result)
+        if result.name == "find_user_id_by_name_zip":  # type: ignore[union-attr]
+            self.assertNotEqual(result.args.get("zip"), "10001")  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # 6. User refuses to share credentials → FINAL (no more asking)
+    # ------------------------------------------------------------------
+    def test_user_refuses_auth_stops_asking(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.user_facts = ["I prefer not to share my details"]
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.FINAL)  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # 7. Auth ask limit reached → FINAL (no more asking)
+    # ------------------------------------------------------------------
+    def test_auth_ask_limit_stops_asking(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.auth_ask_count = 2  # already asked twice
+        wm.user_facts = []
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.FINAL)  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # 8. Product ID resolved from type name in db_facts
+    # ------------------------------------------------------------------
+    def test_product_id_resolved_from_type_name(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.db_facts = ["T-Shirt=6086499569"]
+        action = ProposedAction(
+            name="get_product_details",
+            args={"product_id": "T-Shirt"},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+        result = agent._resolve_product_id_name(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.args["product_id"], 6086499569)  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # 9. Product ID already numeric → no override
+    # ------------------------------------------------------------------
+    def test_product_id_numeric_no_override(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.db_facts = ["T-Shirt=6086499569"]
+        action = ProposedAction(
+            name="get_product_details",
+            args={"product_id": 6086499569},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+        result = agent._resolve_product_id_name(action, wm)
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # 10. list_all_product_types repeated → advance to get_product_details
+    # ------------------------------------------------------------------
+    def test_advance_after_product_list_repeat(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.db_facts = ["T-Shirt=6086499569"]
+        wm.user_facts = ["I want to return my T-Shirt"]
+        action = ProposedAction(
+            name="list_all_product_types",
+            args={},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+        # Record the signature to simulate a repeat
+        wm.record_action_signature(action.signature())
+        result = agent._advance_after_product_list(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_product_details")  # type: ignore[union-attr]
+        self.assertEqual(result.args["product_id"], 6086499569)  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # 11. list_all_product_types first call → no advance (let it run)
+    # ------------------------------------------------------------------
+    def test_advance_after_product_list_first_call_passes(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.db_facts = ["T-Shirt=6086499569"]
+        wm.user_facts = ["I want to return my T-Shirt"]
+        action = ProposedAction(
+            name="list_all_product_types",
+            args={},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+        # Do NOT record signature — this is the first call
+        result = agent._advance_after_product_list(action, wm)
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # 12. Non-placeholder email not overridden (real email passes through)
+    # ------------------------------------------------------------------
+    def test_real_email_in_action_not_overridden(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.user_facts = []
+        action = ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": "alice@gmail.com"},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+        result = agent._auth_override(action, wm)
+        self.assertIsNone(result)
+
+
+# ---------------------------------------------------------------------------
 # Tau-bench import sanity (skipped when tau_bench is not installed)
 # ---------------------------------------------------------------------------
 class TestTauBenchIntegrationOptional(unittest.TestCase):

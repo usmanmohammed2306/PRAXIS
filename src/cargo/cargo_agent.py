@@ -90,6 +90,30 @@ _EMAIL_RE_MOD = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 _NAME_PAIR_RE = re.compile(r"\b([A-Z][a-z]{1,20})\s+([A-Z][a-z]{1,20})\b")
 _ZIP_RE = re.compile(r"\b(\d{5})\b")
 
+# Phrases that indicate the user is refusing to provide authentication info.
+# When any of these are found we stop asking and issue a polite FINAL.
+_AUTH_REFUSAL_PHRASES = (
+    "prefer not",
+    "don't want",
+    "do not want",
+    "don't have",
+    "do not have",
+    "rather not",
+    "not comfortable",
+    "won't share",
+    "will not share",
+    "can't provide",
+    "cannot provide",
+    "skip",
+    "never mind",
+    "forget it",
+    "no thanks",
+    "no thank you",
+)
+
+# Maximum number of ASK_USER auth prompts before we give up and issue a FINAL.
+_MAX_AUTH_ASKS = 2
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -395,6 +419,47 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     })
                     action = auth_action
 
+            # Product-ID override: if the proposer passes a product *type name*
+            # (e.g. "T-Shirt") where a numeric product_id is required, resolve it
+            # from db_facts that were populated by list_all_product_types.
+            if action is not None:
+                prod_action = self._resolve_product_id_name(action, wm)
+                if prod_action is not None:
+                    raw_text = json.dumps({
+                        "thought": prod_action.raw_thought,
+                        "action": {
+                            "name": prod_action.name,
+                            "args": prod_action.args,
+                            "declared_class": prod_action.declared_class.value,
+                            "declared_pre": prod_action.declared_pre,
+                            "declared_post": prod_action.declared_post,
+                            "informational_intent": prod_action.informational_intent,
+                            "user_text": prod_action.user_text,
+                        },
+                    })
+                    action = prod_action
+
+            # Product-list advance: if list_all_product_types is about to be
+            # repeated (already in recent_signatures) and the user has mentioned
+            # a product type name we can resolve, skip straight to
+            # get_product_details with the resolved ID.
+            if action is not None:
+                adv_action = self._advance_after_product_list(action, wm)
+                if adv_action is not None:
+                    raw_text = json.dumps({
+                        "thought": adv_action.raw_thought,
+                        "action": {
+                            "name": adv_action.name,
+                            "args": adv_action.args,
+                            "declared_class": adv_action.declared_class.value,
+                            "declared_pre": adv_action.declared_pre,
+                            "declared_post": adv_action.declared_post,
+                            "informational_intent": adv_action.informational_intent,
+                            "user_text": adv_action.user_text,
+                        },
+                    })
+                    action = adv_action
+
             messages.append({"role": "assistant", "content": raw_text or ""})
 
             if action is None:
@@ -621,6 +686,21 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 wm.last_error = tool_obs[:80]
             wm.absorb_observation(tool_obs if not isinstance(env_resp, type(None))
                                   else "")
+
+            # Track failed name+ZIP lookups so _auth_override doesn't retry the
+            # same invalid ZIP on the next step.
+            if action.name == "find_user_id_by_name_zip":
+                zip_tried = str(action.args.get("zip", ""))
+                obs_lower = tool_obs.lower() if tool_obs else ""
+                if zip_tried and (
+                    "not found" in obs_lower
+                    or '"error"' in obs_lower
+                    or obs_lower.lstrip().startswith("error")
+                    or "no user" in obs_lower
+                    or "invalid" in obs_lower
+                ):
+                    if zip_tried not in wm.auth_failed_zips:
+                        wm.auth_failed_zips.append(zip_tried)
             # Post-condition check (advisory).
             try:
                 post_obs = json.loads(tool_obs) if tool_obs.strip().startswith(("{", "[")) else tool_obs
@@ -672,6 +752,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
         deterministic — it fires only when the arg is a clear placeholder
         and the working memory contains better information.
 
+        Guard rails implemented here:
+        - If the user has refused to share identity info → FINAL (no loop).
+        - If we've already asked _MAX_AUTH_ASKS times → FINAL (no loop).
+        - If a ZIP was tried and came back not-found → skip it and ask for a
+          different/corrected ZIP instead of retrying the same one.
+
         Return value:
           - A replacement ProposedAction if the override applies.
           - None if the model's proposal should proceed unchanged.
@@ -696,6 +782,44 @@ class CargoAgent(Agent):  # type: ignore[misc]
         ):
             return None
 
+        # --- Check if the user has explicitly refused to provide credentials ---
+        all_user_text = " ".join(wm.user_facts).lower()
+        user_refused = any(phrase in all_user_text for phrase in _AUTH_REFUSAL_PHRASES)
+        if user_refused:
+            return ProposedAction(
+                name=RESPOND_TOOL_NAME,
+                args={},
+                declared_class=RiskClass.FINAL,
+                declared_pre=[],
+                declared_post=[],
+                informational_intent="user declined to provide credentials",
+                raw_thought="Auth override: user refused to share identity — stopping.",
+                user_text=(
+                    "I understand. I'm unable to access your account without "
+                    "verifying your identity. If you change your mind, feel free "
+                    "to ask again."
+                ),
+                raw_response="",
+            )
+
+        # --- Hard cap on auth asks to prevent infinite bounce ---
+        if wm.auth_ask_count >= _MAX_AUTH_ASKS:
+            return ProposedAction(
+                name=RESPOND_TOOL_NAME,
+                args={},
+                declared_class=RiskClass.FINAL,
+                declared_pre=[],
+                declared_post=[],
+                informational_intent="auth ask limit reached",
+                raw_thought="Auth override: exhausted auth ask budget — stopping.",
+                user_text=(
+                    "I'm having trouble verifying your identity with the "
+                    "information provided. Please try again with your email "
+                    "address or the name and ZIP code on your account."
+                ),
+                raw_response="",
+            )
+
         # --- Extract what the user has actually told us ---
         evidence_facts = wm.user_facts  # user-provided, not yet DB-confirmed
 
@@ -719,13 +843,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if first_name:
                 break
 
-        # 3. ZIP code (5 digits) — check user_facts then last_error context
+        # 3. ZIP code (5 digits) — skip any that already failed
         zip_code: Optional[str] = None
         for fact in evidence_facts + wm.db_facts:
             m = _ZIP_RE.search(fact)
             if m:
-                zip_code = m.group(1)
-                break
+                candidate = m.group(1)
+                if candidate not in wm.auth_failed_zips:
+                    zip_code = candidate
+                    break
 
         # --- Decide the override action ---
 
@@ -761,8 +887,30 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 raw_response="",
             )
 
+        if first_name and last_name and wm.auth_failed_zips:
+            # We have a name but the ZIP the user gave already failed — ask for
+            # a corrected one rather than retrying the same invalid ZIP.
+            wm.auth_ask_count += 1
+            failed = wm.auth_failed_zips[-1]
+            return ProposedAction(
+                name=RESPOND_TOOL_NAME,
+                args={},
+                declared_class=RiskClass.ASK_USER,
+                declared_pre=[],
+                declared_post=["user provides corrected zip code"],
+                informational_intent="ask user to re-verify zip code",
+                raw_thought=f"Auth override: ZIP {failed} not found — asking for re-verification.",
+                user_text=(
+                    f"I wasn't able to find an account for {first_name} {last_name} "
+                    f"with ZIP code {failed}. Could you double-check your ZIP code "
+                    "and provide the correct one?"
+                ),
+                raw_response="",
+            )
+
         if first_name and last_name:
             # Have name but no zip yet — ask specifically for zip.
+            wm.auth_ask_count += 1
             return ProposedAction(
                 name=RESPOND_TOOL_NAME,
                 args={},
@@ -779,6 +927,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             )
 
         # No usable identity info — ask for email or name+zip.
+        wm.auth_ask_count += 1
         return ProposedAction(
             name=RESPOND_TOOL_NAME,
             args={},
@@ -793,6 +942,114 @@ class CargoAgent(Agent):  # type: ignore[misc]
             ),
             raw_response="",
         )
+
+    # ------------------------------------------------------------------
+    # Product-ID / product-list helpers
+    # ------------------------------------------------------------------
+    def _resolve_product_id_name(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """If the proposer passes a type-name string (e.g. 'T-Shirt') where
+        ``get_product_details`` expects a numeric ``product_id``, resolve the
+        ID from db_facts that were populated when ``list_all_product_types``
+        ran previously.
+
+        db_facts entries look like: ``T-Shirt=6086499569`` or just ``6086499569``.
+        We also absorb bare product names from the observation list.
+
+        Returns a corrected action, or None if no fix is needed / possible.
+        """
+        if action.name != "get_product_details":
+            return None
+        pid = action.args.get("product_id")
+        if pid is None:
+            return None
+        pid_str = str(pid).strip()
+        # Already a numeric ID? Nothing to do.
+        if re.fullmatch(r"\d+", pid_str):
+            return None
+
+        # Try to find a db_facts entry of the form "<type_name>=<numeric_id>"
+        # where the type_name matches pid_str (case-insensitive prefix match).
+        pid_lower = pid_str.lower()
+        for fact in wm.db_facts:
+            if "=" not in fact:
+                continue
+            name_part, _, id_part = fact.partition("=")
+            if not re.fullmatch(r"\d+", id_part.strip()):
+                continue
+            if name_part.strip().lower() == pid_lower or pid_lower in name_part.strip().lower():
+                numeric_id = int(id_part.strip())
+                new_args = dict(action.args)
+                new_args["product_id"] = numeric_id
+                return ProposedAction(
+                    name=action.name,
+                    args=new_args,
+                    declared_class=action.declared_class,
+                    declared_pre=action.declared_pre,
+                    declared_post=action.declared_post,
+                    informational_intent=action.informational_intent,
+                    raw_thought=(
+                        f"Product-ID override: resolved '{pid_str}' → {numeric_id} "
+                        "from db_facts."
+                    ),
+                    user_text=action.user_text,
+                    raw_response=action.raw_response,
+                )
+        return None
+
+    def _advance_after_product_list(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """If ``list_all_product_types`` is about to be repeated (already in
+        recent_signatures) and the user mentioned a product type that we can
+        resolve to a numeric ID in db_facts, skip straight to
+        ``get_product_details`` instead.
+
+        This avoids the infinite list_all_product_types → repeat_loop → retry
+        cycle that wastes the entire step budget without making progress.
+        """
+        if action.name != "list_all_product_types":
+            return None
+        # Check whether this action is already in recent_signatures.
+        sig = action.signature()
+        if sig not in wm.recent_signatures:
+            return None  # first call — let it run normally
+
+        # It's a repeat.  Try to find a product ID we can use directly.
+        # Scan user_facts for any word that appears as a key in db_facts
+        # (i.e. was returned from a previous list_all_product_types call).
+        all_user = " ".join(wm.user_facts)
+        for fact in wm.db_facts:
+            if "=" not in fact:
+                continue
+            name_part, _, id_part = fact.partition("=")
+            name_part = name_part.strip()
+            id_part = id_part.strip()
+            if not re.fullmatch(r"\d+", id_part):
+                continue
+            # Case-insensitive check: does the user message mention this type?
+            if name_part.lower() in all_user.lower():
+                numeric_id = int(id_part)
+                return ProposedAction(
+                    name="get_product_details",
+                    args={"product_id": numeric_id},
+                    declared_class=RiskClass.READ,
+                    declared_pre=["product types already listed"],
+                    declared_post=["product details retrieved"],
+                    informational_intent=f"get details for {name_part}",
+                    raw_thought=(
+                        f"Product-list advance: user mentioned '{name_part}', "
+                        f"resolved to ID {numeric_id} — fetching details directly."
+                    ),
+                    user_text="",
+                    raw_response="",
+                )
+        return None
 
     # ------------------------------------------------------------------
     # Internals
