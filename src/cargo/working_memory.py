@@ -37,6 +37,17 @@ class WorkingMemory:
     # ZIPs that have already been tried with find_user_id_by_name_zip and
     # returned a not-found / error.  The override skips them on retry.
     auth_failed_zips: List[str] = field(default_factory=list)
+    # Set once the user has refused to share credentials OR the ask budget is
+    # exhausted.  When true, the auth override stops triggering and the agent
+    # falls back to no-auth pathways (e.g. product-only queries) or emits a
+    # single FINAL apology.  This breaks the infinite ASK→FINAL→ASK loop.
+    auth_abandoned: bool = False
+    # Set once a user_id has been confirmed by a successful find_user_id_*
+    # call.  Used to cleanly suppress further authentication proposals.
+    auth_user_id: str = ""
+    # Set once we've already emitted a "give up on auth" FINAL.  Prevents the
+    # exact same FINAL from being emitted twice in a row.
+    auth_giveup_emitted: bool = False
 
     # ------------------------------------------------------------------
     # Updates
