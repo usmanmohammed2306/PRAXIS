@@ -50,14 +50,31 @@ def decide(
     # Grounding / pre-cond failures → ask the user for the missing fact.
     if gate in ("arg_grounding",):
         ungrounded = failed_gate.diagnostics.get("ungrounded") or []
-        # Detect hallucinated email/credential → give a natural auth prompt
-        # instead of exposing the fake value to the user.
+        # Detect hallucinated email/credential.
         email_fields = [u for u in ungrounded if "@" in str(u)]
         if email_fields:
+            # First, try a RETRY so the auth override in CargoAgent can
+            # construct the right tool call from user_facts without consuming
+            # a respond turn.  Only fall through to ASK_USER when retries are
+            # exhausted or budget is critically low.
+            if retries_used < max_retries and budget_steps_remaining > 3:
+                crit = (
+                    "Your email argument is a placeholder and was blocked.\n"
+                    "Check STATE user_facts for the user's name and ZIP code.\n"
+                    "  - If BOTH name and zip are present: use "
+                    "find_user_id_by_name_zip(first_name=..., last_name=..., zip=...).\n"
+                    "  - If name but no zip: use respond+ASK_USER asking for zip.\n"
+                    "  - If nothing: use respond+ASK_USER asking for email OR name+zip.\n"
+                    "ASK_USER format: {\"name\":\"respond\",\"args\":{},"
+                    "\"declared_class\":\"ASK_USER\","
+                    "\"user_text\":\"your question here\"}"
+                )
+                return RepairDecision(action="RETRY", critique=crit)
             ask = (
                 "To look up your account, could you please provide your email "
                 "address, or your full name and ZIP code?"
             )
+            return RepairDecision(action="ASK_USER", user_message=ask[:600])
         elif ungrounded:
             ask = (
                 "Could you confirm the following so I can proceed? "

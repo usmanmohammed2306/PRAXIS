@@ -68,8 +68,15 @@ class ProposedAction:
             parts = []
         sig = self.name + "(" + ",".join(parts) + ")"
         # Respond-family actions put content in user_text, not args.
-        if self.name.lower() in ("respond", "send_user", "finish", "final", "answer") \
-                and self.user_text:
+        # Also applies when the model generates a *confused* ASK_USER/FINAL
+        # (wrong tool name but right declared_class) — the hash ensures
+        # semantically different questions get distinct signatures so
+        # repeat_loop only fires on genuine repeats, not different questions.
+        is_respond_name = self.name.lower() in (
+            "respond", "send_user", "finish", "final", "answer"
+        )
+        is_respond_class = self.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
+        if (is_respond_name or is_respond_class) and self.user_text:
             import hashlib
             fp = hashlib.md5(self.user_text.strip()[:300].encode()).hexdigest()[:6]
             sig += f"#{fp}"
