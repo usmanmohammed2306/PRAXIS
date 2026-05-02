@@ -116,15 +116,21 @@ The summary builder aggregates these across trajectories.
 
 ## Fixed base model (priority order)
 
-| Priority | Hugging Face ID | Notes |
-|---|---|---|
-| 1 | `Qwen/Qwen2.5-7B-Instruct` | Primary. 32 K context, stable tool-calling. |
-| 2 | `Qwen/Qwen3-4B-Instruct-2507-FP8` | FP8 fallback. |
-| 3 | `Qwen/Qwen3-4B-Instruct-2507` | Non-FP8 last-resort fallback. |
+The candidate chain varies by `--model` tier. The first that serves
+successfully is used for **all four** controllers — guaranteeing the same
+model across every condition.
 
-`run_project.sh` tries the candidates in order and runs **the first one
-that serves successfully** for *all four* controllers — guaranteeing the
-same model across every condition.
+| Tier | Priority | Hugging Face ID | Notes |
+|---|---|---|---|
+| `14b` (default, 1×80 GB GPU) | 1 | `Qwen/Qwen2.5-14B-Instruct` | Primary. Better JSON compliance + SC quality than 7B; fits 80 GB at max_model_len=32768. |
+| `14b` | 2 | `Qwen/Qwen2.5-7B-Instruct` | Fallback if 14B download or serving fails. |
+| `14b` | 3 | `Qwen/Qwen3-4B-Instruct-2507-FP8` | FP8 last-resort. |
+| `7b` (40 GB GPU or speed preference) | 1 | `Qwen/Qwen2.5-7B-Instruct` | 32 K context at max_model_len=32768; stable tool-calling, fastest. |
+| `7b` | 2 | `Qwen/Qwen3-4B-Instruct-2507-FP8` | FP8 fallback. |
+| `7b` | 3 | `Qwen/Qwen3-4B-Instruct-2507` | Non-FP8 last-resort. |
+| `32b` (≥2 GPUs, TP=2) | 1 | `Qwen/Qwen2.5-32B-Instruct` | Best accuracy; TP=2 on 80 GB GPUs; max_model_len=32768. |
+| `32b` | 2 | `Qwen/Qwen2.5-7B-Instruct` | Fallback to 7B tier. |
+| `32b` | 3 | `Qwen/Qwen3-4B-Instruct-2507-FP8` | FP8 last-resort. |
 
 ## Two shell scripts (and only two)
 
@@ -165,10 +171,29 @@ bash run_project.sh --gpus 0,1 --tau-tasks 20 --tau-trials 2 --max-concurrency 1
 
 ### Auto-selected defaults
 
-| Detected GPUs | `--model auto` picks | Notes |
-|---:|---|---|
-| 1 | `7b` (Qwen2.5-7B-Instruct) | TP=1, primary `max_model_len=16384` |
-| ≥ 2 | `32b` (Qwen2.5-32B-Instruct) → 7B fallback | TP=count, primary `max_model_len=12288` |
+| Detected GPUs | `--model auto` picks | TP | `max_model_len` | `gpu_mem_util` |
+|---:|---|---:|---:|---:|
+| 1 (80 GB A100/H100) | `14b` (Qwen2.5-14B-Instruct) | 1 | 32768 | 0.85 |
+| 1 (40 GB GPU) | use `--model 7b` explicitly | 1 | 32768 | 0.80 |
+| ≥ 2 | `32b` (Qwen2.5-32B-Instruct) → 7B fallback | count | 32768 | 0.85 |
+
+> **Why 14B over 7B on a single 80 GB GPU?** The CARGO proposer must emit
+> structured JSON reliably — `declared_class`, `declared_pre`, and `args` all
+> have to parse correctly. Qwen2.5-14B has measurably better JSON compliance
+> and instruction-following than 7B, which means fewer `json_parse_failures`,
+> more meaningful self-consistency votes, and cleaner argument-grounding hits.
+> At BF16, 14B weights ≈ 28 GB + KV cache at `max_model_len=32768` with
+> concurrency=4 ≈ 24 GB → ~52 GB total, comfortably inside 80 GB at 0.85
+> mem util. The ~1.8–2× slower throughput vs 7B still fits the `medium`
+> profile within ~5–9 h on one H100.
+
+> **Why 32K context?** τ-bench trajectories with 30 tasks × up to 30 steps
+> each accumulate tool-call JSON + DB observations quickly. At 12K tokens,
+> late-trajectory turns get truncated and the agent loses earlier
+> DB-confirmed facts — critical for CARGO's precondition and grounding gates.
+> 32K fits all three tiers within their respective GPU memory budgets:
+> 7B (~32 GB on 40 GB), 14B (~52 GB on 80 GB), 32B (~68 GB/GPU on 2×80 GB).
+> Override with `--max-model-len` if you hit OOM on unusual hardware.
 
 ### Workload profiles
 

@@ -20,12 +20,15 @@ from ..working_memory import WorkingMemory
 
 _SYSTEM = (
     "You are a verifier. The agent is about to execute the action below. "
-    "Imagine the action's tool result and decide whether the user's GOAL "
-    "is still reachable afterwards in <=5 more steps. Output STRICT JSON: "
+    "Imagine the action's likely result and decide whether the user's GOAL "
+    "is still reachable afterwards. Output STRICT JSON only: "
     "{\"predicted_obs\": str, \"goal_still_reachable\": bool, \"reason\": str}. "
-    "Be conservative: if the action looks premature (no DB confirmation of "
-    "required entities, missing post-conditions, or contradicts the goal), "
-    "set goal_still_reachable=false."
+    "Set goal_still_reachable=false ONLY when the action clearly contradicts the "
+    "goal (e.g. cancels the wrong item, sends to wrong address, makes an "
+    "irreversible mistake). "
+    "If the action is plausible given the confirmed facts, set it to true. "
+    "When in doubt, prefer true — the downstream precondition and grounding "
+    "gates have already checked for missing data."
 )
 
 
@@ -62,11 +65,10 @@ def check_counterfactual(
         return GateResult.passing("counterfactual", reason="no_client_skipped")
 
     user = (
-        f"GOAL: {wm.goal[:300]}\n"
-        f"ACTION:\n  name: {action.name}\n  args: {json.dumps(action.args, default=str)[:600]}\n"
-        f"  declared_class: {action.declared_class.value}\n"
-        f"  declared_post: {action.declared_post}\n"
-        f"WORKING MEMORY (compact):\n{wm.render_compact(max_chars=900)}\n\n"
+        f"GOAL: {wm.goal[:150]}\n"
+        f"ACTION: {action.name}({json.dumps(action.args, default=str)[:200]})\n"
+        f"  class: {action.declared_class.value}  post: {action.declared_post}\n"
+        f"STATE:\n{wm.render_compact(max_chars=600)}\n\n"
         "Output JSON only."
     )
     try:

@@ -111,10 +111,26 @@ def decide(
         )
 
     if gate == "repeat_loop":
-        crit = (
-            "You proposed the same action you already attempted recently. "
-            "Pick a different tool, different arguments, or finalize."
+        # For respond actions the repeat means we asked the same question
+        # twice.  Pushing the model to "pick a different tool" is more
+        # actionable than a generic retry message.
+        is_respond = (
+            proposed is not None
+            and proposed.name.lower() in ("respond", "send_user", "finish", "final", "answer")
         )
+        if is_respond:
+            crit = (
+                "You sent the same message to the user again without acting on their reply. "
+                "Do NOT repeat the question — instead, use a READ tool "
+                "(e.g. get_user, find_order, get_order, search_products) to look up the "
+                "required information from the database using the facts already in STATE. "
+                "Only use respond again when you have a NEW question or a final answer."
+            )
+        else:
+            crit = (
+                "You proposed the same action you already attempted recently. "
+                "Pick a different tool, different arguments, or finalize."
+            )
         if retries_used < max_retries:
             return RepairDecision(action="RETRY", critique=crit)
         return RepairDecision(

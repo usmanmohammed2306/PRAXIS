@@ -33,6 +33,13 @@ SYSTEM_PROMPT = (
     "- FINAL: terminal answer to the user (use tool name 'respond').\n"
     "- ASK_USER: ask the user for a missing fact (use tool name 'respond').\n"
     "\n"
+    "CONTEXT DISCIPLINE (follow strictly to stay within token budget):\n"
+    "- declared_pre / declared_post: SHORT PHRASES only, ≤8 words each, max 3 items.\n"
+    "  Good: \"order exists\", \"user confirmed cancellation\"\n"
+    "  Bad:  \"The order with the given ID has been confirmed to exist in the database\"\n"
+    "- thought: one sentence maximum.\n"
+    "- informational_intent: ≤10 words.\n"
+    "\n"
     "Output STRICT JSON only — no markdown, no commentary outside the JSON.\n"
     "Schema:\n"
     "{\n"
@@ -191,8 +198,9 @@ def parse_proposer_response(
         name=name.strip(),
         args={k: v for k, v in args.items() if v is not None},
         declared_class=declared_class,
-        declared_pre=[str(x)[:200] for x in pre if str(x).strip()][:8],
-        declared_post=[str(x)[:200] for x in post if str(x).strip()][:8],
+        # Tip 7: short phrases — 80 chars/item, max 4 items each.
+        declared_pre=[str(x)[:80] for x in pre if str(x).strip()][:4],
+        declared_post=[str(x)[:80] for x in post if str(x).strip()][:4],
         informational_intent=info,
         raw_thought=thought,
         user_text=user_text,
@@ -200,21 +208,172 @@ def parse_proposer_response(
     )
 
 
-def trim_history(messages: List[Dict[str, Any]], n_turns: int = 8,
-                 max_chars: int = 1800) -> str:
-    """Render the tail of the message history for the proposer prompt."""
-    tail = messages[-n_turns:] if len(messages) > n_turns else messages
+# ---------------------------------------------------------------------------
+# History compression helpers (tips 3, 4, 5)
+# ---------------------------------------------------------------------------
+
+def _compress_args(args: Dict[str, Any], max_total: int = 120) -> str:
+    """Render tool args as 'k=v, k=v', truncated to max_total chars."""
     parts: List[str] = []
-    for m in tail:
+    for k, v in args.items():
+        sv = str(v)
+        if len(sv) > 40:
+            sv = sv[:37] + "..."
+        parts.append(f"{k}={sv}")
+    return ", ".join(parts)[:max_total]
+
+
+def _compress_assistant(content: str) -> str:
+    """Compress a raw proposer JSON assistant message to 'name(k=v, …)'.
+
+    The full proposer JSON contains thought, declared_pre/post, and
+    informational_intent — none of which belong in history (tips 3, 6).
+    Only the action name and args are kept.
+    """
+    if not content:
+        return ""
+    try:
+        obj = json.loads(content.strip())
+        action = obj.get("action") or {}
+        name = str(action.get("name") or obj.get("name") or "")
+        args = action.get("args") or obj.get("args") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        if name:
+            return f"{name}({_compress_args(args, 80)})"
+    except Exception:
+        pass
+    # Fallback: strip to first 80 chars of raw text.
+    return content.strip()[:80]
+
+
+def _compress_tool_obs(content: str) -> str:
+    """Compress a tool-result JSON to canonical 'key: val' one-liners (tip 4, 5).
+
+    Only scalar top-level values are included; nested dicts are flattened one
+    level; lists are shown as counts.  This keeps observations within ~100–150
+    chars while preserving every ID and status field.
+    """
+    if not content:
+        return ""
+    s = content.strip()
+    if not s or s[0] not in "{[":
+        return s[:150]
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, list):
+            if not obj:
+                return "[]"
+            # Flatten first item + count.
+            first = obj[0] if isinstance(obj[0], dict) else {}
+            pairs = [f"{k}: {str(v)[:40]}" for k, v in first.items()
+                     if isinstance(v, (str, int, float, bool))][:4]
+            suffix = f" (+{len(obj)-1} more)" if len(obj) > 1 else ""
+            return (", ".join(pairs) + suffix)[:150]
+        if isinstance(obj, dict):
+            pairs: List[str] = []
+            for k, v in obj.items():
+                if isinstance(v, (str, int, float, bool)) and v not in (None, ""):
+                    sv = str(v)
+                    pairs.append(f"{k}: {sv[:50]}")
+                elif isinstance(v, dict):
+                    # Flatten one level (e.g. "order": {"status": "X"} → status: X)
+                    for ik, iv in v.items():
+                        if isinstance(iv, (str, int, float, bool)):
+                            pairs.append(f"{ik}: {str(iv)[:50]}")
+                elif isinstance(v, list):
+                    pairs.append(f"{k}: [{len(v)} items]")
+            return ", ".join(pairs[:10])[:200]
+    except Exception:
+        pass
+    return s[:150]
+
+
+def trim_history(messages: List[Dict[str, Any]], n_turns: int = 8,
+                 max_chars: int = 800) -> str:
+    """Render a compact tail of the message history for the proposer prompt.
+
+    Context-optimization rules applied here (tips 2, 3, 4, 6):
+    - Older messages (beyond n_turns) are collapsed into a one-line action
+      digest so the proposer knows what has already been tried.
+    - Assistant messages: raw proposer JSON is stripped to just
+      ``action(args)`` — thought, pre/post, and intent are dropped.
+    - Tool messages: JSON observations are flattened to ``key: val`` pairs.
+    - User messages: kept verbatim up to 200 chars.
+    - System messages: skipped (already in the system prompt).
+
+    Target: the returned string fits comfortably within ~300 tokens (tip 10).
+    """
+    # Separate the "detail" window (recent) from "digest" (older).
+    # Each complete step adds roughly 3 messages (proposer JSON + tool_calls +
+    # tool result), so n_turns=8 covers ~2-3 full steps in detail.
+    if len(messages) > n_turns:
+        detail_msgs = messages[-n_turns:]
+        digest_msgs = messages[:-n_turns]
+    else:
+        detail_msgs = messages
+        digest_msgs = []
+
+    parts: List[str] = []
+
+    # One-line digest of prior actions (tip 2: summarize older steps).
+    if digest_msgs:
+        prior_actions: List[str] = []
+        for m in digest_msgs:
+            if m.get("role") == "assistant":
+                # Prefer tool_calls field (post-execution); else parse proposer JSON.
+                tcs = m.get("tool_calls") or []
+                if tcs:
+                    for tc in tcs:
+                        nm = tc.get("function", {}).get("name", "")
+                        if nm and nm not in ("respond",):
+                            prior_actions.append(nm)
+                else:
+                    name = _compress_assistant(m.get("content") or "")
+                    # _compress_assistant returns "name(args)" — grab just "name".
+                    nm = name.split("(")[0] if name else ""
+                    if nm:
+                        prior_actions.append(nm)
+        if prior_actions:
+            parts.append("[prior: " + ", ".join(prior_actions[-8:]) + "]")
+
+    # Render the detail window with per-role compression.
+    for m in detail_msgs:
         role = m.get("role", "?")
-        content = m.get("content")
-        if not content:
+        if role == "system":
+            continue  # system prompt already injected separately
+        if role == "assistant":
             tcs = m.get("tool_calls") or []
             if tcs:
-                names = ",".join(tc.get("function", {}).get("name", "?") for tc in tcs)
-                content = f"[tool_calls: {names}]"
-        text = str(content or "")[:300]
-        parts.append(f"{role}: {text}")
+                for tc in tcs:
+                    nm = tc.get("function", {}).get("name", "?")
+                    args_raw = tc.get("function", {}).get("arguments", "{}")
+                    try:
+                        args = json.loads(args_raw)
+                    except Exception:
+                        args = {}
+                    parts.append(f"action: {nm}({_compress_args(args, 80)})")
+            else:
+                compressed = _compress_assistant(m.get("content") or "")
+                if compressed:
+                    parts.append(f"action: {compressed}")
+        elif role == "tool":
+            nm = m.get("name", "tool")
+            obs = _compress_tool_obs(m.get("content") or "")
+            # Respond tool results ARE the user's reply — label them as such
+            # so the model understands the user has answered (not a DB obs).
+            if nm in ("respond", "send_user"):
+                parts.append(f"user_reply: {obs}")
+            else:
+                parts.append(f"obs({nm}): {obs}")
+        elif role == "user":
+            text = str(m.get("content") or "")[:200]
+            if text:
+                parts.append(f"user: {text}")
+
     out = "\n".join(parts)
     return out[:max_chars]
 
@@ -225,4 +384,7 @@ __all__ = [
     "render_proposer_user_message",
     "parse_proposer_response",
     "trim_history",
+    "_compress_args",
+    "_compress_assistant",
+    "_compress_tool_obs",
 ]

@@ -91,13 +91,14 @@ class WorkingMemory:
     def _add_db_fact(self, fact: str) -> None:
         if not fact:
             return
-        fact = fact[:400]  # cap absurd lengths
+        fact = fact[:100]  # tip 5: short canonical form
         if fact in self.db_facts:
             return
         self.db_facts.append(fact)
-        # Hard cap to keep prompts bounded.
-        if len(self.db_facts) > 256:
-            self.db_facts = self.db_facts[-256:]
+        # Hard cap: keep only the 48 most-recent facts.  Older facts are the
+        # ones least likely to be needed for the current gate or proposer call.
+        if len(self.db_facts) > 48:
+            self.db_facts = self.db_facts[-48:]
 
     def record_action_signature(self, sig: str) -> None:
         if sig:
@@ -110,33 +111,37 @@ class WorkingMemory:
         """Concatenated evidence string used for substring grounding."""
         return "\n".join(self.user_facts + self.db_facts)
 
-    def render_compact(self, max_chars: int = 1500) -> str:
-        """Compact NL render used in the proposer prompt."""
-        def trim(items: List[str], cap: int = 16) -> List[str]:
+    def render_compact(self, max_chars: int = 800) -> str:
+        """Compact NL render used in the proposer prompt.
+
+        Design choices (context-optimization tips):
+        - No ``last_obs`` dump: its key fields are already in db_confirmed_facts
+          (absorbed by absorb_observation), so including the raw JSON is pure
+          duplication (tip 6).
+        - Small item windows: only the most-recent facts matter for the current
+          step; older ones are already captured in db_facts from prior turns.
+        - Hard char cap (800) keeps STATE ≈ 200 tokens (tip 10).
+        """
+        def trim(items: List[str], cap: int) -> List[str]:
             return items[-cap:]
-        last_obs_str = ""
-        if self.last_obs not in (None, ""):
-            try:
-                last_obs_str = json.dumps(self.last_obs, default=str)[:600]
-            except Exception:
-                last_obs_str = str(self.last_obs)[:600]
+
         parts = [
-            f"goal: {self.goal[:200]}" if self.goal else "",
-            "user_revealed_facts:",
-            *(f"  - {f[:160]}" for f in trim(self.user_facts)),
-            "db_confirmed_facts:",
-            *(f"  - {f[:160]}" for f in trim(self.db_facts)),
+            f"goal: {self.goal[:150]}" if self.goal else "",
+            "user_facts:",
+            *(f"  {f[:90]}" for f in trim(self.user_facts, 5)),
+            "db_facts:",
+            *(f"  {f[:90]}" for f in trim(self.db_facts, 8)),
         ]
         if self.assumptions:
-            parts += ["assumptions:", *(f"  - {a[:160]}" for a in trim(self.assumptions))]
+            parts += ["assumptions:",
+                      *(f"  {a[:80]}" for a in trim(self.assumptions, 3))]
         if self.pending_obligations:
-            parts += ["pending_obligations:",
-                      *(f"  - {o[:160]}" for o in trim(self.pending_obligations))]
-        if last_obs_str:
-            parts.append(f"last_obs: {last_obs_str}")
+            parts += ["obligations:",
+                      *(f"  {o[:80]}" for o in trim(self.pending_obligations, 2))]
+        # last_error: single short line; empty string suppresses the field (tip 8).
         if self.last_error:
-            parts.append(f"last_error: {self.last_error[:300]}")
-        parts.append(f"budget_steps_remaining: {self.budget_steps}")
+            parts.append(f"last_error: {self.last_error[:80]}")
+        parts.append(f"steps_left: {self.budget_steps}")
         out = "\n".join(p for p in parts if p)
         return out[:max_chars]
 

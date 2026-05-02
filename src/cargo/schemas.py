@@ -51,12 +51,29 @@ class ProposedAction:
     raw_response: str = ""
 
     def signature(self) -> str:
-        """Canonical (name, sorted args) signature for repeat detection."""
+        """Canonical (name, sorted args) signature for repeat detection.
+
+        For ``respond`` actions the text is carried in ``user_text`` (not in
+        ``args``), so the vanilla args-based signature is always ``respond()``
+        for every call — causing the repeat-loop gate to fire after the first
+        clarifying question and block all subsequent responds.
+
+        Fix: include a short hash of ``user_text`` in the signature so that
+        semantically different messages get distinct signatures, while the
+        exact same message (real repeat) is still caught.
+        """
         try:
             parts = [f"{k}={self.args[k]!r}" for k in sorted(self.args.keys())]
         except Exception:
             parts = []
-        return self.name + "(" + ",".join(parts) + ")"
+        sig = self.name + "(" + ",".join(parts) + ")"
+        # Respond-family actions put content in user_text, not args.
+        if self.name.lower() in ("respond", "send_user", "finish", "final", "answer") \
+                and self.user_text:
+            import hashlib
+            fp = hashlib.md5(self.user_text.strip()[:300].encode()).hexdigest()[:6]
+            sig += f"#{fp}"
+        return sig
 
 
 @dataclass

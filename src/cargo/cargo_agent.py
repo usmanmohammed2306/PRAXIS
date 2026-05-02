@@ -162,7 +162,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
         critique: str,
     ) -> List[Dict[str, Any]]:
         tools_block = render_tools_block(self.schemas)
-        history_tail = trim_history(history, n_turns=8)
+        # n_turns=8 messages ≈ 2-3 complete steps; compression keeps it ≤300 tokens.
+        history_tail = trim_history(history, n_turns=8, max_chars=800)
         user_msg = render_proposer_user_message(
             wm=wm,
             tools_block=tools_block,
@@ -538,9 +539,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     "name": action.name,
                     "content": err_obs,
                 })
-                wm.last_error = str(env_exc)[:300]
-                wm.absorb_observation({"status": "error", "error": str(env_exc)[:200]})
-                step_record["env_error"] = str(env_exc)[:200]
+                wm.last_error = str(env_exc)[:80]  # tip 8: minimal failure record
+                wm.absorb_observation({"status": "error", "error": str(env_exc)[:80]})
+                step_record["env_error"] = str(env_exc)[:80]
                 stats.record_step(step_record)
                 continue
 
@@ -561,7 +562,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             pc = check_postconditions(action, schema, obs=post_obs)
             stats.record_gate(pc)
             if not pc.ok:
-                wm.last_error = pc.reason[:300]
+                wm.last_error = pc.reason[:80]  # tip 8: minimal failure record
                 step_record["post_error"] = pc.reason
 
             reward = _float(getattr(env_resp, "reward", reward), reward)
