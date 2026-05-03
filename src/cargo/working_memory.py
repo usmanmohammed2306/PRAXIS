@@ -48,6 +48,14 @@ class WorkingMemory:
     # Set once we've already emitted a "give up on auth" FINAL.  Prevents the
     # exact same FINAL from being emitted twice in a row.
     auth_giveup_emitted: bool = False
+    # Cache of product details keyed by product_id.  Populated by the agent's
+    # solve loop when ``get_product_details`` returns successfully.  Used to
+    # short-circuit "how many X variants are available?" queries that the
+    # model fails to finalize on its own.
+    product_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Set once we've emitted a deterministic answer for a product-count
+    # query.  Prevents re-emitting the same FINAL on each subsequent step.
+    product_count_finalized: bool = False
 
     # ------------------------------------------------------------------
     # Updates

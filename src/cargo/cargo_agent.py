@@ -155,14 +155,53 @@ def _is_placeholder_email(email: str) -> bool:
 # matches AND no PII is in user_facts, the auth override redirects placeholder
 # find_user_id_by_email proposals to list_all_product_types instead of
 # asking for credentials.
+#
+# Note: avoid generic words like "items" / "options" alone — those overlap
+# with account-modifying tasks ("exchange items in my recent order").  We
+# require a specific product/inventory anchor to avoid misrouting.
 _PRODUCT_QUERY_RE = re.compile(
-    r"\b(t-?shirt|product|products|store|items?|options?|available|"
-    r"how\s+many|stock|catalog|inventory|browse|brands?)\b",
+    r"\b(t-?shirts?|product\s+types?|store|catalog|inventory|browse|"
+    r"how\s+many\s+(?:t-?shirts?|products?|items?|options?|variants?)|"
+    r"(?:t-?shirts?|products?|items?|options?|variants?)\s+(?:available|in\s+(?:the|stock)|currently)|"
+    r"available\s+(?:t-?shirts?|products?|items?|options?|variants?)|"
+    r"in\s+stock|stock\s+of|brands?)\b",
+    re.IGNORECASE,
+)
+
+# Account-modifying signals.  When ANY of these match the goal, the goal
+# requires authentication regardless of any product-query overlap.  This
+# overrides the product heuristic so phrases like "exchange items in my
+# recent order" stay on the auth path.
+_AUTH_REQUIRED_RE = re.compile(
+    r"\b("
+    r"my\s+(?:order|orders|account|pending|recent)|"
+    r"exchang|cancel|return\s+(?:the|my|some|item|order|product)|"
+    r"refund|modify|update\s+my|change\s+my|"
+    r"order\s+(?:id|number|#)|#?[Ww]\d{5,10}"
+    r")\b",
     re.IGNORECASE,
 )
 
 # user_id pattern produced by tau-bench retail (e.g. "yusuf_rossi_9620").
+# Format: lowercase token, underscore, lowercase token, underscore, 1-8 digits.
 _USER_ID_PATTERN = re.compile(r"\b([a-z]+_[a-z]+_\d{1,8})\b")
+
+# Token prefixes that match `_USER_ID_PATTERN` shape but are NOT user IDs.
+# These are common tau-bench retail field names (payment methods, addresses)
+# that should never be treated as a user_id even if they textually match.
+_NON_USER_ID_PREFIXES = (
+    "credit_card_",
+    "debit_card_",
+    "gift_card_",
+    "paypal_account_",
+    "bank_account_",
+    "address_",
+    "order_",
+    "item_",
+    "product_",
+    "variant_",
+    "card_",
+)
 
 # tau-bench retail order_id format: "#W" + digits (e.g. "#W2378156").
 # Used as a fallback when auth via email / name+zip fails but the user
@@ -498,6 +537,26 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     })
                     action = auth_action
 
+            # User-ID override: if the model proposes get_user_details with a
+            # non-user token (e.g. credit_card_9513926), replace with the
+            # correct user_id we have in db_facts.
+            if action is not None:
+                uid_action = self._resolve_get_user_details(action, wm)
+                if uid_action is not None:
+                    raw_text = json.dumps({
+                        "thought": uid_action.raw_thought,
+                        "action": {
+                            "name": uid_action.name,
+                            "args": uid_action.args,
+                            "declared_class": uid_action.declared_class.value,
+                            "declared_pre": uid_action.declared_pre,
+                            "declared_post": uid_action.declared_post,
+                            "informational_intent": uid_action.informational_intent,
+                            "user_text": uid_action.user_text,
+                        },
+                    })
+                    action = uid_action
+
             # Product-ID override: if the proposer passes a product *type name*
             # (e.g. "T-Shirt") where a numeric product_id is required, resolve it
             # from db_facts that were populated by list_all_product_types.
@@ -538,6 +597,27 @@ class CargoAgent(Agent):  # type: ignore[misc]
                         },
                     })
                     action = adv_action
+
+            # Product-count finalizer: if the user asked "how many X" and
+            # we have the data but the model is looping, emit a FINAL
+            # with the computed count.  This is the structural answer to
+            # the model's inability to count + finalize on its own.
+            if action is not None:
+                fin_action = self._finalize_product_count_query(action, wm)
+                if fin_action is not None:
+                    raw_text = json.dumps({
+                        "thought": fin_action.raw_thought,
+                        "action": {
+                            "name": fin_action.name,
+                            "args": fin_action.args,
+                            "declared_class": fin_action.declared_class.value,
+                            "declared_pre": fin_action.declared_pre,
+                            "declared_post": fin_action.declared_post,
+                            "informational_intent": fin_action.informational_intent,
+                            "user_text": fin_action.user_text,
+                        },
+                    })
+                    action = fin_action
 
             messages.append({"role": "assistant", "content": raw_text or ""})
 
@@ -784,11 +864,33 @@ class CargoAgent(Agent):  # type: ignore[misc]
 
             # Cache user_id on successful auth lookup so the override can
             # cleanly suppress subsequent find_user_id_* proposals.
-            if action.name in ("find_user_id_by_email", "find_user_id_by_name_zip"):
+            # Only accept tokens that pass _is_user_id_token (filters out
+            # accidentally-matching credit_card_*, address_* tokens).
+            if action.name in (
+                "find_user_id_by_email", "find_user_id_by_name_zip",
+                "get_order_details",
+            ):
                 if tool_obs:
-                    m = _USER_ID_PATTERN.search(tool_obs)
-                    if m and not wm.auth_user_id:
-                        wm.auth_user_id = m.group(1)
+                    for m in _USER_ID_PATTERN.finditer(tool_obs):
+                        tok = m.group(1)
+                        if self._is_user_id_token(tok) and not wm.auth_user_id:
+                            wm.auth_user_id = tok
+                            break
+
+            # Cache product details for short-circuiting count queries.  When
+            # the model fetches a product successfully and the user query is
+            # "how many X variants" / "how many X options", we can later emit
+            # a FINAL with the computed count instead of looping.
+            if action.name == "get_product_details" and tool_obs:
+                try:
+                    pd = json.loads(tool_obs) if tool_obs.lstrip().startswith("{") else None
+                    if isinstance(pd, dict):
+                        pid = str(pd.get("product_id") or
+                                  action.args.get("product_id") or "")
+                        if pid:
+                            wm.product_details[pid] = pd
+                except Exception:
+                    pass
             # Post-condition check (advisory).
             try:
                 post_obs = json.loads(tool_obs) if tool_obs.strip().startswith(("{", "[")) else tool_obs
@@ -884,13 +986,42 @@ class CargoAgent(Agent):  # type: ignore[misc]
         return None
 
     @staticmethod
+    def _is_user_id_token(token: str) -> bool:
+        """True if `token` is shaped like a user_id AND not a known non-user
+        prefix (credit_card_, paypal_account_, etc.)."""
+        if not token or not _USER_ID_PATTERN.fullmatch(token):
+            return False
+        return not any(token.startswith(p) for p in _NON_USER_ID_PREFIXES)
+
+    @staticmethod
     def _existing_user_id(wm: "WorkingMemory") -> Optional[str]:
-        """Return a user_id from db_facts (or wm.auth_user_id), if any."""
+        """Return a user_id from db_facts (or wm.auth_user_id), if any.
+
+        Strategy:
+        1. Cached: ``wm.auth_user_id``.
+        2. Explicit: any db_fact starting with ``user_id=`` is the
+           authoritative source — the tool literally returned this field.
+        3. Fallback: any db_fact whose token matches the user_id pattern
+           AND does NOT start with a known non-user prefix.
+
+        Without (2) and the prefix check in (3), tau-bench retail order
+        responses leak ``credit_card_9513926`` as the "user_id" because
+        it shares the lowercase_lowercase_digits shape.  Observed in
+        trajectories(19) T3 step 7: the agent issued
+        ``get_user_details(user_id='credit_card_9513926')``.
+        """
         if wm.auth_user_id:
             return wm.auth_user_id
+        # Step 2: explicit user_id= entries.
+        for fact in wm.db_facts:
+            if fact.startswith("user_id="):
+                m = _USER_ID_PATTERN.search(fact)
+                if m and CargoAgent._is_user_id_token(m.group(1)):
+                    return m.group(1)
+        # Step 3: bare token fallback, with prefix filter.
         for fact in wm.db_facts:
             m = _USER_ID_PATTERN.search(fact)
-            if m:
+            if m and CargoAgent._is_user_id_token(m.group(1)):
                 return m.group(1)
         return None
 
@@ -917,8 +1048,26 @@ class CargoAgent(Agent):  # type: ignore[misc]
 
     @staticmethod
     def _is_no_auth_query(wm: "WorkingMemory") -> bool:
-        """Heuristic: does the goal look like a pure product/store query?"""
+        """Heuristic: is the goal a pure product/store query (no auth needed)?
+
+        Returns True only when:
+        - Goal contains a product/store query signal (``_PRODUCT_QUERY_RE``)
+        - AND goal does NOT contain any account-modifying signal
+          (``_AUTH_REQUIRED_RE``: my order, exchange, return, cancel, …)
+
+        The negative check is critical: phrases like "exchange items in my
+        recent order" match the product-query keyword "items" but clearly
+        require authentication.  Observed in trajectories(19) T1: the agent
+        routed an exchange task to ``list_all_product_types`` because of
+        a single overlapping word.
+        """
         if not wm.goal:
+            return False
+        # Negative signal wins: any account-mutating phrase forces auth.
+        # Look in user_facts too — the user may have specified the order
+        # ID after the initial goal.
+        all_text = wm.goal + " " + " ".join(wm.user_facts)
+        if _AUTH_REQUIRED_RE.search(all_text):
             return False
         return bool(_PRODUCT_QUERY_RE.search(wm.goal))
 
@@ -1250,6 +1399,54 @@ class CargoAgent(Agent):  # type: ignore[misc]
         )
 
     # ------------------------------------------------------------------
+    # User-ID resolver (defends against confused-field user_id arguments)
+    # ------------------------------------------------------------------
+    def _resolve_get_user_details(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """Replace a wrong ``user_id`` argument with the correct one.
+
+        Observed failure (trajectories(19) T3 step 7): after
+        ``get_order_details`` returned a JSON containing both ``user_id``
+        and a ``payment_methods.credit_card_9513926`` key, the model
+        passed ``credit_card_9513926`` as the user_id.  The pattern
+        accidentally matches both shapes.  We detect non-user prefixes
+        and substitute the correct user_id we already have in db_facts.
+        """
+        if action.name != "get_user_details":
+            return None
+        uid = str(action.args.get("user_id", "")).strip()
+        if not uid:
+            return None
+        # If the proposed uid is a real-looking user_id, leave it alone.
+        if self._is_user_id_token(uid):
+            # If it matches our cached auth_user_id or any explicit
+            # user_id in db_facts, accept it.
+            return None
+        # Otherwise the model passed a non-user token (credit_card_*, …).
+        correct = self._existing_user_id(wm)
+        if not correct or correct == uid:
+            return None
+        new_args = dict(action.args)
+        new_args["user_id"] = correct
+        return ProposedAction(
+            name=action.name,
+            args=new_args,
+            declared_class=action.declared_class,
+            declared_pre=action.declared_pre,
+            declared_post=action.declared_post,
+            informational_intent=action.informational_intent,
+            raw_thought=(
+                f"User-ID override: replacing non-user token {uid!r} "
+                f"with grounded user_id {correct!r}."
+            ),
+            user_text=action.user_text,
+            raw_response=action.raw_response,
+        )
+
+    # ------------------------------------------------------------------
     # Product-ID / product-list helpers
     # ------------------------------------------------------------------
     def _resolve_product_id_name(
@@ -1418,6 +1615,99 @@ class CargoAgent(Agent):  # type: ignore[misc]
                         f"resolved to ID {id_part} — fetching details directly."
                     ),
                     user_text="",
+                    raw_response="",
+                )
+        return None
+
+    # ------------------------------------------------------------------
+    # Product-count finalizer
+    # ------------------------------------------------------------------
+    def _finalize_product_count_query(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """For "how many X options/variants are available?" queries, when
+        the model has already fetched product details for the relevant
+        product but is now stuck looping on ``list_all_product_types``,
+        emit a deterministic FINAL with the count.
+
+        Without this finalizer, the model can sit on the answer forever
+        (observed in trajectories(19) T0/T2/T4: 24+ steps with the data
+        already in hand).
+        """
+        if wm.product_count_finalized:
+            return None
+        if not wm.product_details:
+            return None
+
+        goal_lower = (wm.goal or "").lower()
+        # Only fire on "how many" / "number of" / "count" type queries.
+        if not re.search(
+            r"\b(how\s+many|number\s+of|count\s+of|count\s+the)\b",
+            goal_lower,
+        ):
+            return None
+        # Only when goal is a product-style query.
+        if not _PRODUCT_QUERY_RE.search(goal_lower):
+            return None
+        # Only when the model is about to repeat a list_all_product_types.
+        # If it's proposing something useful, let it through.
+        if action.name not in (
+            "list_all_product_types",
+            "find_user_id_by_email",
+            "find_user_id_by_name_zip",
+        ):
+            return None
+        sig = action.signature()
+        if action.name == "list_all_product_types" and sig not in wm.recent_signatures:
+            # First call to list — let it run.
+            return None
+
+        # Find the product whose name appears in the goal.
+        for pid, details in wm.product_details.items():
+            name = str(details.get("name", "")).strip()
+            if not name:
+                continue
+            name_norm = name.lower().replace("-", " ").replace("_", " ")
+            goal_norm = goal_lower.replace("-", " ").replace("_", " ")
+            # Substring match in either direction.
+            if name_norm in goal_norm or any(
+                tok in goal_norm for tok in name_norm.split() if len(tok) >= 4
+            ):
+                variants = details.get("variants") or {}
+                if not isinstance(variants, dict) or not variants:
+                    continue
+                total = len(variants)
+                # Count how many are "available" (tau-bench retail variants
+                # have an "available" boolean).
+                available = sum(
+                    1 for v in variants.values()
+                    if isinstance(v, dict) and v.get("available", True)
+                )
+                if available == total:
+                    msg = (
+                        f"There are {total} {name} options currently "
+                        "available in the store."
+                    )
+                else:
+                    msg = (
+                        f"There are {total} {name} variants in the catalog, "
+                        f"of which {available} are currently available."
+                    )
+                wm.product_count_finalized = True
+                return ProposedAction(
+                    name=RESPOND_TOOL_NAME,
+                    args={},
+                    declared_class=RiskClass.FINAL,
+                    declared_pre=[f"{name} details fetched"],
+                    declared_post=["count answered"],
+                    informational_intent=f"answer count for {name}",
+                    raw_thought=(
+                        f"Product-count finalize: {name} has {total} variants "
+                        f"({available} available)."
+                    ),
+                    user_text=msg,
                     raw_response="",
                 )
         return None
