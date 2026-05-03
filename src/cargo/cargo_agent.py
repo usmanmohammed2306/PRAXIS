@@ -755,6 +755,25 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 content = (action.user_text or action.raw_thought or "").strip()
                 if not content:
                     content = "Is there anything else I can help you with?"
+
+                # Hard-loop break: if the same respond text is being emitted
+                # repeatedly, the trajectory is making no progress.  tau-bench
+                # treats respond as a query (not a terminator), so a stuck
+                # FINAL would otherwise burn the entire step budget.
+                # Observed in trajectories(20) T3/T4: "Is there anything else
+                # I can help you with?" emitted 8+ times in a row.
+                if content == wm.last_final_text:
+                    wm.consecutive_same_final += 1
+                else:
+                    wm.consecutive_same_final = 1
+                    wm.last_final_text = content
+                if wm.consecutive_same_final >= 2 and action.declared_class == RiskClass.FINAL:
+                    # Already said this exact FINAL.  Terminate to avoid wasting
+                    # the step budget on a frozen trajectory.
+                    step_record["terminated"] = "consecutive_final"
+                    stats.record_step(step_record)
+                    break
+
                 env_resp = self._respond(env, content)
                 if env_resp is None:
                     break
@@ -889,6 +908,34 @@ class CargoAgent(Agent):  # type: ignore[misc]
                                   action.args.get("product_id") or "")
                         if pid:
                             wm.product_details[pid] = pd
+                except Exception:
+                    pass
+
+            # Cache the product type catalogue.  This is a flat dict mapping
+            # name → product_id.  We cache it OUTSIDE db_facts because db_facts
+            # has a 48-entry LRU cap, and a single get_product_details call
+            # fills it with variant data, evicting the catalogue.  The
+            # catalogue is needed by _advance_after_product_list and by the
+            # product-id resolver to handle multi-product follow-up queries.
+            if action.name == "list_all_product_types" and tool_obs:
+                try:
+                    pt = json.loads(tool_obs) if tool_obs.lstrip().startswith("{") else None
+                    if isinstance(pt, dict):
+                        for name, pid in pt.items():
+                            if isinstance(name, str) and isinstance(pid, (str, int)):
+                                wm.product_types[name] = str(pid)
+                except Exception:
+                    pass
+
+            # Cache order details by order_id for downstream access.
+            if action.name == "get_order_details" and tool_obs:
+                try:
+                    od = json.loads(tool_obs) if tool_obs.lstrip().startswith("{") else None
+                    if isinstance(od, dict):
+                        oid = str(od.get("order_id") or
+                                  action.args.get("order_id") or "")
+                        if oid:
+                            wm.order_details[oid] = od
                 except Exception:
                     pass
             # Post-condition check (advisory).
@@ -1477,13 +1524,17 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return None
         pid_str = str(pid).strip()
 
-        # Build a {lower(name): numeric_id} map from db_facts entries of
-        # the form ``Name=Number``.
+        # Build a {lower(name): numeric_id} map.  Prefer the durable
+        # wm.product_types catalogue, then fall back to db_facts (which can
+        # be evicted under memory pressure).
         name_to_id: Dict[str, str] = {}
         all_known_ids = set()
+        for name, pid in wm.product_types.items():
+            if isinstance(name, str) and isinstance(pid, str) and re.fullmatch(r"\d+", pid):
+                name_to_id[name.strip().lower()] = pid
+                all_known_ids.add(pid)
         for fact in wm.db_facts:
             if "=" not in fact:
-                # bare numeric facts are still legitimate
                 if re.fullmatch(r"\d+", fact.strip()):
                     all_known_ids.add(fact.strip())
                 continue
@@ -1491,7 +1542,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             id_part = id_part.strip()
             if not re.fullmatch(r"\d+", id_part):
                 continue
-            name_to_id[name_part.strip().lower()] = id_part
+            name_to_id.setdefault(name_part.strip().lower(), id_part)
             all_known_ids.add(id_part)
 
         # ---- Case 1: numeric ID not in db_facts → hallucinated ----
@@ -1574,25 +1625,47 @@ class CargoAgent(Agent):  # type: ignore[misc]
         action: ProposedAction,
         wm: "WorkingMemory",
     ) -> Optional[ProposedAction]:
-        """If ``list_all_product_types`` is about to be repeated (already in
-        recent_signatures) and the user mentioned a product type that we can
-        resolve to a numeric ID in db_facts, skip straight to
-        ``get_product_details`` instead.
+        """If ``list_all_product_types`` is about to be repeated, skip
+        straight to ``get_product_details`` for a product the user
+        mentioned but we haven't fetched yet.
 
-        This avoids the infinite list_all_product_types → repeat_loop → retry
-        cycle that wastes the entire step budget without making progress.
+        Uses ``wm.product_types`` (durable cache, not db_facts) so multi-
+        product follow-up queries work even after db_facts has been evicted
+        by a single get_product_details flooding it with variant data.
         """
         if action.name != "list_all_product_types":
             return None
-        # Check whether this action is already in recent_signatures.
         sig = action.signature()
         if sig not in wm.recent_signatures:
             return None  # first call — let it run normally
 
-        # It's a repeat.  Try to find a product ID we can use directly.
-        # Scan user_facts for any word that appears as a key in db_facts
-        # (i.e. was returned from a previous list_all_product_types call).
-        all_user = " ".join(wm.user_facts)
+        all_user = " ".join(wm.user_facts).lower()
+        # Iterate the durable catalogue.  Skip anything we've already fetched.
+        for name, pid in wm.product_types.items():
+            if not name or not pid:
+                continue
+            if pid in wm.product_details:
+                continue  # already have details for this product
+            name_norm = name.lower()
+            if name_norm in all_user or any(
+                tok in all_user for tok in name_norm.split() if len(tok) >= 4
+            ):
+                return ProposedAction(
+                    name="get_product_details",
+                    args={"product_id": pid},
+                    declared_class=RiskClass.READ,
+                    declared_pre=["product types already listed"],
+                    declared_post=["product details retrieved"],
+                    informational_intent=f"get details for {name}",
+                    raw_thought=(
+                        f"Product-list advance: user mentioned '{name}', "
+                        f"resolved to ID {pid} — fetching details directly."
+                    ),
+                    user_text="",
+                    raw_response="",
+                )
+        # Fallback: legacy db_facts iteration (kept for callers populating
+        # db_facts directly without the solve-loop cache).
         for fact in wm.db_facts:
             if "=" not in fact:
                 continue
@@ -1601,8 +1674,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
             id_part = id_part.strip()
             if not re.fullmatch(r"\d+", id_part):
                 continue
-            # Case-insensitive check: does the user message mention this type?
-            if name_part.lower() in all_user.lower():
+            if id_part in wm.product_details:
+                continue
+            if name_part.lower() in all_user:
                 return ProposedAction(
                     name="get_product_details",
                     args={"product_id": id_part},
