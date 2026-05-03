@@ -1700,6 +1700,243 @@ class TestTrajectory18Regressions(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Tau-bench import sanity (skipped when tau_bench is not installed)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Regression tests for trajectories(19) failure patterns
+# ---------------------------------------------------------------------------
+class TestTrajectory19Regressions(unittest.TestCase):
+    """Each test pinned to a specific bug observed in trajectories(19)."""
+
+    def _make_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        client = MockClient(scripts=[])
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client; agent.model = "test"; agent.style_name = "cargo"
+        agent.temperature = 0.0; agent.schemas = {}; agent.domain_policy = ""
+        return agent
+
+    # ------------------------------------------------------------------
+    # Bug A: user_id pattern collision with credit_card_*
+    # T3 step 7: get_user_details(credit_card_9513926) — wrong field.
+    # ------------------------------------------------------------------
+    def test_user_id_prefers_explicit_field_over_bare_token(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        wm = WorkingMemory()
+        # credit_card token comes FIRST in db_facts (worst case)
+        wm.db_facts = [
+            "credit_card_9513926",
+            "user_id=yusuf_rossi_9620",
+            "yusuf_rossi_9620",
+        ]
+        self.assertEqual(CargoAgent._existing_user_id(wm), "yusuf_rossi_9620")
+
+    def test_user_id_skips_credit_card_when_only_bare_tokens(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        wm = WorkingMemory()
+        wm.db_facts = ["credit_card_9513926", "yusuf_rossi_9620"]
+        self.assertEqual(CargoAgent._existing_user_id(wm), "yusuf_rossi_9620")
+
+    def test_user_id_skips_paypal_account(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        wm = WorkingMemory()
+        wm.db_facts = ["paypal_account_1234567", "alice_smith_42"]
+        self.assertEqual(CargoAgent._existing_user_id(wm), "alice_smith_42")
+
+    def test_user_id_token_predicate(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        # Real-looking tokens
+        self.assertTrue(CargoAgent._is_user_id_token("yusuf_rossi_9620"))
+        self.assertTrue(CargoAgent._is_user_id_token("alice_smith_1"))
+        # Non-user prefixes
+        self.assertFalse(CargoAgent._is_user_id_token("credit_card_9513926"))
+        self.assertFalse(CargoAgent._is_user_id_token("paypal_account_42"))
+        self.assertFalse(CargoAgent._is_user_id_token("address_id_42"))
+        self.assertFalse(CargoAgent._is_user_id_token("order_W2378156"))
+        # Wrong shape
+        self.assertFalse(CargoAgent._is_user_id_token("yusuf_rossi"))
+        self.assertFalse(CargoAgent._is_user_id_token("yusuf"))
+
+    # ------------------------------------------------------------------
+    # Bug E: get_user_details with non-user token gets corrected
+    # ------------------------------------------------------------------
+    def test_get_user_details_with_credit_card_corrected(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.db_facts = [
+            "user_id=yusuf_rossi_9620",
+            "yusuf_rossi_9620",
+            "credit_card_9513926",
+        ]
+        bad = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "credit_card_9513926"},
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[], informational_intent="",
+            raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._resolve_get_user_details(bad, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.args["user_id"], "yusuf_rossi_9620")  # type: ignore
+
+    def test_get_user_details_with_correct_uid_unchanged(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.db_facts = ["user_id=yusuf_rossi_9620"]
+        good = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "yusuf_rossi_9620"},
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[], informational_intent="",
+            raw_thought="", user_text="", raw_response="",
+        )
+        self.assertIsNone(agent._resolve_get_user_details(good, wm))
+
+    # ------------------------------------------------------------------
+    # Bug B: "exchange items in my recent order" routed to product flow
+    # ------------------------------------------------------------------
+    def test_exchange_task_requires_auth(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        wm = WorkingMemory()
+        wm.goal = "Hello! I need to make some changes to my recent order. Could you please assist me with exchanging items?"
+        wm.absorb_user_message(wm.goal)
+        self.assertFalse(CargoAgent._is_no_auth_query(wm))
+
+    def test_return_task_requires_auth(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        wm = WorkingMemory()
+        wm.goal = "I want to return the headphones from my order."
+        wm.absorb_user_message(wm.goal)
+        self.assertFalse(CargoAgent._is_no_auth_query(wm))
+
+    def test_cancel_task_requires_auth(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        wm = WorkingMemory()
+        wm.goal = "Please cancel my pending order."
+        wm.absorb_user_message(wm.goal)
+        self.assertFalse(CargoAgent._is_no_auth_query(wm))
+
+    def test_pure_product_query_still_no_auth(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are currently available?"
+        wm.absorb_user_message(wm.goal)
+        self.assertTrue(CargoAgent._is_no_auth_query(wm))
+
+    def test_order_id_in_user_facts_forces_auth(self) -> None:
+        """If user provided an order ID in any turn, this is an account task."""
+        from src.cargo.cargo_agent import CargoAgent
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are available?"
+        wm.absorb_user_message("My order is #W2378156, also can I see t-shirts?")
+        # Should require auth — they have a specific order context
+        self.assertFalse(CargoAgent._is_no_auth_query(wm))
+
+    # ------------------------------------------------------------------
+    # Bug C: post-product-details finalization (the loop-breaker)
+    # ------------------------------------------------------------------
+    def test_finalize_product_count_when_data_available(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are currently available?"
+        wm.absorb_user_message(wm.goal)
+        wm.product_details["9523456873"] = {
+            "name": "T-Shirt",
+            "variants": {f"v{i}": {"item_id": f"v{i}"} for i in range(7)},
+        }
+        # list_all_product_types already executed once (in recent_signatures)
+        wm.recent_signatures.append("list_all_product_types()")
+        loop_action = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._finalize_product_count_query(loop_action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.FINAL)
+        # Count should be in the message
+        self.assertIn("7", result.user_text)
+        self.assertIn("T-Shirt", result.user_text)
+        self.assertTrue(wm.product_count_finalized)
+
+    def test_finalize_only_fires_once(self) -> None:
+        """Don't re-emit the same FINAL on every step."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirts are available?"
+        wm.product_details["1"] = {
+            "name": "T-Shirt",
+            "variants": {"v1": {}, "v2": {}},
+        }
+        wm.recent_signatures.append("list_all_product_types()")
+        loop_action = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        first = agent._finalize_product_count_query(loop_action, wm)
+        self.assertIsNotNone(first)
+        # Second call must return None — already finalized
+        second = agent._finalize_product_count_query(loop_action, wm)
+        self.assertIsNone(second)
+
+    def test_finalize_does_not_fire_on_first_list_call(self) -> None:
+        """Don't short-circuit before list_all_product_types has run."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirts are available?"
+        wm.product_details["1"] = {"name": "T-Shirt", "variants": {"v1": {}}}
+        # NOT in recent_signatures yet — first call
+        loop_action = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        self.assertIsNone(agent._finalize_product_count_query(loop_action, wm))
+
+    def test_finalize_does_not_fire_for_non_count_queries(self) -> None:
+        """Goal must contain 'how many' / 'number of' / 'count of'."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "Tell me about t-shirts available in the store."
+        wm.product_details["1"] = {"name": "T-Shirt", "variants": {"v1": {}}}
+        wm.recent_signatures.append("list_all_product_types()")
+        action = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        self.assertIsNone(agent._finalize_product_count_query(action, wm))
+
+    def test_finalize_counts_available_only(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are currently available?"
+        # 5 variants, 3 available, 2 not
+        wm.product_details["1"] = {
+            "name": "T-Shirt",
+            "variants": {
+                "a": {"available": True},
+                "b": {"available": True},
+                "c": {"available": True},
+                "d": {"available": False},
+                "e": {"available": False},
+            },
+        }
+        wm.recent_signatures.append("list_all_product_types()")
+        action = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._finalize_product_count_query(action, wm)
+        self.assertIsNotNone(result)
+        # Should mention 5 total and 3 available
+        self.assertIn("5", result.user_text)
+        self.assertIn("3", result.user_text)
+
+
+# ---------------------------------------------------------------------------
+# Tau-bench import sanity (skipped when tau_bench is not installed)
+# ---------------------------------------------------------------------------
 class TestTauBenchIntegrationOptional(unittest.TestCase):
     def test_baselines_still_import(self) -> None:
         try:
