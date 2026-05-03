@@ -115,13 +115,41 @@ _NAME_PAIR_RE = re.compile(r"\b([A-Z][a-z]{1,20})\s+([A-Z][a-z]{1,20})\b")
 # phrase ("my name is X Y", "I'm X Y", "this is X Y", etc.).  This is the
 # default — it prevents random Title-case bigrams in user prose (e.g.
 # "Google Home", "Smart Thermostat") from being mistaken for person names.
+#
+# CRITICAL: the introduction prefix is wrapped in (?i:...) so case-insensitive
+# matching applies to "my name is" / "I'm" / "I AM" but NOT to the captured
+# name groups.  Without this scoping, re.IGNORECASE made [A-Z][a-z]+ match
+# lowercase too — so "I'm looking to see..." captured ("looking", "to") as
+# the user's first/last name (observed in trajectories(18) tasks 1, 2, 4).
 _NAME_INTRO_RE = re.compile(
-    r"(?:my\s+name\s+(?:is|'s)|i\s+am\b|i'm\b|this\s+is|call\s+me|"
-    r"name(?:\s*[:=]|d\b)|i\s+go\s+by)"
+    r"(?i:(?:my\s+name\s+(?:is|'s)|i\s+am\b|i'm\b|this\s+is|call\s+me|"
+    r"name(?:\s*[:=]|d\b)|i\s+go\s+by))"
     r"[\s,]+([A-Z][a-z]{1,20})\s+([A-Z][a-z]{1,20})",
-    re.IGNORECASE,
 )
 _ZIP_RE = re.compile(r"\b(\d{5})\b")
+
+# Email domains that are clearly placeholder / non-real.
+_PLACEHOLDER_EMAIL_DOMAINS = (
+    "@example.", "@test.", "@sample.", "@dummy.", "@fake.",
+    "@placeholder.", "@invalid.", "@nowhere.", "@localhost",
+)
+
+
+def _is_placeholder_email(email: str) -> bool:
+    """Return True if `email` is a placeholder / fabricated identifier.
+
+    Centralizes the predicate so both the action override and evidence
+    extraction agree.  Without this, ``yusuf.rossi@example.com`` slipped
+    through ``_extract_real_email`` because the prefix-only
+    ``_PLACEHOLDER_EMAIL_RE`` doesn't list "yusuf.rossi", but the email
+    is still a placeholder due to the @example domain.
+    """
+    if not email or "@" not in email:
+        return True
+    el = email.lower().strip()
+    if _PLACEHOLDER_EMAIL_RE.match(email):
+        return True
+    return any(d in el for d in _PLACEHOLDER_EMAIL_DOMAINS)
 
 # Goal keywords that indicate a "no auth required" query.  When the goal
 # matches AND no PII is in user_facts, the auth override redirects placeholder
@@ -135,6 +163,11 @@ _PRODUCT_QUERY_RE = re.compile(
 
 # user_id pattern produced by tau-bench retail (e.g. "yusuf_rossi_9620").
 _USER_ID_PATTERN = re.compile(r"\b([a-z]+_[a-z]+_\d{1,8})\b")
+
+# tau-bench retail order_id format: "#W" + digits (e.g. "#W2378156").
+# Used as a fallback when auth via email / name+zip fails but the user
+# has supplied an order number directly.
+_ORDER_ID_PATTERN = re.compile(r"#?[Ww]\d{5,10}")
 
 # Phrases that indicate the user is refusing to provide authentication info.
 # When any of these are found we stop asking and issue a polite FINAL.
@@ -798,9 +831,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
     # ------------------------------------------------------------------
     @staticmethod
     def _extract_real_email(facts: List[str]) -> Optional[str]:
+        """Return the first non-placeholder email found in `facts`."""
         for fact in facts:
             m = _EMAIL_RE_MOD.search(fact)
-            if m and not _PLACEHOLDER_EMAIL_RE.match(m.group(0)):
+            if m and not _is_placeholder_email(m.group(0)):
                 return m.group(0)
         return None
 
@@ -858,6 +892,27 @@ class CargoAgent(Agent):  # type: ignore[misc]
             m = _USER_ID_PATTERN.search(fact)
             if m:
                 return m.group(1)
+        return None
+
+    @staticmethod
+    def _extract_order_id(wm: "WorkingMemory") -> Optional[str]:
+        """Return a tau-bench order_id from user_facts, if any.
+
+        Format: #W followed by 5-10 digits (e.g. "#W2378156"). This is the
+        recovery anchor when both name+zip and email lookups have failed
+        but the user supplied a tracking/order number.
+        """
+        for fact in wm.user_facts:
+            m = _ORDER_ID_PATTERN.search(fact)
+            if m:
+                oid = m.group(0)
+                # Normalise: ensure leading '#' and uppercase 'W'
+                if not oid.startswith("#"):
+                    oid = "#" + oid
+                # Uppercase the W
+                if len(oid) >= 2:
+                    oid = "#" + oid[1].upper() + oid[2:]
+                return oid
         return None
 
     @staticmethod
@@ -979,19 +1034,82 @@ class CargoAgent(Agent):  # type: ignore[misc]
         # ---------------------------------------------------------------
         if action.name == "find_user_id_by_email":
             email_val = str(action.args.get("email", ""))
-            is_placeholder = (
-                not email_val
-                or _PLACEHOLDER_EMAIL_RE.match(email_val)
-                or "@example." in email_val.lower()
-                or "@test." in email_val.lower()
-            )
-            if not is_placeholder:
+            if not _is_placeholder_email(email_val):
                 return None  # model has a real email — let it proceed
 
         # ---------------------------------------------------------------
-        # Path 2: Auth has been abandoned (refused / ask budget exhausted).
-        # Don't ask again.  If goal is no-auth, redirect; else emit a
-        # one-shot FINAL (guarded so we don't repeat it).
+        # Extract evidence ONCE, before deciding what to do.  Critical
+        # ordering: we must check evidence BEFORE the abandoned-auth
+        # check, otherwise fresh user input (provided AFTER our last ask)
+        # gets discarded just because auth_ask_count hit the cap.  This
+        # was T3 in trajectories(18): user supplied name + ZIP across
+        # two turns, then the override gave up because count == max.
+        # ---------------------------------------------------------------
+        in_response_to_ask = wm.auth_ask_count > 0
+        evidence = wm.user_facts
+        real_email = self._extract_real_email(evidence)
+        name_pair = self._extract_name_pair(evidence, in_response_to_ask)
+        zip_code = self._extract_zip(evidence, wm.auth_failed_zips)
+        has_usable_pii = bool(real_email or (name_pair and zip_code))
+
+        # ---------------------------------------------------------------
+        # Path 2: We have usable PII — use it BEFORE giving up.
+        # ---------------------------------------------------------------
+        if real_email:
+            return ProposedAction(
+                name="find_user_id_by_email",
+                args={"email": real_email},
+                declared_class=RiskClass.READ,
+                declared_pre=["user provided email"],
+                declared_post=["user_id retrieved"],
+                informational_intent="authenticate via user-provided email",
+                raw_thought="Auth override: using real email from user message.",
+                user_text="",
+                raw_response="",
+            )
+
+        if name_pair and zip_code:
+            return ProposedAction(
+                name="find_user_id_by_name_zip",
+                args={
+                    "first_name": name_pair[0],
+                    "last_name": name_pair[1],
+                    "zip": zip_code,
+                },
+                declared_class=RiskClass.READ,
+                declared_pre=["user provided name and zip"],
+                declared_post=["user_id retrieved"],
+                informational_intent="authenticate via name+zip",
+                raw_thought="Auth override: using user-provided name+zip.",
+                user_text="",
+                raw_response="",
+            )
+
+        # Order-ID fallback: if the user supplied an order number, we can
+        # often proceed with get_order_details directly.  This is the recovery
+        # path when both name+zip and email lookups have failed but the user
+        # gave a tracking/order number ("#W2378156" in tau-bench retail).
+        order_id = self._extract_order_id(wm)
+        order_signature = f"get_order_details(order_id={order_id!r})"
+        if order_id and order_signature not in wm.recent_signatures:
+            return ProposedAction(
+                name="get_order_details",
+                args={"order_id": order_id},
+                declared_class=RiskClass.READ,
+                declared_pre=["user provided order id"],
+                declared_post=["order details retrieved"],
+                informational_intent="look up the user's order directly",
+                raw_thought=(
+                    f"Auth override: order_id {order_id} from user_facts → "
+                    "fall back to get_order_details."
+                ),
+                user_text="",
+                raw_response="",
+            )
+
+        # ---------------------------------------------------------------
+        # Path 3: No usable PII.  Now check if auth has been abandoned
+        # (refused / ask budget exhausted).
         # ---------------------------------------------------------------
         all_user_text = " ".join(wm.user_facts).lower()
         user_refused = any(phrase in all_user_text for phrase in _AUTH_REFUSAL_PHRASES)
@@ -1055,19 +1173,13 @@ class CargoAgent(Agent):  # type: ignore[misc]
             )
 
         # ---------------------------------------------------------------
-        # Path 3: No PII at all AND the goal is a no-auth query (product
-        # query) → redirect to list_all_product_types.  This is a critical
-        # fix: without it, the model's reflexive find_user_id_by_email gets
-        # converted to "please give us your credentials" even though the
-        # user only wanted to know how many t-shirts there are.
+        # Path 4: No PII at all AND the goal is a no-auth query (product
+        # query) → redirect to list_all_product_types.  Without this, the
+        # model's reflexive find_user_id_by_email gets converted to
+        # "please give us your credentials" even though the user only
+        # wanted to know how many t-shirts there are.
         # ---------------------------------------------------------------
-        in_response_to_ask = wm.auth_ask_count > 0
-        evidence = wm.user_facts
-        real_email = self._extract_real_email(evidence)
-        name_pair = self._extract_name_pair(evidence, in_response_to_ask)
-        zip_code = self._extract_zip(evidence, wm.auth_failed_zips)
         has_any_pii = bool(real_email or name_pair or zip_code)
-
         if not has_any_pii and self._is_no_auth_query(wm):
             return ProposedAction(
                 name="list_all_product_types",
@@ -1080,39 +1192,6 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     "Auth override: product query with no PII → "
                     "list_all_product_types instead of asking for auth."
                 ),
-                user_text="",
-                raw_response="",
-            )
-
-        # ---------------------------------------------------------------
-        # Path 4: Use the best evidence we have.
-        # ---------------------------------------------------------------
-        if real_email:
-            return ProposedAction(
-                name="find_user_id_by_email",
-                args={"email": real_email},
-                declared_class=RiskClass.READ,
-                declared_pre=["user provided email"],
-                declared_post=["user_id retrieved"],
-                informational_intent="authenticate via user-provided email",
-                raw_thought="Auth override: using real email from user message.",
-                user_text="",
-                raw_response="",
-            )
-
-        if name_pair and zip_code:
-            return ProposedAction(
-                name="find_user_id_by_name_zip",
-                args={
-                    "first_name": name_pair[0],
-                    "last_name": name_pair[1],
-                    "zip": zip_code,
-                },
-                declared_class=RiskClass.READ,
-                declared_pre=["user provided name and zip"],
-                declared_post=["user_id retrieved"],
-                informational_intent="authenticate via name+zip",
-                raw_thought="Auth override: using user-provided name+zip.",
                 user_text="",
                 raw_response="",
             )
@@ -1178,13 +1257,19 @@ class CargoAgent(Agent):  # type: ignore[misc]
         action: ProposedAction,
         wm: "WorkingMemory",
     ) -> Optional[ProposedAction]:
-        """If the proposer passes a type-name string (e.g. 'T-Shirt') where
-        ``get_product_details`` expects a numeric ``product_id``, resolve the
-        ID from db_facts that were populated when ``list_all_product_types``
-        ran previously.
+        """Resolve a corrupt or hallucinated ``product_id`` argument.
 
-        db_facts entries look like: ``T-Shirt=6086499569`` or just ``6086499569``.
-        We also absorb bare product names from the observation list.
+        Two failure modes handled:
+
+        1. Type-name string (e.g. 'T-Shirt') where a numeric ID is expected.
+           Resolved from db_facts entries like ``T-Shirt=6086499569``.
+
+        2. Numeric ID that is NOT in db_facts (i.e. the model hallucinated
+           a number). Observed in trajectories(18): the model called
+           ``get_product_details(9523456873)`` 24+ times after
+           ``list_all_product_types`` returned a JSON map of real IDs.
+           In this case we look at the goal for a product-type keyword
+           and substitute the matching real ID from db_facts.
 
         Returns a corrected action, or None if no fix is needed / possible.
         """
@@ -1194,23 +1279,57 @@ class CargoAgent(Agent):  # type: ignore[misc]
         if pid is None:
             return None
         pid_str = str(pid).strip()
-        # Already a numeric ID? Nothing to do.
-        if re.fullmatch(r"\d+", pid_str):
-            return None
 
-        # Try to find a db_facts entry of the form "<type_name>=<numeric_id>"
-        # where the type_name matches pid_str (case-insensitive prefix match).
-        pid_lower = pid_str.lower()
+        # Build a {lower(name): numeric_id} map from db_facts entries of
+        # the form ``Name=Number``.
+        name_to_id: Dict[str, str] = {}
+        all_known_ids = set()
         for fact in wm.db_facts:
             if "=" not in fact:
+                # bare numeric facts are still legitimate
+                if re.fullmatch(r"\d+", fact.strip()):
+                    all_known_ids.add(fact.strip())
                 continue
             name_part, _, id_part = fact.partition("=")
-            if not re.fullmatch(r"\d+", id_part.strip()):
+            id_part = id_part.strip()
+            if not re.fullmatch(r"\d+", id_part):
                 continue
-            if name_part.strip().lower() == pid_lower or pid_lower in name_part.strip().lower():
-                numeric_id = int(id_part.strip())
+            name_to_id[name_part.strip().lower()] = id_part
+            all_known_ids.add(id_part)
+
+        # ---- Case 1: numeric ID not in db_facts → hallucinated ----
+        if re.fullmatch(r"\d+", pid_str):
+            if pid_str in all_known_ids:
+                return None  # legitimate ID, leave as-is
+            # Hallucinated ID — try to find a goal-relevant replacement.
+            replacement = self._goal_matched_product_id(wm, name_to_id)
+            if replacement is None:
+                # No good replacement; let the action through (gates may
+                # reject; if not, env returns "not found" which is fine).
+                return None
+            new_args = dict(action.args)
+            new_args["product_id"] = replacement
+            return ProposedAction(
+                name=action.name,
+                args=new_args,
+                declared_class=action.declared_class,
+                declared_pre=action.declared_pre,
+                declared_post=action.declared_post,
+                informational_intent=action.informational_intent,
+                raw_thought=(
+                    f"Product-ID override: hallucinated '{pid_str}' → "
+                    f"{replacement} (matched goal in db_facts)."
+                ),
+                user_text=action.user_text,
+                raw_response=action.raw_response,
+            )
+
+        # ---- Case 2: type-name string → look up by name ----
+        pid_lower = pid_str.lower()
+        for name_lower, num in name_to_id.items():
+            if name_lower == pid_lower or pid_lower in name_lower:
                 new_args = dict(action.args)
-                new_args["product_id"] = numeric_id
+                new_args["product_id"] = num
                 return ProposedAction(
                     name=action.name,
                     args=new_args,
@@ -1219,12 +1338,38 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     declared_post=action.declared_post,
                     informational_intent=action.informational_intent,
                     raw_thought=(
-                        f"Product-ID override: resolved '{pid_str}' → {numeric_id} "
+                        f"Product-ID override: resolved '{pid_str}' → {num} "
                         "from db_facts."
                     ),
                     user_text=action.user_text,
                     raw_response=action.raw_response,
                 )
+        return None
+
+    @staticmethod
+    def _goal_matched_product_id(
+        wm: "WorkingMemory", name_to_id: Dict[str, str]
+    ) -> Optional[str]:
+        """Search the goal text for a product-type keyword and return the
+        matching numeric ID from `name_to_id` if found."""
+        goal_lower = (wm.goal or "").lower()
+        if not goal_lower:
+            return None
+        # Exact match: goal mentions a name from db_facts directly.
+        for name_lower, num in name_to_id.items():
+            if name_lower and name_lower in goal_lower:
+                return num
+        # Soft match: split goal into words, look for any word that's a
+        # significant part of a name.  E.g. goal="t-shirt options" should
+        # match name="t-shirt" or "t shirt" or even "shirt".
+        words = re.findall(r"[a-z0-9]+", goal_lower)
+        for w in words:
+            if len(w) < 4:
+                continue
+            for name_lower, num in name_to_id.items():
+                # token must appear as a whole word in the name
+                if re.search(rf"\b{re.escape(w)}\b", name_lower):
+                    return num
         return None
 
     def _advance_after_product_list(
@@ -1261,17 +1406,16 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 continue
             # Case-insensitive check: does the user message mention this type?
             if name_part.lower() in all_user.lower():
-                numeric_id = int(id_part)
                 return ProposedAction(
                     name="get_product_details",
-                    args={"product_id": numeric_id},
+                    args={"product_id": id_part},
                     declared_class=RiskClass.READ,
                     declared_pre=["product types already listed"],
                     declared_post=["product details retrieved"],
                     informational_intent=f"get details for {name_part}",
                     raw_thought=(
                         f"Product-list advance: user mentioned '{name_part}', "
-                        f"resolved to ID {numeric_id} — fetching details directly."
+                        f"resolved to ID {id_part} — fetching details directly."
                     ),
                     user_text="",
                     raw_response="",
