@@ -56,6 +56,22 @@ class WorkingMemory:
     # Set once we've emitted a deterministic answer for a product-count
     # query.  Prevents re-emitting the same FINAL on each subsequent step.
     product_count_finalized: bool = False
+    # Catalog of product types — populated by the solve loop when
+    # ``list_all_product_types`` returns.  Maps product name → product_id.
+    # Lives outside ``db_facts`` so it survives the LRU cap (48 entries),
+    # which would otherwise evict product types as soon as a single
+    # ``get_product_details`` response floods db_facts with variant info.
+    # Observed eviction failure: trajectories(20) T1/T2/T3 lost the
+    # Headphones/Cleaner/Smartwatch entries after T-Shirt details came in.
+    product_types: Dict[str, str] = field(default_factory=dict)
+    # Cache of order details keyed by order_id.  Populated by the solve
+    # loop when ``get_order_details`` returns.  Used by downstream tooling
+    # to look up items in the order without re-fetching.
+    order_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Track the last respond/FINAL message we emitted so the controller can
+    # detect a "same FINAL on every step" infinite loop and break out.
+    last_final_text: str = ""
+    consecutive_same_final: int = 0
 
     # ------------------------------------------------------------------
     # Updates
@@ -178,6 +194,9 @@ class WorkingMemory:
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]{3,}")
 _USER_ID_RE = re.compile(r"\b[a-z]+_[a-z]+_\d{1,8}\b")
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+# tau-bench retail order IDs: "#W" + digits, with or without the leading #.
+# We capture both forms so arg_grounding accepts either.
+_ORDER_ID_LOOSE_RE = re.compile(r"#?[Ww](\d{5,10})")
 
 
 def _extract_id_tokens(s: str) -> List[str]:
@@ -196,6 +215,14 @@ def _extract_id_tokens(s: str) -> List[str]:
         _push(m.group(0))
     for m in _EMAIL_RE.finditer(s):
         _push(m.group(0))
+    # Order IDs: emit BOTH the bare ("W2378156") and the canonical ("#W2378156")
+    # form so arg_grounding accepts either when the action layer normalises
+    # to one or the other.  Without this, the user saying "order number
+    # W2378156" doesn't ground the agent's "#W2378156" and the call loops.
+    for m in _ORDER_ID_LOOSE_RE.finditer(s):
+        digits = m.group(1)
+        _push(f"W{digits}")
+        _push(f"#W{digits}")
     # Capital-prefixed IDs like O123, R4567, B89.
     for m in re.finditer(r"\b[A-Z]\d{2,}\b", s):
         _push(m.group(0))

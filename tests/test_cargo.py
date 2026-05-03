@@ -1937,6 +1937,147 @@ class TestTrajectory19Regressions(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Tau-bench import sanity (skipped when tau_bench is not installed)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Regression tests for trajectories(20) failure patterns
+# ---------------------------------------------------------------------------
+class TestTrajectory20Regressions(unittest.TestCase):
+    """Each test pinned to a specific bug observed in trajectories(20)."""
+
+    def _make_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        client = MockClient(scripts=[])
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client; agent.model = "test"; agent.style_name = "cargo"
+        agent.temperature = 0.0; agent.schemas = {}; agent.domain_policy = ""
+        return agent
+
+    # ------------------------------------------------------------------
+    # Bug T0: order_id format mismatch.  User says "W2378156", agent
+    # produces "#W2378156", arg_grounding rejects.  Both forms must be
+    # stored in user_facts.
+    # ------------------------------------------------------------------
+    def test_order_id_both_forms_in_user_facts(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_user_message("Could you check on order number W2378156 for me please?")
+        self.assertIn("W2378156", wm.user_facts)
+        self.assertIn("#W2378156", wm.user_facts)
+
+    def test_order_id_with_hash_prefix_normalized(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_user_message("My order is #W1234567.")
+        self.assertIn("W1234567", wm.user_facts)
+        self.assertIn("#W1234567", wm.user_facts)
+
+    def test_order_id_lowercase_w_normalized(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_user_message("Looking up w9999999")
+        self.assertIn("W9999999", wm.user_facts)
+        self.assertIn("#W9999999", wm.user_facts)
+
+    # ------------------------------------------------------------------
+    # Bug T1/T2/T3: product_types must survive db_facts eviction.
+    # After get_product_details flooded db_facts with variant data,
+    # _advance_after_product_list could no longer find Headphones/Cleaner.
+    # ------------------------------------------------------------------
+    def test_advance_uses_product_types_when_db_facts_evicted(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirts are available?"
+        wm.absorb_user_message(wm.goal)
+        wm.absorb_user_message("Also, what about the headphones?")
+        # Catalogue is in product_types (durable)
+        wm.product_types = {
+            "Action Camera": "3377618313",
+            "Headphones": "8888888888",
+            "T-Shirt": "9523456873",
+        }
+        # db_facts is full of variant chaff — the catalogue is gone from db_facts
+        wm.db_facts = [f"variants[v{i}].color=red" for i in range(48)]
+        # T-Shirt already fetched (don't re-route to it)
+        wm.product_details["9523456873"] = {"name": "T-Shirt", "variants": {}}
+        # list_all_product_types in recent_signatures (model is looping)
+        wm.recent_signatures.append("list_all_product_types()")
+
+        loop = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._advance_after_product_list(loop, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_product_details")
+        # Must NOT pick T-Shirt (already fetched), must pick Headphones
+        self.assertEqual(result.args["product_id"], "8888888888")
+
+    def test_advance_skips_already_fetched_products(self) -> None:
+        """Don't re-route to a product whose details we already have."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirts are available?"
+        wm.absorb_user_message("Tell me about t-shirts")
+        wm.product_types = {"T-Shirt": "9523456873"}
+        wm.product_details["9523456873"] = {"name": "T-Shirt", "variants": {}}
+        wm.recent_signatures.append("list_all_product_types()")
+        loop = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        # No other product mentioned → should return None (let finalizer fire)
+        result = agent._advance_after_product_list(loop, wm)
+        self.assertIsNone(result)
+
+    def test_resolve_product_id_uses_product_types(self) -> None:
+        """_resolve_product_id_name should use wm.product_types as primary
+        source (not just db_facts)."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.product_types = {"T-Shirt": "9523456873"}
+        # db_facts empty (evicted)
+        action = ProposedAction(
+            name="get_product_details", args={"product_id": "T-Shirt"},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._resolve_product_id_name(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result.args["product_id"]), "9523456873")  # type: ignore
+
+    # ------------------------------------------------------------------
+    # Bug T3/T4: hard-loop break on consecutive identical FINALs.
+    # The state fields must initialize to safe defaults.
+    # ------------------------------------------------------------------
+    def test_consecutive_same_final_state_defaults(self) -> None:
+        wm = WorkingMemory()
+        self.assertEqual(wm.last_final_text, "")
+        self.assertEqual(wm.consecutive_same_final, 0)
+
+    # ------------------------------------------------------------------
+    # Bug T4: order_id fallback survives auth_abandoned state.
+    # After 2 failed name+zip attempts, agent set auth_abandoned=True.
+    # If user then provides an order ID, override must use it.
+    # ------------------------------------------------------------------
+    def test_order_id_recovery_survives_auth_abandoned(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange items in my recent order"
+        wm.auth_abandoned = True
+        wm.auth_failed_zips = ["10012", "12345"]
+        wm.absorb_user_message("My order number is W2378156")
+        ph = ProposedAction(
+            name="find_user_id_by_email", args={"email": "user@example.com"},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._auth_override(ph, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_order_details")
+        self.assertEqual(result.args["order_id"], "#W2378156")
+
+
+# ---------------------------------------------------------------------------
+# Tau-bench import sanity (skipped when tau_bench is not installed)
+# ---------------------------------------------------------------------------
 class TestTauBenchIntegrationOptional(unittest.TestCase):
     def test_baselines_still_import(self) -> None:
         try:
