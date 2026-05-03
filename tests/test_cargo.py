@@ -1067,7 +1067,7 @@ class TestAuthOverride(unittest.TestCase):
         )
         result = agent._resolve_product_id_name(action, wm)
         self.assertIsNotNone(result)
-        self.assertEqual(result.args["product_id"], 6086499569)  # type: ignore[union-attr]
+        self.assertEqual(str(result.args["product_id"]), "6086499569")  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
     # 9. Product ID already numeric → no override
@@ -1114,7 +1114,7 @@ class TestAuthOverride(unittest.TestCase):
         result = agent._advance_after_product_list(action, wm)
         self.assertIsNotNone(result)
         self.assertEqual(result.name, "get_product_details")  # type: ignore[union-attr]
-        self.assertEqual(result.args["product_id"], 6086499569)  # type: ignore[union-attr]
+        self.assertEqual(str(result.args["product_id"]), "6086499569")  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
     # 11. list_all_product_types first call → no advance (let it run)
@@ -1408,6 +1408,293 @@ class TestTrajectoryRegressions(unittest.TestCase):
         # Must NOT be ASK_USER or another find_user_id_*; must be progress
         self.assertEqual(result2.name, "get_user_details")  # type: ignore[union-attr]
         self.assertEqual(result2.args["user_id"], "yusuf_rossi_9620")  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Tau-bench import sanity (skipped when tau_bench is not installed)
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Regression tests for trajectories(18) failure patterns
+# ---------------------------------------------------------------------------
+class TestTrajectory18Regressions(unittest.TestCase):
+    """Each test pinned to a specific bug observed in trajectories(18)."""
+
+    def _make_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        client = MockClient(scripts=[])
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client; agent.model = "test"; agent.style_name = "cargo"
+        agent.temperature = 0.0; agent.schemas = {}; agent.domain_policy = ""
+        return agent
+
+    def _placeholder(self, email: str = "user@example.com") -> ProposedAction:
+        return ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": email},
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[], informational_intent="",
+            raw_thought="", user_text="", raw_response="",
+        )
+
+    # ------------------------------------------------------------------
+    # Bug 1: re.IGNORECASE made [A-Z][a-z]+ match lowercase too.
+    # The intro extractor captured ("looking", "to") from "I'm looking to..."
+    # and the agent said "Thank you, looking!" to the user.
+    # ------------------------------------------------------------------
+    def test_im_looking_to_not_extracted_as_name(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        result = CargoAgent._extract_name_pair(
+            ["I'm looking to see how many t-shirt options are available."],
+            in_response_to_ask=False,
+        )
+        self.assertIsNone(result, f"Got false positive: {result!r}")
+
+    def test_lowercase_words_not_extracted_with_intro(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        # No real name follows the intro
+        for phrase in [
+            "i'm looking to do this",
+            "I am going to ask",
+            "this is great news",
+            "my name is what",  # 'what' is lowercase
+        ]:
+            result = CargoAgent._extract_name_pair([phrase], in_response_to_ask=False)
+            self.assertIsNone(result, f"False positive on {phrase!r}: {result!r}")
+
+    def test_uppercase_intro_still_works(self) -> None:
+        """Intro phrase IS still case-insensitive — only the name portion
+        is case-sensitive."""
+        from src.cargo.cargo_agent import CargoAgent
+        for phrase in [
+            "MY NAME IS Yusuf Rossi",
+            "I'M Yusuf Rossi",
+            "This Is John Smith",
+        ]:
+            result = CargoAgent._extract_name_pair([phrase], in_response_to_ask=False)
+            self.assertIsNotNone(result, f"Failed on {phrase!r}")
+
+    def test_t1_thank_you_looking_not_emitted(self) -> None:
+        """Replays the T1/T2/T4 first turn from trajectories(18)."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "I'm looking to see how many t-shirt options are currently available in the store."
+        wm.absorb_user_message(wm.goal)
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        # Must NOT address user as "looking" or "Looking"
+        ut = result.user_text or ""
+        self.assertNotIn("Thank you, looking", ut)
+        self.assertNotIn("Thank you, Looking", ut)
+        self.assertNotIn("To verify your identity", ut)
+        # Should redirect to list_all_product_types (no auth, product query)
+        self.assertEqual(result.name, "list_all_product_types")
+
+    # ------------------------------------------------------------------
+    # Bug 2: yusuf.rossi@example.com slipped through _extract_real_email
+    # because _PLACEHOLDER_EMAIL_RE only matches the prefix list.
+    # ------------------------------------------------------------------
+    def test_example_domain_email_is_placeholder(self) -> None:
+        from src.cargo.cargo_agent import _is_placeholder_email
+        for email in [
+            "yusuf.rossi@example.com",
+            "anything@example.org",
+            "real.name@test.com",
+            "x@sample.io",
+            "x@dummy.net",
+            "x@fake.com",
+            "x@placeholder.io",
+            "user@example.com",
+        ]:
+            self.assertTrue(_is_placeholder_email(email), email)
+
+    def test_real_email_passes(self) -> None:
+        from src.cargo.cargo_agent import _is_placeholder_email
+        for email in [
+            "yusuf@gmail.com",
+            "alice@company.io",
+            "ceo@anthropic.com",
+        ]:
+            self.assertFalse(_is_placeholder_email(email), email)
+
+    def test_placeholder_user_email_in_message_not_used(self) -> None:
+        """User typed yusuf.rossi@example.com — must NOT be used as a real email."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange keyboard"
+        wm.absorb_user_message("My email is yusuf.rossi@example.com")
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        # Must NOT propose find_user_id_by_email with the placeholder
+        if result.name == "find_user_id_by_email":
+            self.assertFalse(
+                "@example." in result.args.get("email", ""),
+                f"Placeholder email reused: {result.args}",
+            )
+
+    # ------------------------------------------------------------------
+    # Bug 3: get_product_details(9523456873) looped 24 times because the
+    # ID was hallucinated (not in db_facts after list_all_product_types).
+    # Fix: replace hallucinated numeric IDs with goal-matched real IDs.
+    # ------------------------------------------------------------------
+    def test_hallucinated_product_id_replaced(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are available in the store?"
+        wm.db_facts = [
+            "Action Camera=3377618313",
+            "T-Shirt=9523456874",  # real ID
+            "Bookshelf=1234567890",
+        ]
+        action = ProposedAction(
+            name="get_product_details",
+            args={"product_id": 9523456873},  # hallucinated — close but wrong
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[], informational_intent="",
+            raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._resolve_product_id_name(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result.args["product_id"]), "9523456874")  # type: ignore[union-attr]
+
+    def test_legitimate_product_id_not_replaced(self) -> None:
+        """A numeric ID that IS in db_facts must pass through unchanged."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "details for the action camera"
+        wm.db_facts = ["Action Camera=3377618313", "T-Shirt=9523456874"]
+        action = ProposedAction(
+            name="get_product_details",
+            args={"product_id": "3377618313"},  # real
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[], informational_intent="",
+            raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._resolve_product_id_name(action, wm)
+        self.assertIsNone(result)
+
+    def test_hallucinated_id_no_replacement_when_no_match(self) -> None:
+        """Without a goal-matchable name, return None and let env reject."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "modify my recent order"  # no product name in goal
+        wm.db_facts = ["Action Camera=3377618313", "Bookshelf=1234567890"]
+        action = ProposedAction(
+            name="get_product_details",
+            args={"product_id": 9999999999},  # hallucinated
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[], informational_intent="",
+            raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._resolve_product_id_name(action, wm)
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # Bug 4: Auth abandoned BEFORE checking new evidence.
+    # T3: user gave name (turn 1) and zip (turn 2), but auth_ask_count
+    # already == MAX so the override emitted FINAL instead of trying.
+    # Fix: extract evidence first, use it before checking abandonment.
+    # ------------------------------------------------------------------
+    def test_fresh_pii_used_despite_max_ask_count(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange keyboard"  # account-task
+        wm.auth_ask_count = 2  # already at MAX
+        wm.absorb_user_message("My name is Yusuf Rossi")
+        wm.absorb_user_message("The ZIP code is 19122")
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_name_zip")
+        self.assertEqual(result.args["first_name"], "Yusuf")
+        self.assertEqual(result.args["zip"], "19122")
+
+    def test_real_email_used_despite_max_ask_count(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange keyboard"
+        wm.auth_ask_count = 2
+        wm.absorb_user_message("Try alice@gmail.com")
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_email")
+        self.assertEqual(result.args["email"], "alice@gmail.com")
+
+    def test_no_pii_at_max_count_still_abandons(self) -> None:
+        """If we truly have no usable PII at the cap, do abandon."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange keyboard"
+        wm.auth_ask_count = 2
+        # No PII at all
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.FINAL)
+
+    # ------------------------------------------------------------------
+    # Bug 5: After the failed name+zip lookup with placeholder email
+    # follow-up, the agent looped on the placeholder email forever.
+    # The new placeholder predicate catches it.
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Bug 6 (recovery): When name+zip and email both fail, but the user
+    # supplied an order ID, fall back to get_order_details.
+    # ------------------------------------------------------------------
+    def test_order_id_fallback_when_auth_methods_fail(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange the mechanical keyboard"
+        wm.auth_failed_zips = ["12345"]
+        wm.absorb_user_message("My full name is Yusuf Rossi and ZIP 12345.")
+        wm.absorb_user_message("My email is yusuf.rossi@example.com.")
+        wm.absorb_user_message("My order number is #W2378156.")
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_order_details")
+        self.assertEqual(result.args["order_id"], "#W2378156")
+
+    def test_order_id_extracted_from_various_formats(self) -> None:
+        """The order ID extractor must handle '#W' and 'W' formats."""
+        from src.cargo.cargo_agent import CargoAgent
+        for raw, expected in [
+            ("My order is #W2378156", "#W2378156"),
+            ("order id W1234567", "#W1234567"),
+            ("order #w9999999", "#W9999999"),
+        ]:
+            wm = WorkingMemory()
+            wm.absorb_user_message(raw)
+            self.assertEqual(CargoAgent._extract_order_id(wm), expected, raw)
+
+    def test_order_id_fallback_not_repeated(self) -> None:
+        """If get_order_details was already tried, don't propose it again."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "modify my order"
+        wm.absorb_user_message("My order is #W2378156")
+        wm.recent_signatures.append("get_order_details(order_id='#W2378156')")
+        result = agent._auth_override(self._placeholder(), wm)
+        # Must NOT propose the same get_order_details again
+        if result and result.name == "get_order_details":
+            self.fail(f"Re-proposed get_order_details: {result.args}")
+
+    def test_post_failed_zip_with_placeholder_email_does_not_loop(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange mechanical keyboard"
+        wm.auth_failed_zips = ["12345"]
+        wm.auth_ask_count = 2
+        wm.absorb_user_message("My full name is Yusuf Rossi")
+        wm.absorb_user_message("My ZIP is 12345")
+        wm.absorb_user_message("My email is yusuf.rossi@example.com")
+        # Model proposes the placeholder again — override must catch it
+        result = agent._auth_override(
+            self._placeholder("yusuf.rossi@example.com"), wm
+        )
+        self.assertIsNotNone(result)
+        # Must NOT issue the placeholder email lookup
+        if result.name == "find_user_id_by_email":
+            self.assertFalse(
+                "@example." in result.args.get("email", ""),
+                f"Looped on placeholder: {result.args}",
+            )
 
 
 # ---------------------------------------------------------------------------
