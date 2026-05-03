@@ -107,6 +107,19 @@ Server:
   --port N               vLLM port (default: 8001). Env: PORT=N
   --served-name STR      vLLM served-model-name (default: qwen-agent). Env: SERVED_NAME=...
 
+GPU-specific venvs:
+  By default, run_project.sh auto-detects the GPU type (A100, H100, H200) and
+  uses a pre-built venv (.venv-a100, .venv-h100, .venv-h200). This avoids
+  rebuilding vLLM when switching between GPU types.
+
+  To pre-build a GPU-specific venv, run:
+    VENV_DIR=.venv-a100 bash setup_env.sh   # for A100
+    VENV_DIR=.venv-h100 bash setup_env.sh   # for H100
+    VENV_DIR=.venv-h200 bash setup_env.sh   # for H200
+
+  To override and use a specific venv for run_project.sh:
+    VENV_DIR=/path/to/venv bash run_project.sh
+
 Misc:
   --dry-run              Print resolved configuration and exit. Env: DRY_RUN=1
   --help, -h             Show this help and exit.
@@ -351,7 +364,19 @@ fi
 : "${PROJECT_SCRATCH:=${REPO_ROOT}/.scratch}"
 export PROJECT_SCRATCH
 
-VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv}"
+# GPU-aware venv selection: use per-GPU-type venv to avoid rebuilding vLLM
+# when switching between A100 (sm_80), H100 (sm_90), H200 (sm_90a), etc.
+#
+# If VENV_DIR is explicitly set, use it as-is (backward compat).
+# Otherwise, detect GPU and use GPU-specific venv: .venv-{gpu_type}
+if [[ -z "${VENV_DIR:-}" ]]; then
+  # Will be set after GPU detection (see section below)
+  VENV_DIR=""
+else
+  # User explicitly set VENV_DIR; respect it
+  :
+fi
+
 EXTERNAL_DIR="${EXTERNAL_DIR:-${REPO_ROOT}/external}"
 TAU_DIR="${TAU_DIR:-${EXTERNAL_DIR}/tau-bench}"
 ACE_DIR="${ACE_DIR:-${EXTERNAL_DIR}/ACEBench}"
@@ -422,58 +447,58 @@ if command -v nvcc >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Activate venv
-# ---------------------------------------------------------------------------
-if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
-  echo "ERROR: venv not found at $VENV_DIR. Run setup_env.sh first." >&2
-  exit 1
-fi
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-
-# ---------------------------------------------------------------------------
-# GPU preflight: detect compute capability and auto-rebuild vLLM if the
-# installed build was compiled for a different GPU arch.
+# GPU preflight: detect compute capability and select GPU-specific venv.
 #
-# Rationale: cluster schedulers often assign different GPU types across
-# jobs. A vLLM built for sm_80 (A100) fails to load on sm_90 (H100) with
-# cudaErrorNoKernelImageForDevice during _dummy_run warmup. Detecting this
-# early and triggering a rebuild avoids a silent failure hours into a run.
+# Maps compute capability to short GPU type name and uses a pre-built venv
+# for that GPU type (e.g., .venv-a100, .venv-h100, .venv-h200).
+# This avoids rebuilding vLLM when switching between GPU types.
+#
+# Supported mappings:
+#   sm_80, sm_81  → A100 / A10G / RTX 6000 Ada   (.venv-a100)
+#   sm_89         → L40  / L40S                  (.venv-a100 — compatible)
+#   sm_90         → H100 / GH200                 (.venv-h100)
+#   sm_90a        → H200                         (.venv-h200)
 # ---------------------------------------------------------------------------
-log "Running GPU preflight for vLLM compatibility"
+log "Detecting GPU for venv selection"
 
+GPU_TYPE=""
 CURRENT_CAP=$(python - <<'PY'
 import torch
 if torch.cuda.is_available():
     cap = torch.cuda.get_device_capability(0)
-    print(f"{cap[0]}.{cap[1]}")
+    print(f"{cap[0]}{cap[1]}")
+else:
+    print("")
 PY
 )
 
-log "Detected GPU capability: ${CURRENT_CAP:-unknown}"
+case "$CURRENT_CAP" in
+  80|81)   GPU_TYPE="a100" ;;
+  89)      GPU_TYPE="a100" ;;  # L40/L40S compatible with A100 venv
+  90)      GPU_TYPE="h100" ;;
+  90a)     GPU_TYPE="h200" ;;
+  *)       GPU_TYPE="a100"; log "WARNING: unknown GPU capability sm_$CURRENT_CAP, defaulting to a100 venv" ;;
+esac
 
-BUILD_SIG_FILE="$VENV_DIR/.vllm-build-signature"
-NEED_REBUILD=0
+log "Detected GPU: sm_$CURRENT_CAP → using venv for $GPU_TYPE"
 
-if [[ -f "$BUILD_SIG_FILE" ]]; then
-  if ! grep -q "\"capability\": \"$CURRENT_CAP\"" "$BUILD_SIG_FILE"; then
-    log "Detected mismatch between vLLM build and current GPU — triggering rebuild"
-    NEED_REBUILD=1
-  else
-    log "vLLM build matches current GPU (sm_${CURRENT_CAP//./})"
-  fi
-else
-  log "No vLLM build signature found — triggering rebuild"
-  NEED_REBUILD=1
+# If VENV_DIR was not explicitly set, use GPU-specific version
+if [[ -z "${VENV_DIR}" ]]; then
+  VENV_DIR="${REPO_ROOT}/.venv-${GPU_TYPE}"
 fi
 
-if [[ "$NEED_REBUILD" == "1" ]]; then
-  log "Rebuilding vLLM for GPU sm_${CURRENT_CAP//./}"
-  export TORCH_CUDA_ARCH_LIST="$CURRENT_CAP"
-  SETUP_SKIP_GIT_FETCH=1 FORCE_REBUILD=1 bash setup_env.sh
-  log "Rebuild complete — re-activating environment"
-  source "$VENV_DIR/bin/activate"
+# ---------------------------------------------------------------------------
+# Activate venv
+# ---------------------------------------------------------------------------
+if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
+  echo "ERROR: venv not found at $VENV_DIR. Create it with:" >&2
+  echo "  VENV_DIR=$VENV_DIR bash setup_env.sh" >&2
+  exit 1
 fi
+
+log "Activating venv: $VENV_DIR"
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
 
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
