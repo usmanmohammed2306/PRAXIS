@@ -150,8 +150,26 @@ class WorkingMemory:
     # Queries used by gates
     # ------------------------------------------------------------------
     def all_evidence(self) -> str:
-        """Concatenated evidence string used for substring grounding."""
-        return "\n".join(self.user_facts + self.db_facts)
+        """Concatenated evidence string used for substring grounding.
+
+        Includes ``product_types`` values so that the arg-grounding gate
+        accepts product IDs resolved from the durable catalogue even after
+        the original ``list_all_product_types`` JSON response has been evicted
+        from ``db_facts`` by a subsequent large tool response (e.g.
+        get_product_details flooding db_facts with variant data).
+
+        Without this, ``_advance_after_product_list`` correctly resolves
+        "Smart Watch" → "6945232052" from ``wm.product_types``, but the
+        arg-grounding gate then rejects "6945232052" as ungrounded because
+        db_facts no longer contains the product-list JSON.
+        (Observed failure: trajectories(23) Task 2, steps 3–19.)
+        """
+        base = "\n".join(self.user_facts + self.db_facts)
+        if self.product_types:
+            # Append each ID on its own line so substring search is unambiguous.
+            pt_ids = "\n".join(self.product_types.values())
+            return base + "\n" + pt_ids
+        return base
 
     def render_compact(self, max_chars: int = 800) -> str:
         """Compact NL render used in the proposer prompt.
