@@ -2076,6 +2076,480 @@ class TestTrajectory20Regressions(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Regression tests for trajectories(22) failure patterns
+# ---------------------------------------------------------------------------
+class TestTrajectory22Regressions(unittest.TestCase):
+    """Pinned tests for all 6 root-cause bugs identified in trajectories(22).
+
+    B1 (Tasks 0,1): Auth loop after order_id authentication – Path 1 of
+        _auth_override must re-confirm auth via email found in db_facts
+        (populated by get_user_details) instead of returning None and
+        letting the placeholder-email loop continue.
+
+    B2 (Task 2): Product-name false-positive matching – "hose" must NOT
+        match "those", "smart" prefix must NOT match "smartwatch", and
+        compound "smartwatch" MUST match "Smart Watch".
+
+    B3 (Tasks 3,4): Deterministic auth-abandon FINALs blocked by SC gate
+        – all deterministic override FINAL/ASK_USER actions must carry
+        ``bypass_gates=True``.
+
+    B4 (Task 3): Model proposes auth-ask respond before product details
+        fetched – _advance_after_product_list must intercept premature
+        respond/FINAL/ASK_USER actions for no-auth product queries.
+
+    B5 (Tasks 3,4): Auth-abandon must answer no-auth product sub-query
+        before emitting the give-up FINAL for mixed goals.
+
+    B6 (Task 4): "Rather not" + offered alternative not treated as hard
+        refusal – soft-refusal detection must spare negotiating messages.
+    """
+
+    def _make_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        client = MockClient(scripts=[])
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "test"
+        agent.style_name = "cargo"
+        agent.temperature = 0.0
+        agent.schemas = {}
+        agent.domain_policy = ""
+        return agent
+
+    def _placeholder_action(self) -> ProposedAction:
+        return ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": "user@example.com"},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+
+    # ------------------------------------------------------------------
+    # B1: Auth loop after order_id authentication
+    # After get_order_details → get_user_details, Path 1 must extract the
+    # real email from db_facts and emit find_user_id_by_email, rather than
+    # returning None and leaving the agent stuck on placeholder-email loops.
+    # ------------------------------------------------------------------
+    def test_b1_path1_extracts_email_from_db_facts(self) -> None:
+        """Path 1: real email in db_facts → re-confirm auth via that email.
+
+        After order_id auth (get_order_details → get_user_details), the
+        user's real email lands in db_facts.  _auth_override Path 1 must
+        extract it and emit find_user_id_by_email rather than returning None
+        and leaving the agent in a placeholder-email loop.
+        NOTE: @example.com is treated as a placeholder domain by
+        _is_placeholder_email, so use a real-looking domain.
+        """
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange items in my pending order"
+        # User authenticated via order_id path; user_id now in db_facts.
+        wm.db_facts = [
+            "user_id=alice_smith_9620",
+            "email=alice@gmail.com",   # real-looking domain (not @example.com)
+            "name=Alice Smith",
+        ]
+        # get_user_details already called (so _post_auth_action returns None).
+        wm.recent_signatures.append("get_user_details(user_id=alice_smith_9620)")
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_email")  # type: ignore
+        self.assertEqual(result.args["email"], "alice@gmail.com")  # type: ignore
+
+    def test_b1_email_already_confirmed_returns_none(self) -> None:
+        """Path 1: if find_user_id_by_email(real_email) is already in
+        recent_signatures, don't re-issue it (avoids a second loop)."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange items in my pending order"
+        wm.db_facts = [
+            "user_id=alice_smith_9620",
+            "email=alice@gmail.com",   # real-looking domain
+        ]
+        wm.recent_signatures.append("get_user_details(user_id=alice_smith_9620)")
+        # Already confirmed once.
+        wm.recent_signatures.append("find_user_id_by_email(email='alice@gmail.com')")
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        # Should not re-emit the same lookup — returns None.
+        self.assertIsNone(result)
+
+    def test_b1_no_email_in_db_facts_returns_none(self) -> None:
+        """Path 1: if db_facts has user_id but no real email, return None
+        gracefully (don't crash)."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange items in my pending order"
+        wm.db_facts = ["user_id=alice_smith_9620"]
+        wm.recent_signatures.append("get_user_details(user_id=alice_smith_9620)")
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # B2: Product-name false-positive matching
+    # ------------------------------------------------------------------
+    def test_b2_hose_does_not_match_those(self) -> None:
+        """'hose' (from 'Garden Hose') must NOT match 'those'."""
+        from src.cargo.cargo_agent import CargoAgent
+        # "garden hose" — the word "hose" is a substring of "those"
+        # but must fail the word-boundary check.
+        self.assertFalse(
+            CargoAgent._product_name_matches_user(
+                "garden hose",
+                "check those for me"
+            )
+        )
+
+    def test_b2_smart_prefix_does_not_match_smartwatch(self) -> None:
+        """'smart' token (from 'Smart Thermostat') must NOT match 'smartwatch'."""
+        from src.cargo.cargo_agent import CargoAgent
+        # "smart thermostat" — the word "smart" prefix-matches "smartwatch"
+        # if done naively, but word-boundary regex prevents it.
+        self.assertFalse(
+            CargoAgent._product_name_matches_user(
+                "smart thermostat",
+                "how many smartwatches are there"
+            )
+        )
+
+    def test_b2_smart_watch_matches_smartwatch(self) -> None:
+        """Compound 'smartwatch' (Rule 3) must match product 'Smart Watch'.
+
+        The user says "smartwatch" (singular compound word).  Rule 1 fails
+        (no space in user text), Rule 2 fails (no \bsmart\b boundary inside
+        "smartwatch"), Rule 3 catches it via the joined form "smartwatch".
+        This is the exact failure observed in trajectories(22) Task 2.
+        """
+        from src.cargo.cargo_agent import CargoAgent
+        self.assertTrue(
+            CargoAgent._product_name_matches_user(
+                "smart watch",
+                "how many smartwatch variants are available"  # singular compound
+            )
+        )
+
+    def test_b2_tshirt_matches_tshirts_plural(self) -> None:
+        """Phrase 'T-Shirt' must match user saying 't-shirts'."""
+        from src.cargo.cargo_agent import CargoAgent
+        self.assertTrue(
+            CargoAgent._product_name_matches_user(
+                "t-shirt",
+                "how many t-shirts are available"
+            )
+        )
+
+    def test_b2_exact_product_name_always_matches(self) -> None:
+        """Direct phrase match must always pass."""
+        from src.cargo.cargo_agent import CargoAgent
+        self.assertTrue(
+            CargoAgent._product_name_matches_user(
+                "garden hose",
+                "I would like a garden hose"
+            )
+        )
+
+    def test_b2_short_product_name_no_match_when_not_present(self) -> None:
+        """A product name with only short tokens (< 4 chars) returns False
+        when neither the phrase nor any token is a substring of user text.
+
+        Note: Rule 1 (phrase substring) still fires for short names when the
+        name IS literally contained in the text; this test verifies the False
+        path when the product name is simply absent.
+        """
+        from src.cargo.cargo_agent import CargoAgent
+        # "rug" is 3 chars — not in user text at all → all three rules return False.
+        self.assertFalse(
+            CargoAgent._product_name_matches_user(
+                "rug",
+                "I want something soft and cozy for my floor"
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # B3: Deterministic auth-abandon FINALs must carry bypass_gates=True
+    # ------------------------------------------------------------------
+    def test_b3_auth_giveup_final_has_bypass_gates(self) -> None:
+        """Auth-abandon FINAL (user refused) must have bypass_gates=True."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "update my order"
+        wm.absorb_user_message("prefer not to give out my info")
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.FINAL)  # type: ignore
+        self.assertTrue(getattr(result, "bypass_gates", False))  # type: ignore
+
+    def test_b3_auth_giveup_loop_break_has_bypass_gates(self) -> None:
+        """Auth-abandon loop-break FINAL (already gave up once) must also
+        carry bypass_gates=True."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "update my order"
+        wm.auth_abandoned = True
+        wm.auth_giveup_emitted = True
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.FINAL)  # type: ignore
+        self.assertTrue(getattr(result, "bypass_gates", False))  # type: ignore
+
+    def test_b3_finalize_product_count_has_bypass_gates(self) -> None:
+        """_finalize_product_count_query FINAL must carry bypass_gates=True.
+
+        Uses "how many t-shirt options are available" which matches both the
+        'how many … options?' arm of _PRODUCT_QUERY_RE and the t-shirts arm,
+        guaranteeing the count finalizer reaches the return statement.
+        """
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "how many t-shirt options are available"
+        wm.product_details["pid999"] = {
+            "name": "T-Shirt",
+            "variants": {
+                "v1": {"available": True},
+                "v2": {"available": True},
+                "v3": {"available": False},
+            },
+        }
+        # Trigger the finalizer by presenting a repeat list_all_product_types.
+        wm.recent_signatures.append("list_all_product_types()")
+        loop = ProposedAction(
+            name="list_all_product_types",
+            args={},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+        result = agent._finalize_product_count_query(loop, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.FINAL)  # type: ignore
+        self.assertTrue(getattr(result, "bypass_gates", False))  # type: ignore
+
+    # ------------------------------------------------------------------
+    # B4: _advance_after_product_list intercepts premature respond actions
+    # for no-auth product queries before product details have been fetched.
+    # ------------------------------------------------------------------
+    def test_b4_premature_respond_intercepted_for_noauth_query(self) -> None:
+        """A premature respond (ASK_USER class) must be intercepted when
+        product_types is populated and goal is a no-auth product query.
+
+        The user says "smartwatch" (singular compound) — the compound Rule 3
+        in _product_name_matches_user resolves "Smart Watch" → "smartwatch".
+        """
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        # Use singular "smartwatch" so the compound rule (Rule 3) can match
+        # the product name "Smart Watch" → compound "smartwatch".
+        wm.goal = "how many smartwatch variants are in the store"
+        wm.absorb_user_message(wm.goal)
+        wm.product_types = {"Smart Watch": "pid123"}
+        # No product details fetched yet.
+        premature_respond = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="Could you please provide your account details?",
+            raw_response="",
+        )
+        result = agent._advance_after_product_list(premature_respond, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_product_details")  # type: ignore
+        self.assertEqual(result.args["product_id"], "pid123")  # type: ignore
+
+    def test_b4_final_action_intercepted_for_noauth_query(self) -> None:
+        """A premature FINAL action is intercepted the same way as ASK_USER."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "how many t-shirts are in the store"
+        wm.absorb_user_message(wm.goal)
+        wm.product_types = {"T-Shirt": "pid456"}
+        premature_final = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="I cannot help without your account info.",
+            raw_response="",
+        )
+        result = agent._advance_after_product_list(premature_final, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_product_details")  # type: ignore
+        self.assertEqual(result.args["product_id"], "pid456")  # type: ignore
+
+    def test_b4_no_interception_for_auth_required_goal(self) -> None:
+        """For goals that require auth (exchange, cancel), premature responds
+        must NOT be intercepted by the product-list advance logic."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange my recent order for another model"
+        wm.absorb_user_message(wm.goal)
+        wm.product_types = {"Smart Watch": "pid123"}
+        premature_respond = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="Could you provide your account details?",
+            raw_response="",
+        )
+        result = agent._advance_after_product_list(premature_respond, wm)
+        # Auth-required goal → _is_no_auth_query is False → no interception.
+        self.assertIsNone(result)
+
+    def test_b4_no_interception_when_product_types_empty(self) -> None:
+        """If product_types is not yet populated, don't intercept respond
+        (product list hasn't been fetched yet; let normal flow proceed)."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "how many smartwatches are in the store"
+        wm.absorb_user_message(wm.goal)
+        # product_types is empty
+        premature_respond = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="I cannot help.",
+            raw_response="",
+        )
+        result = agent._advance_after_product_list(premature_respond, wm)
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # B5: Auth-abandon must answer the product sub-query before giving up
+    # ------------------------------------------------------------------
+    def test_b5_mixed_goal_lists_products_before_giveup(self) -> None:
+        """For a mixed goal (product count + order update), auth-abandon must
+        pivot to list_all_product_types before emitting the give-up FINAL."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "how many t-shirts are in the store, also update my recent order"
+        wm.auth_abandoned = True
+        # product_types not yet fetched
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "list_all_product_types")  # type: ignore
+        self.assertNotEqual(result.declared_class, RiskClass.FINAL)  # type: ignore
+
+    def test_b5_mixed_goal_fetches_product_details_when_types_available(self) -> None:
+        """After product types are listed, pivot to get_product_details."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "how many t-shirts are in the store, also update my recent order"
+        wm.absorb_user_message("how many t-shirts are available")
+        wm.auth_abandoned = True
+        wm.product_types = {"T-Shirt": "pid789"}
+        # Details not yet fetched.
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_product_details")  # type: ignore
+        self.assertEqual(result.args["product_id"], "pid789")  # type: ignore
+
+    def test_b5_after_product_count_finalized_emits_giveup(self) -> None:
+        """Once product_count_finalized=True the B5 pivot is done; then the
+        give-up FINAL should fire normally."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "how many t-shirts are in the store, also update my recent order"
+        wm.auth_abandoned = True
+        wm.product_count_finalized = True  # count already answered
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        # Should now be the give-up FINAL.
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.FINAL)  # type: ignore
+        self.assertTrue(getattr(result, "bypass_gates", False))  # type: ignore
+
+    # ------------------------------------------------------------------
+    # B6: "Rather not" + offered alternative is not a hard refusal
+    # ------------------------------------------------------------------
+    def test_b6_soft_refusal_with_order_alternative_not_abandoned(self) -> None:
+        """'I'd rather not share … can we proceed based on my recent orders?'
+        must NOT set auth_abandoned — it's a negotiation, not a hard refusal."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange items in my recent order"
+        wm.absorb_user_message(
+            "I'd rather not share too much personal info. "
+            "Can we proceed based on my recent orders or some other identifier?"
+        )
+        action = self._placeholder_action()
+        # Override should NOT emit a give-up FINAL; auth_abandoned must remain False.
+        _ = agent._auth_override(action, wm)
+        self.assertFalse(wm.auth_abandoned)
+
+    def test_b6_soft_refusal_with_identifier_pivot_triggers_order_lookup(self) -> None:
+        """After the soft-refusal + order-alternative message, if the user
+        also supplies an order ID, the override must use it."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange items in my recent order"
+        wm.absorb_user_message(
+            "I'd rather not share personal info. "
+            "My order number is W9876543."
+        )
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        # Override must use the order_id, not set auth_abandoned.
+        self.assertFalse(wm.auth_abandoned)
+        self.assertEqual(result.name, "get_order_details")  # type: ignore
+        self.assertIn("W9876543", str(result.args.get("order_id", "")))  # type: ignore
+
+    def test_b6_hard_refusal_without_alternative_sets_abandoned(self) -> None:
+        """A clean hard refusal ('prefer not', no alternative offered) must
+        still set auth_abandoned and emit a give-up FINAL."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange items in my recent order"
+        wm.absorb_user_message("I prefer not to share that information.")
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertTrue(wm.auth_abandoned)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.FINAL)  # type: ignore
+        self.assertTrue(getattr(result, "bypass_gates", False))  # type: ignore
+
+    def test_b6_rather_not_without_alternative_is_hard_refusal(self) -> None:
+        """'Rather not' alone (no alternative offered) is a hard refusal."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "cancel my order"
+        wm.absorb_user_message("I'd rather not provide that.")
+        action = self._placeholder_action()
+        _ = agent._auth_override(action, wm)
+        self.assertTrue(wm.auth_abandoned)
+
+
+# ---------------------------------------------------------------------------
 # Tau-bench import sanity (skipped when tau_bench is not installed)
 # ---------------------------------------------------------------------------
 class TestTauBenchIntegrationOptional(unittest.TestCase):

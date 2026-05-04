@@ -49,6 +49,12 @@ class ProposedAction:
     user_text: str = ""
     # Convenience: the raw JSON or text that produced this action.
     raw_response: str = ""
+    # When True, the self-consistency and counterfactual gates are skipped.
+    # Set by deterministic overrides (auth-abandon FINALs, product-count
+    # finalisers, etc.) so that the SC gate's independent proposer samples
+    # can't block a decision that was made deterministically.  The
+    # arg-grounding and precondition gates still run.
+    bypass_gates: bool = False
 
     def signature(self) -> str:
         """Canonical (name, sorted args) signature for repeat detection.
