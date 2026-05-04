@@ -60,6 +60,7 @@ from src.cargo.gates import (  # noqa: E402
     check_self_consistency,
 )
 from src.cargo.schema_inducer import _rule_classify  # noqa: E402
+from src.cargo.stats import CargoStats  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -3617,6 +3618,116 @@ class TestTrajectory24Regressions(unittest.TestCase):
         self.assertIsNotNone(action)
         self.assertEqual(action.name, "return_delivered_order_items")
         self.assertEqual(action.args["item_ids"], ["cleaner", "headphones", "watch"])
+
+    def test_f1_confirmation_gate_blocks_unconfirmed_write(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory(goal="show me my order status")
+        action = ProposedAction(
+            name="modify_pending_order_items",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.WRITE,
+        )
+        result = agent._check_write_confirmation(action, wm)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.gate, "confirmation")
+
+    def test_f2_confirmation_gate_accepts_direct_user_request(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory(goal="Please exchange the thermostat in my order.")
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.WRITE,
+        )
+        result = agent._check_write_confirmation(action, wm)
+        self.assertTrue(result.ok, result.reason)
+
+    def test_f3_canonicalizer_replaces_non_best_exchange(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "Please exchange the mechanical keyboard for clicky switches. "
+            "If there is no clicky RGB full size keyboard, go for no backlight."
+        )
+        wm.auth_user_id = "u"
+        wm.order_details["#W1"] = {
+            "order_id": "#W1",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "pm"}],
+            "items": [{
+                "name": "Mechanical Keyboard",
+                "product_id": "kbd",
+                "item_id": "old",
+                "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+            }],
+        }
+        wm.product_details["kbd"] = {
+            "name": "Mechanical Keyboard",
+            "variants": {
+                "wrong": {"item_id": "wrong", "available": True,
+                          "options": {"switch type": "linear", "backlight": "RGB", "size": "80%"}},
+                "right": {"item_id": "right", "available": True,
+                          "options": {"switch type": "clicky", "backlight": "none", "size": "full size"}},
+            },
+        }
+        bad = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={
+                "order_id": "#W1",
+                "item_ids": ["old"],
+                "new_item_ids": ["wrong"],
+                "payment_method_id": "pm",
+            },
+            declared_class=RiskClass.WRITE,
+        )
+        fixed = agent._canonicalize_write_action(bad, wm)
+        self.assertIsNotNone(fixed)
+        self.assertEqual(fixed.args["new_item_ids"], ["right"])
+
+    def test_f4_mixed_product_count_is_not_terminal_final(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are available, and modify my pending order."
+        wm.product_types = {"T-Shirt": "ts"}
+        wm.product_details["ts"] = {
+            "name": "T-Shirt",
+            "variants": {str(i): {"available": True} for i in range(3)},
+        }
+        wm.recent_signatures.append("list_all_product_types()")
+        action = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+        )
+        result = agent._finalize_product_count_query(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.ASK_USER)
+        self.assertTrue(wm.product_count_finalized)
+
+    def test_f5_completed_mutation_gate_blocks_reexecution(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory(goal="Please exchange item old.")
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={
+                "order_id": "#W1",
+                "item_ids": ["old"],
+                "new_item_ids": ["new"],
+                "payment_method_id": "pm",
+            },
+            declared_class=RiskClass.WRITE,
+        )
+        wm.record_executed_mutation(action.signature())
+        schema = ToolEffectSchema(
+            name="exchange_delivered_order_items",
+            cls=RiskClass.WRITE,
+            arg_id_fields=["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+            required_params=["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+        )
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "completed_task")
+        self.assertIn("completed_task", diag["gates_failed"])
 
 
 # ---------------------------------------------------------------------------

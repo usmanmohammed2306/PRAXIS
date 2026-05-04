@@ -52,6 +52,14 @@ class WorkingMemory:
     # memory: once a phase completes (auth, product count, etc.), future
     # proposals must advance from that state instead of re-entering it.
     phase_locks: Dict[str, bool] = field(default_factory=dict)
+    # Signatures of successful state-changing actions.  Unlike
+    # recent_signatures, this is not a short rolling window: a write that has
+    # already succeeded must not be retried later in the same task.
+    executed_mutations: Dict[str, int] = field(default_factory=dict)
+    # Set after a successful state change or terminal final answer.  The
+    # controller checks this before each proposer call so no more tools run
+    # after the task is complete.
+    task_completed: bool = False
     # Set once we've already emitted a "give up on auth" FINAL.  Prevents the
     # exact same FINAL from being emitted twice in a row.
     auth_giveup_emitted: bool = False
@@ -198,6 +206,13 @@ class WorkingMemory:
     def failed_without_new_evidence(self, sig: str) -> bool:
         return bool(sig and self.failed_signatures.get(sig) == self.evidence_version)
 
+    def record_executed_mutation(self, sig: str) -> None:
+        if sig:
+            self.executed_mutations[sig] = self.evidence_version
+
+    def mutation_already_executed(self, sig: str) -> bool:
+        return bool(sig and sig in self.executed_mutations)
+
     def lock_phase(self, phase: str) -> None:
         key = str(phase or "").strip().lower()
         if key:
@@ -309,6 +324,10 @@ class WorkingMemory:
             parts.append(f"confirmed_email: {self.auth_email}")
         if self.product_count_finalized:
             parts.append("phase_locked: product_count")
+        if self.phase_locked("mutation"):
+            parts.append("phase_locked: mutation")
+        if self.task_completed:
+            parts.append("task_completed: true")
         if self.order_details:
             parts.append(f"orders_cached: {len(self.order_details)}")
         parts += [
