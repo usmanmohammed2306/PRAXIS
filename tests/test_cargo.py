@@ -1517,19 +1517,44 @@ class TestTrajectory18Regressions(unittest.TestCase):
             self.assertFalse(_is_placeholder_email(email), email)
 
     def test_placeholder_user_email_in_message_not_used(self) -> None:
-        """User typed yusuf.rossi@example.com — must NOT be used as a real email."""
+        """Generic-prefix placeholder emails (user@, test@, alice@, …) must
+        NOT be used even if the user types them.
+
+        D4 note: _extract_any_email now accepts specific-prefix @example.com
+        emails from user_facts (e.g. 'yusuf.rossi@example.com' → prefix is
+        specific, not in the generic-RE list).  Only truly generic prefixes
+        (user@, test@, demo@, alice@, …) are still blocked."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange keyboard"
+        # These are clearly fabricated — prefix matches _PLACEHOLDER_EMAIL_RE.
+        # Note: emails with SPECIFIC prefixes (e.g. alice@test.com, yusuf@example.com)
+        # are intentionally allowed by _extract_any_email (D4 fix).
+        for fabricated in ["user@example.com", "test@example.com",
+                           "demo@example.com", "admin@sample.com"]:
+            wm2 = WorkingMemory()
+            wm2.goal = "exchange keyboard"
+            wm2.absorb_user_message(f"My email is {fabricated}")
+            result = agent._auth_override(self._placeholder(), wm2)
+            if result is not None and result.name == "find_user_id_by_email":
+                self.assertNotEqual(
+                    result.args.get("email", ""), fabricated,
+                    f"Generic placeholder email should not be used: {fabricated}",
+                )
+
+    def test_specific_prefix_example_email_is_used(self) -> None:
+        """D4 regression: a user-provided email like 'yusuf.rossi@example.com'
+        (specific prefix, not in generic-RE list) SHOULD be tried via
+        find_user_id_by_email — tau-bench user simulations provide emails
+        in this exact format."""
         agent = self._make_agent()
         wm = WorkingMemory()
         wm.goal = "exchange keyboard"
         wm.absorb_user_message("My email is yusuf.rossi@example.com")
         result = agent._auth_override(self._placeholder(), wm)
         self.assertIsNotNone(result)
-        # Must NOT propose find_user_id_by_email with the placeholder
-        if result.name == "find_user_id_by_email":
-            self.assertFalse(
-                "@example." in result.args.get("email", ""),
-                f"Placeholder email reused: {result.args}",
-            )
+        self.assertEqual(result.name, "find_user_id_by_email")
+        self.assertEqual(result.args.get("email"), "yusuf.rossi@example.com")
 
     # ------------------------------------------------------------------
     # Bug 3: get_product_details(9523456873) looped 24 times because the
@@ -1639,6 +1664,12 @@ class TestTrajectory18Regressions(unittest.TestCase):
     # supplied an order ID, fall back to get_order_details.
     # ------------------------------------------------------------------
     def test_order_id_fallback_when_auth_methods_fail(self) -> None:
+        """When email AND name+zip have already been tried (and failed), the
+        override must fall back to get_order_details with the order_id.
+
+        D4 note: _extract_any_email now accepts @example.com emails from
+        user_facts (specific prefix).  So the test must also mark the email
+        as 'already tried' via recent_signatures to reach the order_id path."""
         agent = self._make_agent()
         wm = WorkingMemory()
         wm.goal = "exchange the mechanical keyboard"
@@ -1646,6 +1677,11 @@ class TestTrajectory18Regressions(unittest.TestCase):
         wm.absorb_user_message("My full name is Yusuf Rossi and ZIP 12345.")
         wm.absorb_user_message("My email is yusuf.rossi@example.com.")
         wm.absorb_user_message("My order number is #W2378156.")
+        # Simulate email already tried (D4 fix: email is now extracted from
+        # user_facts, so we need to mark it used to reach the order_id fallback)
+        wm.recent_signatures.append(
+            "find_user_id_by_email(email='yusuf.rossi@example.com')"
+        )
         result = agent._auth_override(self._placeholder(), wm)
         self.assertIsNotNone(result)
         self.assertEqual(result.name, "get_order_details")
@@ -1676,6 +1712,16 @@ class TestTrajectory18Regressions(unittest.TestCase):
             self.fail(f"Re-proposed get_order_details: {result.args}")
 
     def test_post_failed_zip_with_placeholder_email_does_not_loop(self) -> None:
+        """After auth_ask_count hits the cap AND the user's email has already
+        been tried once (recent_signatures guard), the override must NOT loop
+        on the same email.
+
+        D4+D5 note: 'yusuf.rossi@example.com' is now treated as a usable
+        email (specific prefix → allowed by _extract_any_email).  The D5
+        re-attempt fires the FIRST time (when the sig is not yet in
+        recent_signatures).  After the sig is recorded, the re-attempt does
+        NOT fire again, preventing an infinite loop on a failing email.
+        """
         agent = self._make_agent()
         wm = WorkingMemory()
         wm.goal = "exchange mechanical keyboard"
@@ -1684,16 +1730,19 @@ class TestTrajectory18Regressions(unittest.TestCase):
         wm.absorb_user_message("My full name is Yusuf Rossi")
         wm.absorb_user_message("My ZIP is 12345")
         wm.absorb_user_message("My email is yusuf.rossi@example.com")
-        # Model proposes the placeholder again — override must catch it
+        # Simulate email was already tried (fresh-PII re-attempt already used)
+        wm.recent_signatures.append(
+            "find_user_id_by_email(email='yusuf.rossi@example.com')"
+        )
         result = agent._auth_override(
             self._placeholder("yusuf.rossi@example.com"), wm
         )
         self.assertIsNotNone(result)
-        # Must NOT issue the placeholder email lookup
+        # After the email was already tried, must NOT propose it again
         if result.name == "find_user_id_by_email":
-            self.assertFalse(
-                "@example." in result.args.get("email", ""),
-                f"Looped on placeholder: {result.args}",
+            self.assertNotEqual(
+                result.args.get("email", ""), "yusuf.rossi@example.com",
+                f"Looped on already-tried email: {result.args}",
             )
 
 
@@ -2838,6 +2887,420 @@ class TestTrajectory23Regressions(unittest.TestCase):
         self.assertIsNotNone(result)
         user_text = (result.user_text or "").lower()  # type: ignore
         self.assertIn("zip", user_text)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for trajectories(24) failure patterns
+# ---------------------------------------------------------------------------
+class TestTrajectory24Regressions(unittest.TestCase):
+    """Each test pinned to a specific bug observed in trajectories(24)."""
+
+    def _make_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        client = MockClient(scripts=[])
+        return CargoAgent.__new__(CargoAgent)
+
+    def _placeholder(self, email: str = "alice@example.com") -> Any:
+        from src.cargo.schemas import ProposedAction
+        from src.cargo.risk_class import RiskClass
+        return ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": email},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+
+    # ------------------------------------------------------------------
+    # D1: auth_email cache survives db_facts LRU eviction
+    # ------------------------------------------------------------------
+    def test_d1_auth_email_field_in_working_memory(self) -> None:
+        """WorkingMemory must have an auth_email field (durable, never evicted)."""
+        wm = WorkingMemory()
+        self.assertEqual(wm.auth_email, "")
+        wm.auth_email = "yusuf.rossi7301@example.com"
+        self.assertEqual(wm.auth_email, "yusuf.rossi7301@example.com")
+
+    def test_d1_auth_email_survives_db_facts_eviction(self) -> None:
+        """auth_email must remain accessible even when db_facts has been
+        flushed (simulated by clearing db_facts after it was set)."""
+        wm = WorkingMemory()
+        wm.auth_email = "yusuf.rossi7301@example.com"
+        # Simulate LRU eviction by clearing db_facts entirely.
+        wm.db_facts = []
+        # all_evidence() must still include the email.
+        self.assertIn("yusuf.rossi7301@example.com", wm.all_evidence())
+
+    def test_d1_auth_email_in_all_evidence(self) -> None:
+        """all_evidence() must include auth_email and auth_user_id so
+        arg_grounding accepts them even after db_facts LRU eviction."""
+        wm = WorkingMemory()
+        wm.auth_user_id = "yusuf_rossi_9620"
+        wm.auth_email = "yusuf.rossi7301@example.com"
+        ev = wm.all_evidence()
+        self.assertIn("yusuf_rossi_9620", ev)
+        self.assertIn("yusuf.rossi7301@example.com", ev)
+
+    def test_d1_render_compact_shows_confirmed_identity(self) -> None:
+        """render_compact() must surface confirmed_user_id and confirmed_email
+        so the proposer MODEL always sees them, not relying on db_facts."""
+        wm = WorkingMemory()
+        wm.auth_user_id = "yusuf_rossi_9620"
+        wm.auth_email = "yusuf.rossi7301@example.com"
+        rendered = wm.render_compact()
+        self.assertIn("confirmed_user_id", rendered)
+        self.assertIn("yusuf_rossi_9620", rendered)
+        self.assertIn("confirmed_email", rendered)
+        self.assertIn("yusuf.rossi7301@example.com", rendered)
+
+    def test_d1_path1_uses_auth_email_cache_over_db_facts(self) -> None:
+        """Path 1 of _auth_override must prefer wm.auth_email over
+        _extract_any_email(db_facts) so a cleared db_facts doesn't block it."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange the mechanical keyboard in my order #W2378156"
+        wm.auth_user_id = "yusuf_rossi_9620"
+        wm.auth_email = "yusuf.rossi7301@example.com"
+        # db_facts is empty — simulates LRU eviction
+        wm.db_facts = []
+        wm.recent_signatures.append("get_user_details(user_id='yusuf_rossi_9620')")
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_email")
+        self.assertEqual(result.args.get("email"), "yusuf.rossi7301@example.com")
+
+    # ------------------------------------------------------------------
+    # D2: order_id normalization (#W prefix)
+    # ------------------------------------------------------------------
+    def test_d2_normalize_adds_hash_prefix(self) -> None:
+        """_normalize_order_id_action must add '#' when model uses bare W…."""
+        from src.cargo.schemas import ProposedAction
+        from src.cargo.risk_class import RiskClass
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        action = ProposedAction(
+            name="get_order_details",
+            args={"order_id": "W2378156"},
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._normalize_order_id_action(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.args["order_id"], "#W2378156")
+
+    def test_d2_normalize_lowercase_w(self) -> None:
+        """Lowercase 'w' prefix must be uppercased to 'W'."""
+        from src.cargo.schemas import ProposedAction
+        from src.cargo.risk_class import RiskClass
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        action = ProposedAction(
+            name="get_order_details",
+            args={"order_id": "w1234567"},
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._normalize_order_id_action(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.args["order_id"], "#W1234567")
+
+    def test_d2_normalize_already_canonical(self) -> None:
+        """Already canonical '#W…' must be returned as-is (no change)."""
+        from src.cargo.schemas import ProposedAction
+        from src.cargo.risk_class import RiskClass
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        action = ProposedAction(
+            name="get_order_details",
+            args={"order_id": "#W2378156"},
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._normalize_order_id_action(action, wm)
+        self.assertIsNone(result, "Canonical order_id should not be modified")
+
+    def test_d2_normalize_non_order_action_ignored(self) -> None:
+        """Non-get_order_details actions must not be touched."""
+        from src.cargo.schemas import ProposedAction
+        from src.cargo.risk_class import RiskClass
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        action = ProposedAction(
+            name="get_product_details",
+            args={"product_id": "W2378156"},
+            declared_class=RiskClass.READ,
+            declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._normalize_order_id_action(action, wm)
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # D3: product name matching — last-word AND logic
+    # ------------------------------------------------------------------
+    def test_d3_smart_thermostat_does_not_match_smart_watches(self) -> None:
+        """'Smart Thermostat' must NOT match when user says 'smart watches'.
+        Old Rule 2 (OR-any) would match on the single word 'smart'."""
+        from src.cargo.cargo_agent import CargoAgent
+        result = CargoAgent._product_name_matches_user(
+            "smart thermostat", "i want info on smart watches and headphones"
+        )
+        self.assertFalse(
+            result,
+            "'Smart Thermostat' must not match 'smart watches' (D3 regression)",
+        )
+
+    def test_d3_smart_watch_still_matches_smart_watches(self) -> None:
+        """'Smart Watch' must still match 'smart watches' via Rule 1 phrase
+        substring (the phrase 'smart watch' is a substring of 'smart watches')."""
+        from src.cargo.cargo_agent import CargoAgent
+        result = CargoAgent._product_name_matches_user(
+            "smart watch", "info on smart watches"
+        )
+        self.assertTrue(result, "'Smart Watch' should match 'smart watches' via Rule 1")
+
+    def test_d3_vacuum_cleaner_matches_cleaner(self) -> None:
+        """'Vacuum Cleaner' last word 'cleaner' must match 'cleaner' in user
+        text — the primary noun anchors the match even without 'vacuum'."""
+        from src.cargo.cargo_agent import CargoAgent
+        result = CargoAgent._product_name_matches_user(
+            "vacuum cleaner", "find out about any cleaner available"
+        )
+        self.assertTrue(result, "'Vacuum Cleaner' should match 'any cleaner'")
+
+    def test_d3_mechanical_keyboard_matches_keyboard(self) -> None:
+        """'Mechanical Keyboard' last-word 'keyboard' must match 'keyboard'."""
+        from src.cargo.cargo_agent import CargoAgent
+        result = CargoAgent._product_name_matches_user(
+            "mechanical keyboard", "exchange my keyboard for a clicky one"
+        )
+        self.assertTrue(result)
+
+    def test_d3_thermostat_does_not_match_only_smart(self) -> None:
+        """'Smart Thermostat' must require 'thermostat' — 'smart' alone is
+        insufficient with the new last-word primary requirement."""
+        from src.cargo.cargo_agent import CargoAgent
+        # user only mentions "smart" — no thermostat
+        result = CargoAgent._product_name_matches_user(
+            "smart thermostat", "looking for a smart solution"
+        )
+        self.assertFalse(result)
+
+    # ------------------------------------------------------------------
+    # D4: user-provided @example.com email accepted in Path 2
+    # ------------------------------------------------------------------
+    def test_d4_user_email_example_com_used_in_path2(self) -> None:
+        """When user explicitly provides 'yusufrossi@example.com' (specific
+        prefix, not in generic-RE list), Path 2 must try it via
+        find_user_id_by_email rather than asking again."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange keyboard in my order #W2378156"
+        wm.absorb_user_message("my email is yusufrossi@example.com")
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_email")
+        self.assertEqual(result.args.get("email"), "yusufrossi@example.com")
+
+    def test_d4_generic_prefix_example_still_blocked(self) -> None:
+        """'user@example.com' (generic prefix) must still be blocked."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange keyboard in my order"
+        wm.absorb_user_message("my email is user@example.com")
+        result = agent._auth_override(self._placeholder(), wm)
+        # Must NOT propose find_user_id_by_email(user@example.com)
+        if result is not None and result.name == "find_user_id_by_email":
+            self.assertNotEqual(
+                result.args.get("email"), "user@example.com",
+                "Generic prefix email should be blocked",
+            )
+
+    def test_d4_already_tried_email_not_retried(self) -> None:
+        """If an email from user_facts is already in recent_signatures,
+        Path 2 must skip it and not loop."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange keyboard in my order"
+        wm.absorb_user_message("my email is yusufrossi@example.com")
+        wm.recent_signatures.append(
+            "find_user_id_by_email(email='yusufrossi@example.com')"
+        )
+        result = agent._auth_override(self._placeholder(), wm)
+        # Must NOT propose the same email again
+        if result is not None and result.name == "find_user_id_by_email":
+            self.assertNotEqual(result.args.get("email"), "yusufrossi@example.com")
+
+    # ------------------------------------------------------------------
+    # D5: re-attempt auth with fresh PII after abandonment
+    # ------------------------------------------------------------------
+    def test_d5_fresh_email_after_abandonment_unabandons(self) -> None:
+        """When auth_abandoned=True but user has provided a fresh email not
+        yet in recent_signatures, Path 2 must try it AND clear auth_abandoned
+        so the auth flow can proceed normally.
+
+        Note: Path 2 fires before the abandoned block when fresh PII is present.
+        The abandonment-clearing happens in Path 2 itself (not the abandoned block)
+        to handle the common pattern: user provides email AFTER the agent gave up."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "update my pending order"
+        wm.auth_abandoned = True
+        wm.auth_giveup_emitted = True
+        wm.absorb_user_message("The email is yusufrossi@example.com.")
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_email")
+        self.assertEqual(result.args.get("email"), "yusufrossi@example.com")
+        # Path 2 clears auth_abandoned when fresh credentials are provided
+        self.assertFalse(wm.auth_abandoned)
+        self.assertFalse(wm.auth_giveup_emitted)
+
+    def test_d5_fresh_email_already_tried_does_not_unabondon(self) -> None:
+        """If the fresh email was already tried, do NOT un-abandon — it failed
+        and re-trying would loop."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "update my pending order"
+        wm.auth_abandoned = True
+        wm.auth_giveup_emitted = True
+        wm.absorb_user_message("The email is yusufrossi@example.com.")
+        wm.recent_signatures.append(
+            "find_user_id_by_email(email='yusufrossi@example.com')"
+        )
+        result = agent._auth_override(self._placeholder(), wm)
+        # Must NOT return find_user_id_by_email with the already-tried email
+        if result is not None and result.name == "find_user_id_by_email":
+            self.assertNotEqual(result.args.get("email"), "yusufrossi@example.com")
+
+    def test_d5_fresh_name_zip_after_abandonment_unabandons(self) -> None:
+        """After abandonment, user provides name+zip not yet tried → Path 2
+        must try it AND clear auth_abandoned."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "update my pending order"
+        wm.auth_abandoned = True
+        wm.auth_giveup_emitted = True
+        wm.absorb_user_message("My name is Yusuf Rossi and ZIP is 19122.")
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_name_zip")
+        self.assertFalse(wm.auth_abandoned)
+        self.assertFalse(wm.auth_giveup_emitted)
+
+    # ------------------------------------------------------------------
+    # D6: multi-product query — wait for ALL products before finalizing
+    # ------------------------------------------------------------------
+    def test_d6_multi_product_waits_for_all_products(self) -> None:
+        """When user asks about N products, the finalizer must NOT emit a
+        partial FINAL after only 1 product is fetched; it must wait for all."""
+        from src.cargo.schemas import ProposedAction
+        from src.cargo.risk_class import RiskClass
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "How many t-shirt options are there? Also info on headphones "
+            "and cleaners available."
+        )
+        # Catalogue populated
+        wm.product_types = {
+            "T-Shirt": "111",
+            "Headphones": "222",
+            "Vacuum Cleaner": "333",
+        }
+        # Only Headphones fetched so far
+        wm.product_details["222"] = {
+            "name": "Headphones",
+            "variants": {str(i): {"available": True} for i in range(5)},
+        }
+        wm.recent_signatures.append("list_all_product_types()")
+        action = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._finalize_product_count_query(action, wm)
+        self.assertIsNone(
+            result,
+            "Must NOT finalize when T-Shirt and Cleaner are still unfetched",
+        )
+
+    def test_d6_multi_product_fires_when_all_fetched(self) -> None:
+        """When ALL user-mentioned products are fetched, the finalizer must
+        emit ONE comprehensive FINAL covering all of them."""
+        from src.cargo.schemas import ProposedAction
+        from src.cargo.risk_class import RiskClass
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "How many t-shirt options are there? Also info on headphones "
+            "and cleaners available."
+        )
+        wm.product_types = {
+            "T-Shirt": "111",
+            "Headphones": "222",
+            "Vacuum Cleaner": "333",
+        }
+        # All three fetched
+        wm.product_details["111"] = {
+            "name": "T-Shirt",
+            "variants": {str(i): {"available": True} for i in range(12)},
+        }
+        wm.product_details["222"] = {
+            "name": "Headphones",
+            "variants": {str(i): {"available": i < 5} for i in range(13)},
+        }
+        wm.product_details["333"] = {
+            "name": "Vacuum Cleaner",
+            "variants": {str(i): {"available": True} for i in range(3)},
+        }
+        wm.recent_signatures.append("list_all_product_types()")
+        action = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._finalize_product_count_query(action, wm)
+        self.assertIsNotNone(result, "Must finalize when all products are fetched")
+        self.assertEqual(result.name, "respond")
+        self.assertTrue(result.bypass_gates)
+        self.assertTrue(wm.product_count_finalized)
+        # The FINAL must mention all three products
+        user_text = result.user_text.lower()
+        self.assertIn("t-shirt", user_text)
+        self.assertIn("headphones", user_text)
+        self.assertIn("vacuum cleaner", user_text)
+
+    def test_d6_single_product_still_works(self) -> None:
+        """Single-product goals must still get a single-product FINAL (no
+        regression on the original behavior)."""
+        from src.cargo.schemas import ProposedAction
+        from src.cargo.risk_class import RiskClass
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are currently available?"
+        wm.product_types = {"T-Shirt": "111"}
+        wm.product_details["111"] = {
+            "name": "T-Shirt",
+            "variants": {str(i): {"available": i < 10} for i in range(12)},
+        }
+        wm.recent_signatures.append("list_all_product_types()")
+        action = ProposedAction(
+            name="list_all_product_types", args={},
+            declared_class=RiskClass.READ, declared_pre=[], declared_post=[],
+            informational_intent="", raw_thought="", user_text="", raw_response="",
+        )
+        result = agent._finalize_product_count_query(action, wm)
+        self.assertIsNotNone(result)
+        self.assertIn("t-shirt", result.user_text.lower())
+        self.assertTrue(wm.product_count_finalized)
 
 
 # ---------------------------------------------------------------------------
