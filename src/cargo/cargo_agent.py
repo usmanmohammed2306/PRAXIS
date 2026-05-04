@@ -437,38 +437,43 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return ag, diag
 
         # 4c. Self-consistency (k samples per class).
-        k = self.calibration.sc_k.get(action.declared_class, 0)
-        threshold = self.calibration.sc_thresholds.get(action.declared_class, 0.0)
-        if k >= 1 and threshold > 0:
-            sc = check_self_consistency(
-                action, schema,
-                client=self.client,
-                model=self.model,
-                proposer_messages=proposer_messages,
-                schemas_for_parse=self.schemas,
-                k=k,
-                threshold=threshold,
-            )
-            diag["gates_run"].append("self_consistency")
-            stats.record_gate(sc)
-            diag["sc_agreement"] = sc.diagnostics.get("agreement")
-            if not sc.ok:
-                diag["gates_failed"].append("self_consistency")
-                return sc, diag
+        # Skipped when the action was produced by a deterministic override
+        # (bypass_gates=True). SC samples the proposer independently; for
+        # auth-abandon FINALs and product-count finalisers the proposer's
+        # independent votes are irrelevant and would block a correct decision.
+        if not getattr(action, "bypass_gates", False):
+            k = self.calibration.sc_k.get(action.declared_class, 0)
+            threshold = self.calibration.sc_thresholds.get(action.declared_class, 0.0)
+            if k >= 1 and threshold > 0:
+                sc = check_self_consistency(
+                    action, schema,
+                    client=self.client,
+                    model=self.model,
+                    proposer_messages=proposer_messages,
+                    schemas_for_parse=self.schemas,
+                    k=k,
+                    threshold=threshold,
+                )
+                diag["gates_run"].append("self_consistency")
+                stats.record_gate(sc)
+                diag["sc_agreement"] = sc.diagnostics.get("agreement")
+                if not sc.ok:
+                    diag["gates_failed"].append("self_consistency")
+                    return sc, diag
 
-        # 4d. Counterfactual rollout (IRREV / FINAL only).
-        if self.calibration.run_cf.get(action.declared_class, False) and is_irreversible_or_final(action.declared_class):
-            cf = check_counterfactual(
-                action, schema, wm,
-                client=self.client, model=self.model,
-                temperature=0.0,
-            )
-            diag["gates_run"].append("counterfactual")
-            stats.record_gate(cf)
-            diag["cf_predicted_blocking"] = bool(cf.diagnostics.get("cf_reason")) and not cf.ok
-            if not cf.ok:
-                diag["gates_failed"].append("counterfactual")
-                return cf, diag
+            # 4d. Counterfactual rollout (IRREV / FINAL only).
+            if self.calibration.run_cf.get(action.declared_class, False) and is_irreversible_or_final(action.declared_class):
+                cf = check_counterfactual(
+                    action, schema, wm,
+                    client=self.client, model=self.model,
+                    temperature=0.0,
+                )
+                diag["gates_run"].append("counterfactual")
+                stats.record_gate(cf)
+                diag["cf_predicted_blocking"] = bool(cf.diagnostics.get("cf_reason")) and not cf.ok
+                if not cf.ok:
+                    diag["gates_failed"].append("counterfactual")
+                    return cf, diag
 
         return None, diag
 
@@ -1223,7 +1228,42 @@ class CargoAgent(Agent):  # type: ignore[misc]
         existing_user_id = self._existing_user_id(wm)
         if existing_user_id:
             wm.auth_user_id = existing_user_id  # cache for downstream
-            return self._post_auth_action(wm)
+            post_action = self._post_auth_action(wm)
+            if post_action is not None:
+                return post_action
+            # _post_auth_action returned None: auth is done and user details
+            # have been fetched, but goal is not a simple no-auth query (e.g.
+            # an order-exchange task).  The model keeps looping on placeholder
+            # find_user_id_by_email proposals.  Break the loop by confirming
+            # the user's identity via their real email from db_facts (which was
+            # populated by get_user_details) or user_facts.  After seeing a
+            # successful find_user_id_by_email result the model should proceed
+            # to the actual task without another auth proposal.
+            # Also check db_facts because get_user_details puts the email
+            # there before the user has manually typed it.
+            confirmed_email = self._extract_real_email(wm.user_facts + wm.db_facts)
+            if confirmed_email:
+                email_sig = f"find_user_id_by_email(email={confirmed_email!r})"
+                if email_sig not in wm.recent_signatures:
+                    return ProposedAction(
+                        name="find_user_id_by_email",
+                        args={"email": confirmed_email},
+                        declared_class=RiskClass.READ,
+                        declared_pre=["identity confirmed via order details"],
+                        declared_post=["user_id confirmed via email"],
+                        informational_intent=(
+                            "re-confirm auth via email from db_facts "
+                            "to break auth loop"
+                        ),
+                        raw_thought=(
+                            "Post-auth override: confirming auth via email "
+                            "from db_facts/user_facts to break auth loop and "
+                            "signal model to proceed with actual task."
+                        ),
+                        user_text="",
+                        raw_response="",
+                    )
+            return None
 
         # ---------------------------------------------------------------
         # Placeholder check (only applies to find_user_id_by_email)
@@ -1308,13 +1348,78 @@ class CargoAgent(Agent):  # type: ignore[misc]
         # (refused / ask budget exhausted).
         # ---------------------------------------------------------------
         all_user_text = " ".join(wm.user_facts).lower()
-        user_refused = any(phrase in all_user_text for phrase in _AUTH_REFUSAL_PHRASES)
+        raw_refused = any(phrase in all_user_text for phrase in _AUTH_REFUSAL_PHRASES)
+        # B6 fix: soft-refusal detection.  A message like "I'd rather not
+        # share too much — can we proceed based on my recent orders?" is a
+        # NEGOTIATION, not a hard refusal.  If the user also mentions an
+        # alternative path (order number, different identifier) do not set
+        # auth_abandoned yet; give the order-ID fallback a chance to run.
+        if raw_refused:
+            offering_alt = any(
+                kw in all_user_text
+                for kw in (
+                    "order", "order number", "order id", "recent order",
+                    "tracking", "some other", "identifier", "another way",
+                    "different way", "instead",
+                )
+            )
+            user_refused = not offering_alt
+        else:
+            user_refused = False
         if user_refused or wm.auth_ask_count >= _MAX_AUTH_ASKS:
             wm.auth_abandoned = True
 
         if wm.auth_abandoned:
+            # B5 fix: before giving up entirely, answer any no-auth product-
+            # query component present in a mixed goal (e.g. "how many t-shirts
+            # + update my pending order").  Even when _is_no_auth_query returns
+            # False (because the goal also has an account-mutation phrase), we
+            # can still list and count products without auth, giving the user
+            # partial value before the final "can't help without identity" message.
+            has_product_query = bool(_PRODUCT_QUERY_RE.search(wm.goal or ""))
+            if has_product_query and not wm.product_count_finalized:
+                if not wm.product_types:
+                    return ProposedAction(
+                        name="list_all_product_types",
+                        args={},
+                        declared_class=RiskClass.READ,
+                        declared_pre=["auth abandoned, answering product query first"],
+                        declared_post=["product types listed"],
+                        informational_intent="answer product query component before auth give-up",
+                        raw_thought=(
+                            "Auth abandoned + product query not yet answered → "
+                            "list_all_product_types before final give-up."
+                        ),
+                        user_text="",
+                        raw_response="",
+                    )
+                # Product types available; pick the first user-mentioned product
+                # that hasn't been fetched yet and get its details.
+                name_to_id_lc = {k.lower(): v for k, v in wm.product_types.items()}
+                target_pid = self._goal_matched_product_id(wm, name_to_id_lc)
+                if target_pid and target_pid not in wm.product_details:
+                    return ProposedAction(
+                        name="get_product_details",
+                        args={"product_id": target_pid},
+                        declared_class=RiskClass.READ,
+                        declared_pre=["answering product query component"],
+                        declared_post=["product details fetched"],
+                        informational_intent="fetch product details for count answer",
+                        raw_thought=(
+                            "Auth abandoned + product types listed → fetching "
+                            "product details to answer count query."
+                        ),
+                        user_text="",
+                        raw_response="",
+                    )
+                # Product details fetched; _finalize_product_count_query will
+                # emit the count FINAL on the next applicable step. Fall through
+                # to the give-up FINAL only after that finalizer has fired.
+                if not wm.product_count_finalized:
+                    return None  # let _finalize_product_count_query handle it
+
             if self._is_no_auth_query(wm):
-                # Pivot to no-auth pathway.
+                # Pure no-auth pathway (original path).
                 return ProposedAction(
                     name="list_all_product_types",
                     args={},
@@ -1329,6 +1434,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     raw_response="",
                 )
             # Otherwise emit a FINAL exactly once.
+            # bypass_gates=True so the SC gate's independent proposer samples
+            # don't block a deterministic auth-abandonment decision.
             if wm.auth_giveup_emitted:
                 # We've already said this — break the loop by returning a
                 # different short FINAL.
@@ -1342,6 +1449,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     raw_thought="Auth abandoned, already gave up once — terminating.",
                     user_text="Is there anything else I can help you with?",
                     raw_response="",
+                    bypass_gates=True,
                 )
             wm.auth_giveup_emitted = True
             if user_refused:
@@ -1366,6 +1474,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 raw_thought="Auth override: abandoning auth flow.",
                 user_text=msg,
                 raw_response="",
+                bypass_gates=True,
             )
 
         # ---------------------------------------------------------------
@@ -1620,24 +1729,83 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     return num
         return None
 
+    # ------------------------------------------------------------------
+    # Product-matching helper (B2 fix: word-boundary semantics)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _product_name_matches_user(name_norm: str, all_user: str) -> bool:
+        """Return True if the product name (lowercased) is mentioned by the user.
+
+        Rules (applied in order):
+        1. Exact phrase substring — handles "t-shirt" matching "t-shirts" etc.
+        2. Any single word (len≥4) with **word-boundary** regex — prevents
+           "hose" (from "Garden Hose") from matching "those" in "check those
+           for me".  Observed failure in trajectories(22) T2.
+        3. Compound-word check — joins all words and checks as one token so
+           "Smart Watch" matches "smartwatch" (and NOT "smartthermostat").
+           Observed failure: "smart" prefix matched "Smart Thermostat" when
+           user said "smartwatch".
+        """
+        if not name_norm or not all_user:
+            return False
+        # Rule 1: phrase substring (handles plurals like "t-shirts")
+        if name_norm in all_user:
+            return True
+        # Rule 2: word-boundary token match
+        words = name_norm.split()
+        for tok in words:
+            if len(tok) >= 4 and re.search(rf"\b{re.escape(tok)}\b", all_user):
+                return True
+        # Rule 3: compound form (e.g. "smartwatch" ↔ "Smart Watch")
+        compound = "".join(words)
+        if len(compound) >= 6 and re.search(rf"\b{re.escape(compound)}\b", all_user):
+            return True
+        return False
+
     def _advance_after_product_list(
         self,
         action: ProposedAction,
         wm: "WorkingMemory",
     ) -> Optional[ProposedAction]:
-        """If ``list_all_product_types`` is about to be repeated, skip
-        straight to ``get_product_details`` for a product the user
+        """Skip straight to ``get_product_details`` for a product the user
         mentioned but we haven't fetched yet.
+
+        Two trigger modes:
+        1. The model is about to **repeat** ``list_all_product_types`` — the
+           classic case (first call already executed).
+        2. The model is proposing a **respond / ASK_USER / FINAL** prematurely
+           before fetching the needed product details, AND the goal is a
+           no-auth product query (B4 fix).  This prevents the model from
+           asking for credentials or giving up before counting products.
 
         Uses ``wm.product_types`` (durable cache, not db_facts) so multi-
         product follow-up queries work even after db_facts has been evicted
         by a single get_product_details flooding it with variant data.
+
+        B2 fix: uses word-boundary matching so "hose" does NOT match "those"
+        and "smart" does NOT match "smartwatch"; adds compound-word check so
+        "Smart Watch" DOES match "smartwatch".
         """
-        if action.name != "list_all_product_types":
+        is_list_repeat = False
+        is_premature_respond = False
+
+        if action.name == "list_all_product_types":
+            sig = action.signature()
+            if sig not in wm.recent_signatures:
+                return None  # first call — let it run normally
+            is_list_repeat = True
+        elif (
+            action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
+            or action.name.lower() in ("respond", "send_user", "finish")
+        ):
+            # Only intercept premature responds for no-auth product queries
+            # when product types are already cached.  This handles task 3 /
+            # task 4 where the model tries to ask for auth even though the
+            # product count can be answered without it.
+            if wm.product_types and self._is_no_auth_query(wm):
+                is_premature_respond = True
+        if not is_list_repeat and not is_premature_respond:
             return None
-        sig = action.signature()
-        if sig not in wm.recent_signatures:
-            return None  # first call — let it run normally
 
         all_user = " ".join(wm.user_facts).lower()
         # Iterate the durable catalogue.  Skip anything we've already fetched.
@@ -1647,9 +1815,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if pid in wm.product_details:
                 continue  # already have details for this product
             name_norm = name.lower()
-            if name_norm in all_user or any(
-                tok in all_user for tok in name_norm.split() if len(tok) >= 4
-            ):
+            if self._product_name_matches_user(name_norm, all_user):
                 return ProposedAction(
                     name="get_product_details",
                     args={"product_id": pid},
@@ -1676,7 +1842,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 continue
             if id_part in wm.product_details:
                 continue
-            if name_part.lower() in all_user:
+            if self._product_name_matches_user(name_part.lower(), all_user):
                 return ProposedAction(
                     name="get_product_details",
                     args={"product_id": id_part},
@@ -1783,6 +1949,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     ),
                     user_text=msg,
                     raw_response="",
+                    # Deterministic override — skip SC/CF gates (B3 fix).
+                    bypass_gates=True,
                 )
         return None
 
