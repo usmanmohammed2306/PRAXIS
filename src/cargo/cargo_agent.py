@@ -728,6 +728,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             }
 
             if failing is not None:
+                wm.record_failed_signature(action.signature())
                 stats.steps_gated += 1
                 stats.abstain_total += 1
                 rd = repair.decide(
@@ -871,6 +872,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 })
                 wm.last_error = str(env_exc)[:80]  # tip 8: minimal failure record
                 wm.absorb_observation({"status": "error", "error": str(env_exc)[:80]})
+                wm.record_failed_signature(action.signature())
                 step_record["env_error"] = str(env_exc)[:80]
                 stats.record_step(step_record)
                 continue
@@ -1197,6 +1199,39 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return False
         return bool(_PRODUCT_QUERY_RE.search(wm.goal))
 
+    @staticmethod
+    def _order_product_catalog(wm: "WorkingMemory") -> Dict[str, str]:
+        """Return product name → product_id from grounded order details."""
+        out: Dict[str, str] = {}
+        for details in wm.order_details.values():
+            if not isinstance(details, dict):
+                continue
+            for item in details.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                pid = str(item.get("product_id") or "").strip()
+                if name and pid:
+                    out[name] = pid
+        return out
+
+    @staticmethod
+    def _order_item_id_to_product(wm: "WorkingMemory") -> Dict[str, Tuple[str, str]]:
+        """Return item_id → (product name, product_id) from order details."""
+        out: Dict[str, Tuple[str, str]] = {}
+        for details in wm.order_details.values():
+            if not isinstance(details, dict):
+                continue
+            for item in details.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("item_id") or "").strip()
+                name = str(item.get("name") or "").strip()
+                pid = str(item.get("product_id") or "").strip()
+                if item_id and pid:
+                    out[item_id] = (name, pid)
+        return out
+
     def _post_auth_action(self, wm: "WorkingMemory") -> Optional[ProposedAction]:
         """Build a sensible next action after the user has been authenticated.
 
@@ -1241,6 +1276,30 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 user_text="",
                 raw_response="",
             )
+
+        # Account/order tasks: once identity and order details are grounded,
+        # do not let the proposer re-enter auth.  Fetch product details for
+        # order items that the user mentioned so later mutations can use
+        # grounded item IDs from product_details rather than invented IDs.
+        all_user = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        for name, pid in self._order_product_catalog(wm).items():
+            if pid in wm.product_details:
+                continue
+            if self._product_name_matches_user(name.lower(), all_user):
+                return ProposedAction(
+                    name="get_product_details",
+                    args={"product_id": pid},
+                    declared_class=RiskClass.READ,
+                    declared_pre=["order item product grounded"],
+                    declared_post=["product details retrieved"],
+                    informational_intent=f"fetch product details for {name}",
+                    raw_thought=(
+                        "Post-auth override: auth is complete; fetching "
+                        f"grounded product details for order item '{name}'."
+                    ),
+                    user_text="",
+                    raw_response="",
+                )
 
         # Default: return None and let the model figure out the next step.
         return None
@@ -1863,22 +1922,30 @@ class CargoAgent(Agent):  # type: ignore[misc]
         pid_str = str(pid).strip()
 
         # Build a {lower(name): numeric_id} map.  Prefer the durable
-        # wm.product_types catalogue, then fall back to db_facts (which can
-        # be evicted under memory pressure).
+        # wm.product_types catalogue and grounded order details, then fall
+        # back to simple db_facts catalogue entries.  Do NOT treat arbitrary
+        # numeric db_facts as product IDs; item IDs share the same shape and
+        # were observed passing through as product_id arguments.
         name_to_id: Dict[str, str] = {}
         all_known_ids = set()
         for name, pid in wm.product_types.items():
             if isinstance(name, str) and isinstance(pid, str) and re.fullmatch(r"\d+", pid):
                 name_to_id[name.strip().lower()] = pid
                 all_known_ids.add(pid)
+        for name, pid in self._order_product_catalog(wm).items():
+            if re.fullmatch(r"\d+", pid):
+                name_to_id.setdefault(name.strip().lower(), pid)
+                all_known_ids.add(pid)
         for fact in wm.db_facts:
             if "=" not in fact:
-                if re.fullmatch(r"\d+", fact.strip()):
-                    all_known_ids.add(fact.strip())
                 continue
             name_part, _, id_part = fact.partition("=")
             id_part = id_part.strip()
             if not re.fullmatch(r"\d+", id_part):
+                continue
+            if "." in name_part or "[" in name_part:
+                # Structured observation paths like items[0].item_id=...
+                # retain provenance; they are not product catalogue entries.
                 continue
             name_to_id.setdefault(name_part.strip().lower(), id_part)
             all_known_ids.add(id_part)
@@ -1887,6 +1954,31 @@ class CargoAgent(Agent):  # type: ignore[misc]
         if re.fullmatch(r"\d+", pid_str):
             if pid_str in all_known_ids:
                 return None  # legitimate ID, leave as-is
+            item_map = self._order_item_id_to_product(wm)
+            if pid_str in item_map:
+                item_name, item_product_id = item_map[pid_str]
+                # If the model supplied an order item_id where product_id is
+                # required, convert it to that item's product_id only when the
+                # item itself is goal-relevant; otherwise fall through to the
+                # goal matcher below.
+                all_user = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+                if item_name and self._product_name_matches_user(item_name.lower(), all_user):
+                    new_args = dict(action.args)
+                    new_args["product_id"] = item_product_id
+                    return ProposedAction(
+                        name=action.name,
+                        args=new_args,
+                        declared_class=action.declared_class,
+                        declared_pre=action.declared_pre,
+                        declared_post=action.declared_post,
+                        informational_intent=action.informational_intent,
+                        raw_thought=(
+                            f"Product-ID override: item_id '{pid_str}' → "
+                            f"product_id {item_product_id} for order item {item_name}."
+                        ),
+                        user_text=action.user_text,
+                        raw_response=action.raw_response,
+                    )
             # Hallucinated ID — try to find a goal-relevant replacement.
             replacement = self._goal_matched_product_id(wm, name_to_id)
             if replacement is None:

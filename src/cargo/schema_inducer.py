@@ -51,7 +51,7 @@ _ID_PARAM_HINTS = {
     "id", "user_id", "customer_id", "order_id", "reservation_id",
     "booking_id", "item_id", "product_id", "flight_id",
     "payment_method_id", "payment_id", "account_id", "ticket_id",
-    "session_id",
+    "session_id", "item_ids", "new_item_ids", "order_ids", "product_ids",
 }
 
 
@@ -59,7 +59,8 @@ def _is_id_param(name: str, prop: Optional[Dict[str, Any]]) -> bool:
     n = (name or "").lower()
     if n in _ID_PARAM_HINTS:
         return True
-    if n.endswith("_id") or n.endswith("id") or n.endswith("_number"):
+    if (n.endswith("_id") or n.endswith("id") or n.endswith("_ids")
+            or n.endswith("ids") or n.endswith("_number")):
         return True
     if prop and isinstance(prop, dict):
         # Common pattern: "type": "string", "description": "...id..."

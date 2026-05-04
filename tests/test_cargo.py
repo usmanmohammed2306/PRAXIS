@@ -297,11 +297,15 @@ class TestSchemaInduction(unittest.TestCase):
         schemas = induce_schemas([
             _tool("cancel_order", ["order_id"]),
             _tool("update_user_address", ["user_id", "address"]),
+            _tool("exchange_delivered_order_items",
+                  ["order_id", "item_ids", "new_item_ids", "payment_method_id"]),
         ])
         self.assertIn("order_id", schemas["cancel_order"].arg_id_fields)
         self.assertIn("user_id", schemas["update_user_address"].arg_id_fields)
         # 'address' is not an ID field.
         self.assertNotIn("address", schemas["update_user_address"].arg_id_fields)
+        self.assertIn("item_ids", schemas["exchange_delivered_order_items"].arg_id_fields)
+        self.assertIn("new_item_ids", schemas["exchange_delivered_order_items"].arg_id_fields)
 
     def test_schema_cache_reuses(self) -> None:
         # First induction populates the cache.
@@ -457,6 +461,53 @@ class TestArgGroundingGate(unittest.TestCase):
         result = check_arg_grounding(action, self.schemas["update_user_address"], wm)
         self.assertTrue(result.ok, result.reason)
 
+    def test_typed_product_id_rejects_grounded_item_id(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_observation({
+            "items": [{
+                "name": "Smart Watch",
+                "product_id": "6945232052",
+                "item_id": "9408160950",
+            }]
+        })
+        schema = ToolEffectSchema(
+            name="get_product_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["product_id"],
+            required_params=["product_id"],
+        )
+        action = ProposedAction(
+            name="get_product_details",
+            args={"product_id": "9408160950"},
+            declared_class=RiskClass.READ,
+        )
+        result = check_arg_grounding(action, schema, wm)
+        self.assertFalse(result.ok)
+        self.assertIn("product_id=9408160950", result.reason)
+
+    def test_list_id_arguments_are_grounded_elementwise(self) -> None:
+        wm = WorkingMemory()
+        wm.product_details["p1"] = {
+            "variants": {
+                "old_item": {"item_id": "old_item"},
+                "new_item": {"item_id": "new_item"},
+            }
+        }
+        schema = ToolEffectSchema(
+            name="exchange_delivered_order_items",
+            cls=RiskClass.IRREVERSIBLE,
+            arg_id_fields=["item_ids", "new_item_ids"],
+            required_params=["item_ids", "new_item_ids"],
+        )
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={"item_ids": ["old_item"], "new_item_ids": ["made_up_item"]},
+            declared_class=RiskClass.IRREVERSIBLE,
+        )
+        result = check_arg_grounding(action, schema, wm)
+        self.assertFalse(result.ok)
+        self.assertIn("new_item_ids[0]=made_up_item", result.reason)
+
 
 class TestRepeatLoopGate(unittest.TestCase):
     def test_repeat_signature_detected(self) -> None:
@@ -478,6 +529,16 @@ class TestRepeatLoopGate(unittest.TestCase):
         wm.record_action_signature(action1.signature())
         result = check_repeat_loop(action2, sch, wm)
         self.assertTrue(result.ok)
+
+    def test_failed_signature_blocks_until_new_evidence(self) -> None:
+        wm = WorkingMemory()
+        sch = ToolEffectSchema(name="get_x", cls=RiskClass.READ)
+        action = ProposedAction(name="get_x", args={"a": "A1234"},
+                                declared_class=RiskClass.READ)
+        wm.record_failed_signature(action.signature())
+        self.assertFalse(check_repeat_loop(action, sch, wm).ok)
+        wm.absorb_user_message("New evidence A1234")
+        self.assertTrue(check_repeat_loop(action, sch, wm).ok)
 
 
 class TestSelfConsistencyGate(unittest.TestCase):
@@ -523,6 +584,32 @@ class TestSelfConsistencyGate(unittest.TestCase):
         )
         self.assertFalse(result.ok, result.diagnostics)
         self.assertLess(result.diagnostics["agreement"], 0.66)
+
+    def test_final_self_consistency_includes_user_text(self) -> None:
+        action = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+            user_text="The order was cancelled.",
+        )
+        client = MockClient(scripts=[
+            [
+                _proposer_json(name="respond", declared_class="FINAL",
+                               user_text="The order was cancelled."),
+                _proposer_json(name="respond", declared_class="FINAL",
+                               user_text="I cannot verify that."),
+                _proposer_json(name="respond", declared_class="FINAL",
+                               user_text="Please provide your email."),
+            ],
+        ])
+        result = check_self_consistency(
+            action, ToolEffectSchema(name="respond", cls=RiskClass.FINAL),
+            client=client, model="m",
+            proposer_messages=[{"role": "user", "content": "x"}],
+            schemas_for_parse={"respond": ToolEffectSchema(name="respond", cls=RiskClass.FINAL)},
+            k=3, threshold=0.66,
+        )
+        self.assertFalse(result.ok)
 
     def test_no_client_passthrough(self) -> None:
         result = check_self_consistency(
@@ -842,6 +929,28 @@ class TestRunCargoIntegration(unittest.TestCase):
         self.assertGreaterEqual(stats["abstain_total"], 1)
         # arg_grounding fired
         self.assertIn("arg_grounding", stats["gate_fails"])
+
+    def test_ace_read_with_ungrounded_id_is_blocked(self) -> None:
+        scripts = [
+            _proposer_json(
+                name="get_product_details",
+                args={"product_id": "9999999999"},
+                declared_class="READ",
+            ),
+        ]
+        client = MockClient(scripts=scripts)
+        result = run_cargo(
+            client=client, model="m",
+            task={},
+            tool_specs=[_tool("get_product_details", ["product_id"])],
+            user_turn="Please show me product details.",
+            system_prompt="",
+            max_num_steps=5, temperature=0.0,
+        )
+        self.assertEqual(result["status"], "ok", result.get("error"))
+        self.assertNotIn("get_product_details", result["tool_calls_made"])
+        self.assertIn("respond", result["tool_calls_made"])
+        self.assertIn("arg_grounding", result["cargo_stats"]["gate_fails"])
 
     def test_grounded_mutation_executes(self) -> None:
         # Step 1: READ get_order_details (auto-grounds order_id O1234 in db)
@@ -3301,6 +3410,57 @@ class TestTrajectory24Regressions(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn("t-shirt", result.user_text.lower())
         self.assertTrue(wm.product_count_finalized)
+
+    # ------------------------------------------------------------------
+    # D7: completed auth must progress to grounded order-product retrieval
+    # ------------------------------------------------------------------
+    def test_d7_post_auth_fetches_mentioned_order_product(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange my mechanical keyboard for clicky switches"
+        wm.auth_user_id = "yusuf_rossi_9620"
+        wm.recent_signatures.append("get_user_details(user_id='yusuf_rossi_9620')")
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "1656367028",
+                    "item_id": "1151293680",
+                },
+                {
+                    "name": "Smart Watch",
+                    "product_id": "6945232052",
+                    "item_id": "9408160950",
+                },
+            ],
+        }
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_product_details")
+        self.assertEqual(result.args["product_id"], "1656367028")
+
+    def test_d7_item_id_not_accepted_as_product_id(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange my mechanical keyboard for clicky switches"
+        wm.order_details["#W2378156"] = {
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "1656367028",
+                    "item_id": "1151293680",
+                }
+            ]
+        }
+        bad = ProposedAction(
+            name="get_product_details",
+            args={"product_id": "1151293680"},
+            declared_class=RiskClass.READ,
+        )
+        result = agent._resolve_product_id_name(bad, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.args["product_id"], "1656367028")
 
 
 # ---------------------------------------------------------------------------

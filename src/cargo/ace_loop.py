@@ -87,6 +87,12 @@ def _run_gates(
         diag["gates_failed"].append("repeat_loop")
         return rl, diag
     if not is_gated(action.declared_class):
+        ag = check_arg_grounding(action, schema, wm)
+        diag["gates_run"].append("arg_grounding")
+        stats.record_gate(ag)
+        if not ag.ok:
+            diag["gates_failed"].append("arg_grounding")
+            return ag, diag
         return None, diag
     pc = check_preconditions(action, schema, wm)
     diag["gates_run"].append("preconditions")
@@ -100,34 +106,35 @@ def _run_gates(
     if not ag.ok:
         diag["gates_failed"].append("arg_grounding")
         return ag, diag
-    k = calibration.sc_k.get(action.declared_class, 0)
-    threshold = calibration.sc_thresholds.get(action.declared_class, 0.0)
-    if k >= 1 and threshold > 0:
-        sc = check_self_consistency(
-            action, schema,
-            client=client, model=model,
-            proposer_messages=proposer_messages,
-            schemas_for_parse=schemas,
-            k=k, threshold=threshold,
-        )
-        diag["gates_run"].append("self_consistency")
-        diag["sc_agreement"] = sc.diagnostics.get("agreement")
-        stats.record_gate(sc)
-        if not sc.ok:
-            diag["gates_failed"].append("self_consistency")
-            return sc, diag
-    if (calibration.run_cf.get(action.declared_class, False)
-            and is_irreversible_or_final(action.declared_class)):
-        cf = check_counterfactual(
-            action, schema, wm,
-            client=client, model=model, temperature=0.0,
-        )
-        diag["gates_run"].append("counterfactual")
-        diag["cf_predicted_blocking"] = bool(cf.diagnostics.get("cf_reason")) and not cf.ok
-        stats.record_gate(cf)
-        if not cf.ok:
-            diag["gates_failed"].append("counterfactual")
-            return cf, diag
+    if not getattr(action, "bypass_gates", False):
+        k = calibration.sc_k.get(action.declared_class, 0)
+        threshold = calibration.sc_thresholds.get(action.declared_class, 0.0)
+        if k >= 1 and threshold > 0:
+            sc = check_self_consistency(
+                action, schema,
+                client=client, model=model,
+                proposer_messages=proposer_messages,
+                schemas_for_parse=schemas,
+                k=k, threshold=threshold,
+            )
+            diag["gates_run"].append("self_consistency")
+            diag["sc_agreement"] = sc.diagnostics.get("agreement")
+            stats.record_gate(sc)
+            if not sc.ok:
+                diag["gates_failed"].append("self_consistency")
+                return sc, diag
+        if (calibration.run_cf.get(action.declared_class, False)
+                and is_irreversible_or_final(action.declared_class)):
+            cf = check_counterfactual(
+                action, schema, wm,
+                client=client, model=model, temperature=0.0,
+            )
+            diag["gates_run"].append("counterfactual")
+            diag["cf_predicted_blocking"] = bool(cf.diagnostics.get("cf_reason")) and not cf.ok
+            stats.record_gate(cf)
+            if not cf.ok:
+                diag["gates_failed"].append("counterfactual")
+                return cf, diag
     return None, diag
 
 
@@ -248,6 +255,7 @@ def run_cargo(
             }
 
             if failing is not None:
+                wm.record_failed_signature(action.signature())
                 stats.steps_gated += 1
                 stats.abstain_total += 1
                 rd = repair.decide(

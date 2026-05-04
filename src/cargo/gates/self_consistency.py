@@ -12,6 +12,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from ..proposer import parse_proposer_response
+from ..risk_class import RiskClass
 from ..schemas import GateResult, ProposedAction, ToolEffectSchema
 
 
@@ -20,7 +21,10 @@ def _canonical(action: ProposedAction) -> str:
         args_canon = json.dumps(action.args, sort_keys=True, default=str)
     except Exception:
         args_canon = str(action.args)
-    return f"{action.name}::{args_canon}"
+    text = ""
+    if action.declared_class in (RiskClass.FINAL, RiskClass.ASK_USER):
+        text = f"::{(action.user_text or '').strip()[:300]}"
+    return f"{action.name}::{args_canon}{text}"
 
 
 def check_self_consistency(
