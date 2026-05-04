@@ -48,6 +48,13 @@ class WorkingMemory:
     # Set once we've already emitted a "give up on auth" FINAL.  Prevents the
     # exact same FINAL from being emitted twice in a row.
     auth_giveup_emitted: bool = False
+    # Confirmed email from a successful get_user_details / find_user_id_by_email
+    # call.  Stored here so it is NEVER evicted by the 48-entry db_facts LRU
+    # and so render_compact() can surface it directly to the proposer.
+    # Without this, get_user_details floods db_facts with variant/payment data
+    # that pushes out the email entry, breaking the auth-confirmation loop in
+    # Path 1 of _auth_override.  (Observed: trajectories(24) T0.)
+    auth_email: str = ""
     # Cache of product details keyed by product_id.  Populated by the agent's
     # solve loop when ``get_product_details`` returns successfully.  Used to
     # short-circuit "how many X variants are available?" queries that the
@@ -158,17 +165,22 @@ class WorkingMemory:
         from ``db_facts`` by a subsequent large tool response (e.g.
         get_product_details flooding db_facts with variant data).
 
-        Without this, ``_advance_after_product_list`` correctly resolves
-        "Smart Watch" → "6945232052" from ``wm.product_types``, but the
-        arg-grounding gate then rejects "6945232052" as ungrounded because
-        db_facts no longer contains the product-list JSON.
-        (Observed failure: trajectories(23) Task 2, steps 3–19.)
+        Also includes ``auth_user_id`` and ``auth_email`` so that confirmed
+        identity tokens pass arg_grounding even after the corresponding
+        db_facts entries are evicted by the LRU cap.
+        (Observed failure: trajectories(24) T0 — email evicted after
+        get_user_details flooded db_facts, breaking auth-confirmation loop.)
         """
         base = "\n".join(self.user_facts + self.db_facts)
+        extras: list = []
         if self.product_types:
-            # Append each ID on its own line so substring search is unambiguous.
-            pt_ids = "\n".join(self.product_types.values())
-            return base + "\n" + pt_ids
+            extras.append("\n".join(self.product_types.values()))
+        if self.auth_user_id:
+            extras.append(self.auth_user_id)
+        if self.auth_email:
+            extras.append(self.auth_email)
+        if extras:
+            return base + "\n" + "\n".join(extras)
         return base
 
     def render_compact(self, max_chars: int = 800) -> str:
@@ -187,6 +199,17 @@ class WorkingMemory:
 
         parts = [
             f"goal: {self.goal[:150]}" if self.goal else "",
+        ]
+        # Surface confirmed identity explicitly so the proposer always sees
+        # them even when db_facts has been evicted (48-entry LRU cap).
+        # Without these lines the model keeps proposing find_user_id_* after
+        # auth is complete because it can't see the user_id in truncated STATE.
+        # (Observed failure: trajectories(24) T0.)
+        if self.auth_user_id:
+            parts.append(f"confirmed_user_id: {self.auth_user_id}")
+        if self.auth_email:
+            parts.append(f"confirmed_email: {self.auth_email}")
+        parts += [
             "user_facts:",
             *(f"  {f[:90]}" for f in trim(self.user_facts, 5)),
             "db_facts:",
