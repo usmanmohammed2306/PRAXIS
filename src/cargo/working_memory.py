@@ -48,6 +48,10 @@ class WorkingMemory:
     # Set once a user_id has been confirmed by a successful find_user_id_*
     # call.  Used to cleanly suppress further authentication proposals.
     auth_user_id: str = ""
+    # Durable phase locks.  These are deterministic controller state, not LLM
+    # memory: once a phase completes (auth, product count, etc.), future
+    # proposals must advance from that state instead of re-entering it.
+    phase_locks: Dict[str, bool] = field(default_factory=dict)
     # Set once we've already emitted a "give up on auth" FINAL.  Prevents the
     # exact same FINAL from being emitted twice in a row.
     auth_giveup_emitted: bool = False
@@ -194,6 +198,14 @@ class WorkingMemory:
     def failed_without_new_evidence(self, sig: str) -> bool:
         return bool(sig and self.failed_signatures.get(sig) == self.evidence_version)
 
+    def lock_phase(self, phase: str) -> None:
+        key = str(phase or "").strip().lower()
+        if key:
+            self.phase_locks[key] = True
+
+    def phase_locked(self, phase: str) -> bool:
+        return bool(self.phase_locks.get(str(phase or "").strip().lower()))
+
     # ------------------------------------------------------------------
     # Queries used by gates
     # ------------------------------------------------------------------
@@ -292,8 +304,13 @@ class WorkingMemory:
         # (Observed failure: trajectories(24) T0.)
         if self.auth_user_id:
             parts.append(f"confirmed_user_id: {self.auth_user_id}")
+            parts.append("phase_locked: auth")
         if self.auth_email:
             parts.append(f"confirmed_email: {self.auth_email}")
+        if self.product_count_finalized:
+            parts.append("phase_locked: product_count")
+        if self.order_details:
+            parts.append(f"orders_cached: {len(self.order_details)}")
         parts += [
             "user_facts:",
             *(f"  {f[:90]}" for f in trim(self.user_facts, 5)),

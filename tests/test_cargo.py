@@ -2290,20 +2290,12 @@ class TestTrajectory22Regressions(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # B1: Auth loop after order_id authentication
-    # After get_order_details → get_user_details, Path 1 must extract the
-    # real email from db_facts and emit find_user_id_by_email, rather than
-    # returning None and leaving the agent stuck on placeholder-email loops.
+    # After auth is complete, Path 1 must lock the phase and avoid re-entering
+    # find_user_id_* confirmation.  The separate grounded-progress layer is
+    # responsible for order retrieval / commit.
     # ------------------------------------------------------------------
     def test_b1_path1_extracts_email_from_db_facts(self) -> None:
-        """Path 1: real email in db_facts → re-confirm auth via that email.
-
-        After order_id auth (get_order_details → get_user_details), the
-        user's real email lands in db_facts.  _auth_override Path 1 must
-        extract it and emit find_user_id_by_email rather than returning None
-        and leaving the agent in a placeholder-email loop.
-        NOTE: @example.com is treated as a placeholder domain by
-        _is_placeholder_email, so use a real-looking domain.
-        """
+        """Path 1: real email in db_facts must not cause auth re-entry."""
         agent = self._make_agent()
         wm = WorkingMemory()
         wm.goal = "exchange items in my pending order"
@@ -2317,9 +2309,8 @@ class TestTrajectory22Regressions(unittest.TestCase):
         wm.recent_signatures.append("get_user_details(user_id=alice_smith_9620)")
         action = self._placeholder_action()
         result = agent._auth_override(action, wm)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.name, "find_user_id_by_email")  # type: ignore
-        self.assertEqual(result.args["email"], "alice@gmail.com")  # type: ignore
+        self.assertIsNone(result)
+        self.assertTrue(wm.phase_locked("auth"))
 
     def test_b1_email_already_confirmed_returns_none(self) -> None:
         """Path 1: if find_user_id_by_email(real_email) is already in
@@ -2800,8 +2791,8 @@ class TestTrajectory23Regressions(unittest.TestCase):
         )
 
     def test_c1_path1_uses_db_facts_email_to_confirm_auth(self) -> None:
-        """After order_id auth, Path 1 must emit find_user_id_by_email with
-        the DB email even when the domain is @example.com."""
+        """After order_id auth, Path 1 must not re-enter email auth even when
+        a confirmed @example.com email is available from DB facts."""
         agent = self._make_agent()
         wm = WorkingMemory()
         wm.goal = "exchange the mechanical keyboard in my order"
@@ -2813,9 +2804,8 @@ class TestTrajectory23Regressions(unittest.TestCase):
         wm.recent_signatures.append("get_user_details(user_id=yusuf_rossi_9620)")
         action = self._placeholder_action()
         result = agent._auth_override(action, wm)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.name, "find_user_id_by_email")  # type: ignore
-        self.assertEqual(result.args["email"], "yusuf.rossi7301@example.com")  # type: ignore
+        self.assertIsNone(result)
+        self.assertTrue(wm.phase_locked("auth"))
 
     def test_c1_user_provided_example_com_email_still_blocked_via_real_email(self) -> None:
         """If the user provides yusufrossi@example.com (not a generic prefix),
@@ -3067,8 +3057,8 @@ class TestTrajectory24Regressions(unittest.TestCase):
         self.assertIn("yusuf.rossi7301@example.com", rendered)
 
     def test_d1_path1_uses_auth_email_cache_over_db_facts(self) -> None:
-        """Path 1 of _auth_override must prefer wm.auth_email over
-        _extract_any_email(db_facts) so a cleared db_facts doesn't block it."""
+        """Path 1 of _auth_override must not use cached email to re-enter a
+        completed auth phase, even if db_facts were evicted."""
         agent = self._make_agent()
         wm = WorkingMemory()
         wm.goal = "exchange the mechanical keyboard in my order #W2378156"
@@ -3078,9 +3068,8 @@ class TestTrajectory24Regressions(unittest.TestCase):
         wm.db_facts = []
         wm.recent_signatures.append("get_user_details(user_id='yusuf_rossi_9620')")
         result = agent._auth_override(self._placeholder(), wm)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.name, "find_user_id_by_email")
-        self.assertEqual(result.args.get("email"), "yusuf.rossi7301@example.com")
+        self.assertIsNone(result)
+        self.assertTrue(wm.phase_locked("auth"))
 
     # ------------------------------------------------------------------
     # D2: order_id normalization (#W prefix)
@@ -3461,6 +3450,173 @@ class TestTrajectory24Regressions(unittest.TestCase):
         result = agent._resolve_product_id_name(bad, wm)
         self.assertIsNotNone(result)
         self.assertEqual(result.args["product_id"], "1656367028")
+
+    def test_e1_persona_identity_extracts_name_zip(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("You are Yusuf Rossi in 19122. Please help with my order.")
+        result = agent._auth_override(self._placeholder(), wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_name_zip")
+        self.assertEqual(result.args["first_name"], "Yusuf")
+        self.assertEqual(result.args["last_name"], "Rossi")
+        self.assertEqual(result.args["zip"], "19122")
+
+    def test_e1_progress_authenticates_after_count_phase(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "You are Yusuf Rossi in 19122. How many tshirts are available, then update my order."
+        wm.absorb_user_message(wm.goal)
+        wm.product_count_finalized = True
+        result = agent._grounded_progress_or_commit_action(
+            ProposedAction(name="list_all_product_types", args={}, declared_class=RiskClass.READ),
+            wm,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_name_zip")
+        self.assertEqual(result.args["zip"], "19122")
+
+    def test_e2_grounded_exchange_commits_after_retrieval(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "You are Yusuf Rossi in 19122. You received order #W2378156 and "
+            "wish to exchange the mechanical keyboard for clicky switches and "
+            "the smart thermostat for one compatible with Google Home instead "
+            "of Apple HomeKit. If there is no keyboard that is clicky, RGB "
+            "backlight, full size, you'd go for no backlight."
+        )
+        wm.auth_user_id = "yusuf_rossi_9620"
+        wm.lock_phase("auth")
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "credit_card_9513926"}],
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "kbd",
+                    "item_id": "oldkbd",
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+                },
+                {
+                    "name": "Smart Thermostat",
+                    "product_id": "thermo",
+                    "item_id": "oldthermo",
+                    "options": {"compatibility": "Apple HomeKit", "color": "black"},
+                },
+            ],
+        }
+        wm.product_details["kbd"] = {
+            "name": "Mechanical Keyboard",
+            "product_id": "kbd",
+            "variants": {
+                "bad": {"item_id": "bad", "available": False,
+                        "options": {"switch type": "clicky", "backlight": "RGB", "size": "full size"}},
+                "newkbd": {"item_id": "newkbd", "available": True,
+                           "options": {"switch type": "clicky", "backlight": "none", "size": "full size"}},
+            },
+        }
+        wm.product_details["thermo"] = {
+            "name": "Smart Thermostat",
+            "product_id": "thermo",
+            "variants": {
+                "newthermo": {"item_id": "newthermo", "available": True,
+                              "options": {"compatibility": "Google Assistant", "color": "black"}},
+                "wrong": {"item_id": "wrong", "available": True,
+                          "options": {"compatibility": "Apple HomeKit", "color": "black"}},
+            },
+        }
+        action = agent._grounded_retail_commit_action(wm)
+        self.assertIsNotNone(action)
+        self.assertEqual(action.name, "exchange_delivered_order_items")
+        self.assertEqual(action.args["item_ids"], ["oldkbd", "oldthermo"])
+        self.assertEqual(action.args["new_item_ids"], ["newkbd", "newthermo"])
+        self.assertTrue(action.bypass_gates)
+
+    def test_e3_exchange_respects_only_exchange_fallback(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "exchange the mechanical keyboard for clicky, RGB backlight, full size. "
+            "If there is no keyboard that is clicky, RGB backlight, full size, "
+            "you'd rather only exchange the thermostat."
+        )
+        wm.auth_user_id = "u"
+        wm.order_details["#W1"] = {
+            "order_id": "#W1",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "pm"}],
+            "items": [{
+                "name": "Mechanical Keyboard",
+                "product_id": "kbd",
+                "item_id": "old",
+                "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+            }],
+        }
+        wm.product_details["kbd"] = {
+            "name": "Mechanical Keyboard",
+            "variants": {
+                "fallback": {"item_id": "fallback", "available": True,
+                             "options": {"switch type": "clicky", "backlight": "none", "size": "full size"}},
+                "exact": {"item_id": "exact", "available": False,
+                          "options": {"switch type": "clicky", "backlight": "RGB", "size": "full size"}},
+            },
+        }
+        self.assertIsNone(agent._grounded_retail_commit_action(wm))
+
+    def test_e4_grounded_modify_groups_pending_order(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "modify all pending small tshirts to purple, same size, same v-neck, prefer polyester"
+        wm.auth_user_id = "u"
+        wm.order_details["#W4776164"] = {
+            "order_id": "#W4776164",
+            "status": "pending",
+            "payment_history": [{"payment_method_id": "pm"}],
+            "items": [{
+                "name": "T-Shirt",
+                "product_id": "ts",
+                "item_id": "oldts",
+                "options": {"color": "blue", "size": "S", "material": "cotton", "style": "v-neck"},
+            }],
+        }
+        wm.product_details["ts"] = {
+            "name": "T-Shirt",
+            "variants": {
+                "target": {"item_id": "target", "available": True,
+                           "options": {"color": "purple", "size": "S", "material": "polyester", "style": "v-neck"}},
+                "weak": {"item_id": "weak", "available": True,
+                         "options": {"color": "purple", "size": "XL", "material": "cotton", "style": "crew neck"}},
+            },
+        }
+        action = agent._grounded_retail_commit_action(wm)
+        self.assertIsNotNone(action)
+        self.assertEqual(action.name, "modify_pending_order_items")
+        self.assertEqual(action.args["order_id"], "#W4776164")
+        self.assertEqual(action.args["item_ids"], ["oldts"])
+        self.assertEqual(action.args["new_item_ids"], ["target"])
+
+    def test_e5_grounded_return_uses_delivered_order_items(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "return the cleaner, headphone, and smart watch"
+        wm.auth_user_id = "u"
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "pm"}],
+            "items": [
+                {"name": "Vacuum Cleaner", "item_id": "cleaner"},
+                {"name": "Headphones", "item_id": "headphones"},
+                {"name": "Smart Watch", "item_id": "watch"},
+                {"name": "Mechanical Keyboard", "item_id": "keyboard"},
+            ],
+        }
+        action = agent._grounded_retail_commit_action(wm)
+        self.assertIsNotNone(action)
+        self.assertEqual(action.name, "return_delivered_order_items")
+        self.assertEqual(action.args["item_ids"], ["cleaner", "headphones", "watch"])
 
 
 # ---------------------------------------------------------------------------
