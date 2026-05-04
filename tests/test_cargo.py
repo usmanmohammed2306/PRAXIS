@@ -2550,6 +2550,297 @@ class TestTrajectory22Regressions(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Regression tests for trajectories(23) failure patterns
+# ---------------------------------------------------------------------------
+class TestTrajectory23Regressions(unittest.TestCase):
+    """Pinned tests for all 4 root-cause bugs identified in trajectories(23).
+
+    C1 (Tasks 0,1): db_facts emails blocked by @example. domain filter —
+        tau-bench uses @example.com for real user emails; Path 1 of
+        _auth_override must trust db_facts emails unconditionally (they come
+        from tool responses, not model hallucination).
+
+    C2 (Task 2): arg_grounding rejects product IDs from wm.product_types —
+        after db_facts is evicted by a large get_product_details response,
+        the durable wm.product_types catalogue must be included in evidence.
+
+    C3 (Tasks 3,4): _finalize_product_count_query only fires on
+        list_all_product_types repeats, not on model-proposed FINAL actions,
+        causing the precondition gate to block a correct count response.
+
+    C4 (Tasks 3,4): Default auth question leads with "email address", which
+        triggers refusal from privacy-sensitive user simulations; should ask
+        for name + ZIP first (what tau-bench users willingly provide).
+    """
+
+    def _make_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        client = MockClient(scripts=[])
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "test"
+        agent.style_name = "cargo"
+        agent.temperature = 0.0
+        agent.schemas = {}
+        agent.domain_policy = ""
+        return agent
+
+    def _placeholder_action(self) -> ProposedAction:
+        return ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": "user@example.com"},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+
+    # ------------------------------------------------------------------
+    # C1: db_facts emails (@example.com) must be trusted for auth confirmation
+    # ------------------------------------------------------------------
+    def test_c1_extract_any_email_trusts_example_com_from_db_facts(self) -> None:
+        """_extract_any_email must return an @example.com email from db_facts.
+
+        tau-bench retail uses @example.com for every user's email address.
+        The previous _extract_real_email blanket-blocked @example. as a
+        placeholder domain, so Path 1 could never find the DB email and
+        confirm auth via find_user_id_by_email.
+        """
+        from src.cargo.cargo_agent import CargoAgent
+        facts = [
+            "user_id=yusuf_rossi_9620",
+            "email=yusuf.rossi7301@example.com",  # real tau-bench email
+        ]
+        result = CargoAgent._extract_any_email(facts)
+        self.assertEqual(result, "yusuf.rossi7301@example.com")
+
+    def test_c1_extract_any_email_still_blocks_generic_prefixes(self) -> None:
+        """_extract_any_email must still reject emails whose prefix matches
+        the _PLACEHOLDER_EMAIL_RE pattern (user@, demo@, test@, admin@, etc.).
+
+        Note: _extract_any_email does NOT block emails with a specific-name
+        prefix like alice@example.com — the C1 fix intentionally allows those
+        because tau-bench real users have addresses like yusuf.rossi7301@example.com.
+        Only the generic-prefix RE patterns are blocked."""
+        from src.cargo.cargo_agent import CargoAgent
+        # Clearly generic prefixes — blocked by the prefix RE.
+        for fabricated in ["user@example.com", "customer@example.com",
+                           "demo@example.com", "test@test.com",
+                           "admin@sample.com", "noreply@fake.com"]:
+            result = CargoAgent._extract_any_email([fabricated])
+            self.assertIsNone(
+                result,
+                f"_extract_any_email should reject fabricated email {fabricated!r}",
+            )
+        # Specific-name prefix — NOT blocked (C1: trust db_facts @example.com).
+        self.assertIsNotNone(
+            CargoAgent._extract_any_email(["alice@example.com"]),
+            "_extract_any_email should pass alice@example.com (specific name, C1 fix)",
+        )
+
+    def test_c1_path1_uses_db_facts_email_to_confirm_auth(self) -> None:
+        """After order_id auth, Path 1 must emit find_user_id_by_email with
+        the DB email even when the domain is @example.com."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange the mechanical keyboard in my order"
+        # Auth confirmed via get_order_details → get_user_details; DB email present.
+        wm.db_facts = [
+            "user_id=yusuf_rossi_9620",
+            "email=yusuf.rossi7301@example.com",
+        ]
+        wm.recent_signatures.append("get_user_details(user_id=yusuf_rossi_9620)")
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "find_user_id_by_email")  # type: ignore
+        self.assertEqual(result.args["email"], "yusuf.rossi7301@example.com")  # type: ignore
+
+    def test_c1_user_provided_example_com_email_still_blocked_via_real_email(self) -> None:
+        """If the user provides yusufrossi@example.com (not a generic prefix),
+        _extract_real_email should still block it (domain filter applies to
+        user-provided emails), but _extract_any_email would accept it from db_facts."""
+        from src.cargo.cargo_agent import CargoAgent
+        # _extract_real_email applies domain block → rejects user-provided @example.com
+        self.assertIsNone(
+            CargoAgent._extract_real_email(["yusufrossi@example.com"])
+        )
+        # _extract_any_email accepts it (non-generic prefix)
+        self.assertEqual(
+            CargoAgent._extract_any_email(["yusufrossi@example.com"]),
+            "yusufrossi@example.com",
+        )
+
+    # ------------------------------------------------------------------
+    # C2: product_types values are grounded evidence for arg_grounding gate
+    # ------------------------------------------------------------------
+    def test_c2_product_types_ids_in_all_evidence(self) -> None:
+        """WorkingMemory.all_evidence() must include product_types values
+        so arg_grounding doesn't reject IDs from the durable catalogue."""
+        wm = WorkingMemory()
+        wm.product_types = {"Smart Watch": "6945232052", "T-Shirt": "9523456873"}
+        # db_facts is empty (evicted after a large get_product_details response)
+        wm.db_facts = []
+        evidence = wm.all_evidence()
+        self.assertIn("6945232052", evidence)
+        self.assertIn("9523456873", evidence)
+
+    def test_c2_advance_product_id_passes_arg_grounding(self) -> None:
+        """A product_id resolved from wm.product_types must pass the
+        arg_grounding gate even when db_facts has been evicted."""
+        from src.cargo.gates import check_arg_grounding
+        from src.cargo import ToolEffectSchema
+        wm = WorkingMemory()
+        wm.product_types = {"Smart Watch": "6945232052"}
+        wm.db_facts = []  # evicted
+
+        action = ProposedAction(
+            name="get_product_details",
+            args={"product_id": "6945232052"},
+            declared_class=RiskClass.READ,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="",
+            raw_response="",
+        )
+        schema = ToolEffectSchema(
+            name="get_product_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["product_id"],
+            param_properties={"product_id": {"type": "string"}},
+            required_params=["product_id"],
+        )
+        result = check_arg_grounding(action, schema, wm)
+        self.assertTrue(result.ok, f"arg_grounding should pass; got: {result.reason}")
+
+    # ------------------------------------------------------------------
+    # C3: _finalize_product_count_query fires on FINAL actions too
+    # ------------------------------------------------------------------
+    def test_c3_finalizer_fires_on_model_proposed_final(self) -> None:
+        """_finalize_product_count_query must replace a model-proposed FINAL
+        (which would fail precondition gate) with a deterministic bypass FINAL
+        when product details are already available."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "how many t-shirt options are available in the store"
+        wm.product_details["pid-ts"] = {
+            "name": "T-Shirt",
+            "variants": {
+                "v1": {"available": True},
+                "v2": {"available": True},
+                "v3": {"available": False},
+                "v4": {"available": True},
+            },
+        }
+        model_final = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+            declared_pre=["T-Shirt details fetched"],
+            declared_post=[],
+            informational_intent="answer t-shirt count",
+            raw_thought="",
+            user_text="There are some t-shirt options.",  # vague model answer
+            raw_response="",
+        )
+        result = agent._finalize_product_count_query(model_final, wm)
+        self.assertIsNotNone(result)
+        # Must be a deterministic FINAL with bypass_gates=True
+        self.assertEqual(result.declared_class, RiskClass.FINAL)  # type: ignore
+        self.assertTrue(getattr(result, "bypass_gates", False))  # type: ignore
+        # Must contain the actual count (3 available out of 4)
+        self.assertIn("3", result.user_text)  # type: ignore
+        self.assertIn("T-Shirt", result.user_text)  # type: ignore
+
+    def test_c3_finalizer_does_not_fire_when_data_missing(self) -> None:
+        """Finalizer must NOT fire on a FINAL action if product_details is
+        empty — nothing to count yet."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "how many t-shirt options are available"
+        # product_details is empty
+        model_final = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="I don't know.",
+            raw_response="",
+        )
+        result = agent._finalize_product_count_query(model_final, wm)
+        self.assertIsNone(result)
+
+    def test_c3_finalizer_does_not_fire_for_non_count_goal_final(self) -> None:
+        """Finalizer must NOT fire on FINAL if goal is not a 'how many' query."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange my thermostat for one compatible with Google Home"
+        wm.product_details["pid-st"] = {
+            "name": "Smart Thermostat",
+            "variants": {"v1": {"available": True}},
+        }
+        model_final = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+            declared_pre=[],
+            declared_post=[],
+            informational_intent="",
+            raw_thought="",
+            user_text="Let me check the thermostat options.",
+            raw_response="",
+        )
+        result = agent._finalize_product_count_query(model_final, wm)
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # C4: auth question leads with name+zip, not email
+    # ------------------------------------------------------------------
+    def test_c4_auth_question_mentions_name_and_zip_first(self) -> None:
+        """The default auth question must ask for name + ZIP before email.
+
+        Asking for 'email address' first triggers refusals from privacy-
+        sensitive user simulations; tau-bench users readily provide name+zip.
+        """
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "update my pending order"
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declared_class, RiskClass.ASK_USER)  # type: ignore
+        user_text = (result.user_text or "").lower()  # type: ignore
+        # "name" must appear before "email" in the question
+        name_pos = user_text.find("name")
+        email_pos = user_text.find("email")
+        self.assertGreater(name_pos, -1, "auth question must mention 'name'")
+        self.assertGreater(
+            email_pos,
+            name_pos,
+            "auth question must ask for name before email (name+zip first)",
+        )
+
+    def test_c4_auth_question_still_mentions_zip(self) -> None:
+        """Auth question must also ask for ZIP code."""
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "cancel my most recent order"
+        action = self._placeholder_action()
+        result = agent._auth_override(action, wm)
+        self.assertIsNotNone(result)
+        user_text = (result.user_text or "").lower()  # type: ignore
+        self.assertIn("zip", user_text)
+
+
+# ---------------------------------------------------------------------------
 # Tau-bench import sanity (skipped when tau_bench is not installed)
 # ---------------------------------------------------------------------------
 class TestTauBenchIntegrationOptional(unittest.TestCase):
