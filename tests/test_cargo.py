@@ -3045,6 +3045,50 @@ class TestTrajectory24Regressions(unittest.TestCase):
         self.assertIn("yusuf_rossi_9620", ev)
         self.assertIn("yusuf.rossi7301@example.com", ev)
 
+    def test_d1_durable_caches_are_gate_evidence(self) -> None:
+        """Preconditions must see order/product caches, not just db_facts LRU."""
+        wm = WorkingMemory()
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "credit_card_9513926"}],
+            "items": [{"item_id": "1151293680", "product_id": "1656367028"}],
+        }
+        wm.product_details["1656367028"] = {
+            "product_id": "1656367028",
+            "variants": {
+                "7706410293": {
+                    "item_id": "7706410293",
+                    "available": True,
+                    "options": {"switch type": "clicky"},
+                }
+            },
+        }
+        for i in range(80):
+            wm._add_db_fact(f"evict_{i}=x")
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={
+                "order_id": "#W2378156",
+                "item_ids": ["1151293680"],
+                "new_item_ids": ["7706410293"],
+                "payment_method_id": "credit_card_9513926",
+            },
+            declared_class=RiskClass.WRITE,
+            declared_pre=[
+                "order #W2378156 delivered",
+                "item 1151293680 exists",
+                "item 7706410293 exists",
+            ],
+        )
+        schema = ToolEffectSchema(
+            name="exchange_delivered_order_items",
+            cls=RiskClass.WRITE,
+            required_params=["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+        )
+        result = check_preconditions(action, schema, wm)
+        self.assertTrue(result.ok, result.reason)
+
     def test_d1_render_compact_shows_confirmed_identity(self) -> None:
         """render_compact() must surface confirmed_user_id and confirmed_email
         so the proposer MODEL always sees them, not relying on db_facts."""
@@ -3702,6 +3746,7 @@ class TestTrajectory24Regressions(unittest.TestCase):
         result = agent._finalize_product_count_query(action, wm)
         self.assertIsNotNone(result)
         self.assertEqual(result.declared_class, RiskClass.ASK_USER)
+        self.assertEqual(result.declared_pre, [])
         self.assertTrue(wm.product_count_finalized)
 
     def test_f5_completed_mutation_gate_blocks_reexecution(self) -> None:
@@ -3728,6 +3773,123 @@ class TestTrajectory24Regressions(unittest.TestCase):
         self.assertIsNotNone(failing)
         self.assertEqual(failing.gate, "completed_task")
         self.assertIn("completed_task", diag["gates_failed"])
+
+    def test_g1_exchange_constraints_are_hard_filters(self) -> None:
+        agent = self._make_agent()
+        details = {
+            "name": "Mechanical Keyboard",
+            "variants": {
+                "partial": {
+                    "item_id": "partial",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "RGB", "size": "80%"},
+                },
+                "fallback": {
+                    "item_id": "fallback",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "none", "size": "full size"},
+                },
+            },
+        }
+        old = {
+            "item_id": "old",
+            "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+        }
+        chosen = agent._select_variant_id(
+            details,
+            old,
+            "clicky, RGB backlight, full size; if unavailable go for no backlight",
+            mode="exchange",
+        )
+        self.assertEqual(chosen, "fallback")
+
+    def test_g2_exchange_rejects_decoy_when_constraint_missing(self) -> None:
+        agent = self._make_agent()
+        details = {
+            "variants": {
+                "decoy": {
+                    "item_id": "decoy",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "RGB", "size": "80%"},
+                }
+            }
+        }
+        old = {
+            "item_id": "old",
+            "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+        }
+        chosen = agent._select_variant_id(
+            details,
+            old,
+            "clicky, RGB backlight, full size",
+            mode="exchange",
+        )
+        self.assertIsNone(chosen)
+
+    def test_g3_modify_does_not_rewrite_satisfied_item(self) -> None:
+        agent = self._make_agent()
+        details = {
+            "variants": {
+                "target": {
+                    "item_id": "target",
+                    "available": True,
+                    "options": {"color": "purple", "size": "S", "material": "polyester", "style": "v-neck"},
+                },
+                "other": {
+                    "item_id": "other",
+                    "available": True,
+                    "options": {"color": "purple", "size": "S", "material": "polyester", "style": "v-neck"},
+                },
+            }
+        }
+        old = {
+            "item_id": "target",
+            "options": {"color": "purple", "size": "S", "material": "polyester", "style": "v-neck"},
+        }
+        self.assertIsNone(
+            agent._select_variant_id(
+                details,
+                old,
+                "purple, same size, same v-neck, prefer polyester",
+                mode="modify",
+            )
+        )
+
+    def test_g4_distinct_multi_order_mutation_can_continue(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "modify all pending tshirts to purple, s size, same v-neck, prefer polyester"
+        wm.auth_user_id = "u"
+        for oid, item_id in (("#W1", "old1"), ("#W2", "old2")):
+            wm.order_details[oid] = {
+                "order_id": oid,
+                "status": "pending",
+                "payment_history": [{"payment_method_id": "pm"}],
+                "items": [{
+                    "name": "T-Shirt",
+                    "product_id": "ts",
+                    "item_id": item_id,
+                    "options": {"color": "blue", "size": "S", "material": "cotton", "style": "v-neck"},
+                }],
+            }
+        wm.product_details["ts"] = {
+            "name": "T-Shirt",
+            "variants": {
+                "target": {
+                    "item_id": "target",
+                    "available": True,
+                    "options": {"color": "purple", "size": "S", "material": "polyester", "style": "v-neck"},
+                }
+            },
+        }
+        first = agent._grounded_retail_commit_action(wm)
+        self.assertIsNotNone(first)
+        self.assertEqual(first.args["order_id"], "#W1")
+        wm.record_action_signature(first.signature())
+        wm.record_executed_mutation(first.signature())
+        second = agent._grounded_retail_commit_action(wm)
+        self.assertIsNotNone(second)
+        self.assertEqual(second.args["order_id"], "#W2")
 
 
 # ---------------------------------------------------------------------------
