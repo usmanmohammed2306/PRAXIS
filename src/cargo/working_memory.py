@@ -30,6 +30,9 @@ class WorkingMemory:
     last_error: str = ""
     budget_steps: int = 30
     recent_signatures: Deque[str] = field(default_factory=lambda: deque(maxlen=_RECENT_WINDOW))
+    failed_signatures: Dict[str, int] = field(default_factory=dict)
+    evidence_version: int = 0
+    typed_values: Dict[str, List[str]] = field(default_factory=dict)
     # Auth-loop guard: how many times we've already asked the user for identity
     # credentials.  The override stops asking after 2 attempts to avoid an
     # infinite ASK_USER bounce.
@@ -95,13 +98,18 @@ class WorkingMemory:
         clean = text.strip()
         if not clean:
             return
+        changed = False
         if clean not in self.user_facts:
             self.user_facts.append(clean)
+            changed = True
         # Extract atomic candidate values (proper nouns, IDs, emails) as
         # individual fact lines so arg-grounding has fine-grained anchors.
         for tok in _extract_id_tokens(clean):
             if tok not in self.user_facts:
                 self.user_facts.append(tok)
+                changed = True
+        if changed:
+            self.evidence_version += 1
 
     def absorb_observation(self, obs: Any) -> None:
         """Promote scalar key/value pairs in a tool observation to db_facts."""
@@ -124,6 +132,7 @@ class WorkingMemory:
         for k, v in d.items():
             kpath = f"{prefix}.{k}" if prefix else str(k)
             if isinstance(v, (str, int, float)) and v not in (None, ""):
+                self._add_typed_value(kpath, v)
                 self._add_db_fact(f"{kpath}={v}")
                 # Also store the value alone (helps arg-grounding substring).
                 if isinstance(v, str) and v.strip():
@@ -135,6 +144,7 @@ class WorkingMemory:
                     if isinstance(item, dict):
                         self._absorb_dict(item, prefix=f"{kpath}[{i}]")
                     elif isinstance(item, (str, int, float)) and item not in (None, ""):
+                        self._add_typed_value(kpath, item)
                         self._add_db_fact(f"{kpath}[{i}]={item}")
 
     def _add_db_fact(self, fact: str) -> None:
@@ -144,14 +154,45 @@ class WorkingMemory:
         if fact in self.db_facts:
             return
         self.db_facts.append(fact)
+        self.evidence_version += 1
         # Hard cap: keep only the 48 most-recent facts.  Older facts are the
         # ones least likely to be needed for the current gate or proposer call.
         if len(self.db_facts) > 48:
             self.db_facts = self.db_facts[-48:]
 
+    def _add_typed_value(self, key_path: str, value: Any) -> None:
+        val = str(value).strip()
+        if not val:
+            return
+        keys = _typed_keys_for_path(key_path, val)
+        for key in keys:
+            bucket = self.typed_values.setdefault(key, [])
+            if val not in bucket:
+                bucket.append(val)
+                if len(bucket) > 64:
+                    del bucket[:-64]
+
     def record_action_signature(self, sig: str) -> None:
         if sig:
             self.recent_signatures.append(sig)
+
+    def record_failed_signature(self, sig: str) -> None:
+        """Remember a failed proposal until new evidence arrives.
+
+        A retry is useful only after the state changes or the action changes.
+        Tying failed signatures to ``evidence_version`` prevents loops on the
+        exact same rejected action while still allowing the same action after a
+        new tool observation or user reply grounds it.
+        """
+        if sig:
+            self.failed_signatures[sig] = self.evidence_version
+            if len(self.failed_signatures) > 64:
+                stale = list(self.failed_signatures.keys())[:-64]
+                for k in stale:
+                    self.failed_signatures.pop(k, None)
+
+    def failed_without_new_evidence(self, sig: str) -> bool:
+        return bool(sig and self.failed_signatures.get(sig) == self.evidence_version)
 
     # ------------------------------------------------------------------
     # Queries used by gates
@@ -182,6 +223,50 @@ class WorkingMemory:
         if extras:
             return base + "\n" + "\n".join(extras)
         return base
+
+    def typed_evidence_for(self, field_name: str) -> List[str]:
+        """Return grounded values known for a specific ID-like argument field."""
+        key = _normalize_typed_key(field_name)
+        vals: List[str] = []
+
+        def add(v: Any) -> None:
+            sv = str(v).strip()
+            if sv and sv not in vals:
+                vals.append(sv)
+
+        for v in self.typed_values.get(key, []):
+            add(v)
+        if key == "product_id":
+            for v in self.product_types.values():
+                add(v)
+            for details in self.order_details.values():
+                if isinstance(details, dict):
+                    for item in details.get("items") or []:
+                        if isinstance(item, dict):
+                            add(item.get("product_id"))
+        elif key == "item_id":
+            for details in self.product_details.values():
+                if isinstance(details, dict):
+                    variants = details.get("variants") or {}
+                    if isinstance(variants, dict):
+                        for variant_id, variant in variants.items():
+                            add(variant_id)
+                            if isinstance(variant, dict):
+                                add(variant.get("item_id"))
+            for details in self.order_details.values():
+                if isinstance(details, dict):
+                    for item in details.get("items") or []:
+                        if isinstance(item, dict):
+                            add(item.get("item_id"))
+        elif key == "user_id":
+            add(self.auth_user_id)
+        elif key == "email":
+            add(self.auth_email)
+        elif key == "order_id":
+            for details in self.order_details.values():
+                if isinstance(details, dict):
+                    add(details.get("order_id"))
+        return vals
 
     def render_compact(self, max_chars: int = 800) -> str:
         """Compact NL render used in the proposer prompt.
@@ -238,6 +323,48 @@ _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 # tau-bench retail order IDs: "#W" + digits, with or without the leading #.
 # We capture both forms so arg_grounding accepts either.
 _ORDER_ID_LOOSE_RE = re.compile(r"#?[Ww](\d{5,10})")
+
+_TYPED_ID_KEYS = {
+    "account_id", "booking_id", "customer_id", "email", "flight_id",
+    "item_id", "order_id", "payment_id", "payment_method_id",
+    "product_id", "reservation_id", "session_id", "ticket_id", "user_id",
+}
+
+
+def _normalize_typed_key(field_name: str) -> str:
+    key = str(field_name or "").strip().lower()
+    key = re.sub(r"\[\d+\]", "", key)
+    key = key.split(".")[-1]
+    if key in ("item_ids", "new_item_ids"):
+        return "item_id"
+    if key.endswith("_ids"):
+        return key[:-1]
+    if key.endswith("ids") and len(key) > 3:
+        return key[:-1]
+    return key
+
+
+def _typed_keys_for_path(key_path: str, value: str) -> List[str]:
+    key = _normalize_typed_key(key_path)
+    out: List[str] = []
+    if key in _TYPED_ID_KEYS:
+        out.append(key)
+    # tau retail stores a user's order list under "orders"; those values are
+    # order IDs even though the key is plural and not an argument name.
+    if key == "orders" and _ORDER_ID_LOOSE_RE.fullmatch(value):
+        out.append("order_id")
+    if key in ("payment_methods", "payment_history") and value:
+        out.append("payment_method_id")
+    # Preserve alternate order-id spellings for grounding after normalization.
+    if "order_id" in out:
+        m = _ORDER_ID_LOOSE_RE.fullmatch(value)
+        if m:
+            out.extend(["order_id"])
+    dedup: List[str] = []
+    for item in out:
+        if item not in dedup:
+            dedup.append(item)
+    return dedup
 
 
 def _extract_id_tokens(s: str) -> List[str]:

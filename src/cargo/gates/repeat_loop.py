@@ -25,6 +25,12 @@ def check_repeat_loop(
             "repeated_action_signature",
             signature=sig,
         )
+    if wm.failed_without_new_evidence(sig):
+        return GateResult.failing(
+            "repeat_loop",
+            "repeated_failed_action_without_new_evidence",
+            signature=sig,
+        )
     return GateResult.passing("repeat_loop", signature=sig)
 
 

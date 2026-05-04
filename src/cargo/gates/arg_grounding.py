@@ -8,7 +8,7 @@ mutates against it. Cost: zero LLM calls.
 from __future__ import annotations
 
 import re
-from typing import Iterable, List
+from typing import Any, Iterable, List, Tuple
 
 from ..schemas import GateResult, ProposedAction, ToolEffectSchema
 from ..working_memory import WorkingMemory
@@ -39,6 +39,27 @@ def _grounded_in_evidence(value: str, evidence: str) -> bool:
     return value in evidence
 
 
+def _field_key(path: str) -> str:
+    key = str(path or "").split(".")[-1]
+    key = key.split("[")[0]
+    return key
+
+
+def _iter_arg_values(name: str, value: Any) -> Iterable[Tuple[str, str]]:
+    """Yield scalar argument values with their logical argument path."""
+    if value is None:
+        return
+    if isinstance(value, list):
+        for i, item in enumerate(value):
+            yield from _iter_arg_values(f"{name}[{i}]", item)
+        return
+    if isinstance(value, dict):
+        for k, item in value.items():
+            yield from _iter_arg_values(f"{name}.{k}", item)
+        return
+    yield name, value if isinstance(value, str) else str(value)
+
+
 def check_arg_grounding(
     action: ProposedAction,
     schema: ToolEffectSchema,
@@ -60,13 +81,18 @@ def check_arg_grounding(
     id_fields = list(schema.arg_id_fields or [])
 
     for k, v in action.args.items():
-        if v is None:
-            continue
-        v_str = v if isinstance(v, str) else str(v)
-        forced_id = k in id_fields
-        if forced_id or _looks_like_id(v_str):
+        for path, v_str in _iter_arg_values(k, v):
+            base = _field_key(path)
+            forced_id = k in id_fields or base in id_fields
+            typed_values = wm.typed_evidence_for(base) if forced_id else []
+            if typed_values:
+                if v_str not in typed_values:
+                    ungrounded.append(f"{path}={v_str}")
+                continue
+            if not (forced_id or _looks_like_id(v_str)):
+                continue
             if not _grounded_in_evidence(v_str, full_evidence):
-                ungrounded.append(f"{k}={v_str}")
+                ungrounded.append(f"{path}={v_str}")
 
     if ungrounded:
         return GateResult.failing(
