@@ -415,6 +415,27 @@ class CargoAgent(Agent):  # type: ignore[misc]
             diag["gates_failed"].append("repeat_loop")
             return rl, diag
 
+        # Successful writes are single-shot.  This check is durable across the
+        # whole task, not just the rolling repeat window.
+        if action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE):
+            sig = action.signature()
+            if wm.mutation_already_executed(sig) or wm.task_completed:
+                done_gate = GateResult.failing(
+                    "completed_task",
+                    "state_change_already_executed",
+                    signature=sig,
+                )
+                diag["gates_run"].append("completed_task")
+                diag["gates_failed"].append("completed_task")
+                stats.record_gate(done_gate)
+                return done_gate, diag
+            confirm_gate = self._check_write_confirmation(action, wm)
+            diag["gates_run"].append("confirmation")
+            stats.record_gate(confirm_gate)
+            if not confirm_gate.ok:
+                diag["gates_failed"].append("confirmation")
+                return confirm_gate, diag
+
         if not is_gated(action.declared_class):
             # Even on the fast path, run arg_grounding so hallucinated
             # placeholder values (e.g. "user@example.com") are caught before
@@ -521,6 +542,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
         MAX_CONSEC_PARSE_FAIL = 3
 
         for step in range(max_num_steps):
+            if wm.task_completed:
+                break
             wm.budget_steps = max_num_steps - step
             stats.steps_total += 1
 
@@ -676,6 +699,27 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     })
                     action = progress_action
 
+            # Final write discipline: any model-proposed mutation that can be
+            # assembled deterministically from grounded state is replaced with
+            # the canonical best action before gates/execute.  This prevents
+            # "try a write, then fix it later" behavior.
+            if action is not None:
+                write_action = self._canonicalize_write_action(action, wm)
+                if write_action is not None:
+                    raw_text = json.dumps({
+                        "thought": write_action.raw_thought,
+                        "action": {
+                            "name": write_action.name,
+                            "args": write_action.args,
+                            "declared_class": write_action.declared_class.value,
+                            "declared_pre": write_action.declared_pre,
+                            "declared_post": write_action.declared_post,
+                            "informational_intent": write_action.informational_intent,
+                            "user_text": write_action.user_text,
+                        },
+                    })
+                    action = write_action
+
             messages.append({"role": "assistant", "content": raw_text or ""})
 
             if action is None:
@@ -828,6 +872,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 if wm.consecutive_same_final >= 2 and action.declared_class == RiskClass.FINAL:
                     # Already said this exact FINAL.  Terminate to avoid wasting
                     # the step budget on a frozen trajectory.
+                    wm.task_completed = True
                     step_record["terminated"] = "consecutive_final"
                     stats.record_step(step_record)
                     break
@@ -865,6 +910,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 stats.executed_by_class[cls] = stats.executed_by_class.get(cls, 0) + 1
                 step_record["executed"] = True
                 stats.record_step(step_record)
+                if action.declared_class == RiskClass.FINAL:
+                    wm.task_completed = True
+                    break
                 if done:
                     break
                 continue
@@ -1021,6 +1069,16 @@ class CargoAgent(Agent):  # type: ignore[misc]
                             wm.order_details[oid] = od
                 except Exception:
                     pass
+            # Successful retail mutations also return an order-shaped object.
+            # Promote it into the order cache so stale "delivered"/"pending"
+            # state cannot drive another write after the world has changed.
+            if action.name != "get_order_details" and tool_obs:
+                try:
+                    od = json.loads(tool_obs) if tool_obs.lstrip().startswith("{") else None
+                    if isinstance(od, dict) and od.get("order_id"):
+                        wm.order_details[str(od.get("order_id"))] = od
+                except Exception:
+                    pass
             # Post-condition check (advisory).
             try:
                 post_obs = json.loads(tool_obs) if tool_obs.strip().startswith(("{", "[")) else tool_obs
@@ -1040,6 +1098,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
             stats.executed_by_class[cls] = stats.executed_by_class.get(cls, 0) + 1
             step_record["executed"] = True
             stats.record_step(step_record)
+            if (
+                action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE)
+                and pc.ok
+            ):
+                wm.record_executed_mutation(action.signature())
+                wm.lock_phase("mutation")
+                wm.task_completed = True
+                break
             if done:
                 break
 
@@ -2356,10 +2422,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     )
                 wm.product_count_finalized = True
                 wm.lock_phase("product_count")
+                final_cls = (
+                    RiskClass.ASK_USER
+                    if self._is_account_order_goal(wm)
+                    else RiskClass.FINAL
+                )
                 return ProposedAction(
                     name=RESPOND_TOOL_NAME,
                     args={},
-                    declared_class=RiskClass.FINAL,
+                    declared_class=final_cls,
                     declared_pre=[f"{len(fetched_names)} products fetched"],
                     declared_post=["counts answered"],
                     informational_intent=f"answer count for {', '.join(fetched_names)}",
@@ -2408,10 +2479,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     )
                 wm.product_count_finalized = True
                 wm.lock_phase("product_count")
+                final_cls = (
+                    RiskClass.ASK_USER
+                    if self._is_account_order_goal(wm)
+                    else RiskClass.FINAL
+                )
                 return ProposedAction(
                     name=RESPOND_TOOL_NAME,
                     args={},
-                    declared_class=RiskClass.FINAL,
+                    declared_class=final_cls,
                     declared_pre=[f"{name} details fetched"],
                     declared_post=["count answered"],
                     informational_intent=f"answer count for {name}",
@@ -2428,6 +2504,66 @@ class CargoAgent(Agent):  # type: ignore[misc]
     # ------------------------------------------------------------------
     # Grounded task progress / commit layer
     # ------------------------------------------------------------------
+    def _check_write_confirmation(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        """Require explicit user intent before any state-changing action.
+
+        In tau-bench the initial instruction is itself a user instruction
+        ("You want to return...", "wish to exchange...").  We treat direct
+        action requests and later "yes / confirm / go ahead" replies as
+        confirmation, but not mere retrieved DB facts or model assumptions.
+        """
+        text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        if re.search(r"\b(yes|confirm|confirmed|go ahead|proceed|do it|please do|sounds good)\b", text):
+            return GateResult.passing("confirmation")
+        name = action.name.lower()
+        verb_groups = {
+            "exchange": ("exchange", "exchanging", "swap", "replace"),
+            "return": ("return", "refund"),
+            "modify": ("modify", "change", "update", "adjust"),
+            "cancel": ("cancel",),
+            "update": ("update", "change", "modify", "set"),
+        }
+        for group, verbs in verb_groups.items():
+            if group in name and any(re.search(rf"\b{re.escape(v)}\b", text) for v in verbs):
+                return GateResult.passing("confirmation")
+        return GateResult.failing(
+            "confirmation",
+            "missing_explicit_user_confirmation_for_write",
+        )
+
+    def _canonicalize_write_action(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """Replace retail WRITE proposals with the canonical grounded commit.
+
+        This keeps the proposer from executing a plausible but non-best
+        mutation when the controller can already compute the correct option
+        from order/product state.  If the proposed action already matches the
+        canonical signature, return None.
+        """
+        if action.name not in {
+            "exchange_delivered_order_items",
+            "return_delivered_order_items",
+            "modify_pending_order_items",
+        }:
+            return None
+        canonical = self._grounded_retail_commit_action(wm)
+        if canonical is None or canonical.name != action.name:
+            return None
+        if canonical.signature() == action.signature():
+            return None
+        canonical.raw_thought = (
+            "Write canonicalizer: replacing proposed mutation with the best "
+            "grounded action assembled from current state."
+        )
+        return canonical
+
     def _has_tool(self, name: str) -> bool:
         schemas = getattr(self, "schemas", None) or {}
         return (not schemas) or name in schemas
@@ -2507,8 +2643,6 @@ class CargoAgent(Agent):  # type: ignore[misc]
         """
         if not self._is_account_order_goal(wm):
             return None
-        if self._goal_has_count_query(wm) and not wm.product_count_finalized:
-            return None
 
         user_id = self._existing_user_id(wm)
         if not user_id:
@@ -2543,6 +2677,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     user_text="",
                     raw_response="",
                 ), wm)
+            return None
+        if self._goal_has_count_query(wm) and not wm.product_count_finalized:
             return None
         wm.auth_user_id = user_id
         wm.lock_phase("auth")
@@ -2686,7 +2822,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 declared_class=self._risk_for_tool(
                     "return_delivered_order_items", RiskClass.IRREVERSIBLE
                 ),
-                declared_pre=["delivered order and item ids grounded"],
+                declared_pre=[
+                    f"order {str(order.get('order_id') or order_id)} delivered",
+                    f"item {item_ids[0]} exists",
+                ],
                 declared_post=["delivered items returned"],
                 informational_intent="return grounded delivered items",
                 raw_thought="Commit trigger: all return slots are grounded from order details.",
@@ -2742,7 +2881,11 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 declared_class=self._risk_for_tool(
                     "exchange_delivered_order_items", RiskClass.WRITE
                 ),
-                declared_pre=["delivered order and replacement ids grounded"],
+                declared_pre=[
+                    f"order {str(order.get('order_id') or order_id)} delivered",
+                    f"item {old_ids[0]} exists",
+                    f"item {new_ids[0]} exists",
+                ],
                 declared_post=["delivered items exchanged"],
                 informational_intent="exchange grounded delivered items",
                 raw_thought="Commit trigger: exchange slots are grounded from order and variant details.",
@@ -2800,7 +2943,11 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 declared_class=self._risk_for_tool(
                     "modify_pending_order_items", RiskClass.WRITE
                 ),
-                declared_pre=["pending order and replacement ids grounded"],
+                declared_pre=[
+                    f"order {str(order.get('order_id') or order_id)} pending",
+                    f"item {item_ids[0]} exists",
+                    f"item {new_ids[0]} exists",
+                ],
                 declared_post=["pending items modified"],
                 informational_intent="modify grounded pending items",
                 raw_thought="Commit trigger: pending-order modify slots are grounded.",

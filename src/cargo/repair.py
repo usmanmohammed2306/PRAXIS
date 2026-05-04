@@ -109,6 +109,21 @@ def decide(
             )
         return RepairDecision(action="RETRY", critique=f"Pre-conditions not met: {reason}")
 
+    if gate == "confirmation":
+        return RepairDecision(
+            action="ASK_USER",
+            user_message=(
+                "Before I make that change, please confirm that you want me "
+                "to proceed with the requested update."
+            ),
+        )
+
+    if gate == "completed_task":
+        return RepairDecision(
+            action="FINALIZE_GENERIC",
+            user_message="The requested change has already been completed.",
+        )
+
     # Self-consistency / counterfactual failures → re-prompt with critique.
     if gate in ("self_consistency", "counterfactual"):
         crit = (
