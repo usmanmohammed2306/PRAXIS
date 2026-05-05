@@ -22,6 +22,12 @@ _ID_PATTERNS = [
     re.compile(r"^[a-z]+_[a-z]+_\d{1,8}$"),           # alex_smith_42
     re.compile(r"^[\w.+\-]+@[\w\-.]+\.[A-Za-z]{2,}$"),  # email
 ]
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIME_RE = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$")
+_DATE_FIELD_NAMES = {
+    "date", "dob", "birth_date", "departure_date", "arrival_date",
+    "scheduled_departure_date", "scheduled_arrival_date",
+}
 
 
 def _looks_like_id(value: str) -> bool:
@@ -29,6 +35,11 @@ def _looks_like_id(value: str) -> bool:
         return False
     v = value.strip()
     if len(v) < 3 or len(v) > 80:
+        return False
+    # Dates and times are grounded semantic literals, not opaque IDs.  Treating
+    # ISO dates as IDs blocked valid airline flight searches such as
+    # search_direct_flight(date="2024-05-20").
+    if _ISO_DATE_RE.fullmatch(v) or _TIME_RE.fullmatch(v):
         return False
     return any(p.match(v) for p in _ID_PATTERNS)
 
@@ -43,6 +54,11 @@ def _field_key(path: str) -> str:
     key = str(path or "").split(".")[-1]
     key = key.split("[")[0]
     return key
+
+
+def _is_semantic_literal_field(path: str) -> bool:
+    base = _field_key(path).strip().lower()
+    return base in _DATE_FIELD_NAMES or base.endswith("_date") or base.endswith("_time")
 
 
 def _iter_arg_values(name: str, value: Any) -> Iterable[Tuple[str, str]]:
@@ -88,6 +104,8 @@ def check_arg_grounding(
             if typed_values:
                 if v_str not in typed_values:
                     ungrounded.append(f"{path}={v_str}")
+                continue
+            if not forced_id and _is_semantic_literal_field(path):
                 continue
             if not (forced_id or _looks_like_id(v_str)):
                 continue

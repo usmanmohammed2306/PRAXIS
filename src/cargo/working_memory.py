@@ -90,6 +90,10 @@ class WorkingMemory:
     # loop when ``get_order_details`` returns.  Used by downstream tooling
     # to look up items in the order without re-fetching.
     order_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Durable profile / reservation caches for airline-style domains.  These
+    # prevent state loss after large observations evict prompt-facing db_facts.
+    user_profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    reservation_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Track the last respond/FINAL message we emitted so the controller can
     # detect a "same FINAL on every step" infinite loop and break out.
     last_final_text: str = ""
@@ -271,6 +275,10 @@ class WorkingMemory:
             extras.append(self.auth_email)
         for order in self.order_details.values():
             extras.extend(_flatten_scalar_facts(order))
+        for profile in self.user_profiles.values():
+            extras.extend(_flatten_scalar_facts(profile))
+        for reservation in self.reservation_details.values():
+            extras.extend(_flatten_scalar_facts(reservation))
         for details in self.product_details.values():
             extras.extend(_flatten_scalar_facts(details))
         if extras:
@@ -319,6 +327,15 @@ class WorkingMemory:
             for details in self.order_details.values():
                 if isinstance(details, dict):
                     add(details.get("order_id"))
+        elif key == "reservation_id":
+            for profile in self.user_profiles.values():
+                if isinstance(profile, dict):
+                    for rid in profile.get("reservations") or []:
+                        add(rid)
+            for details in self.reservation_details.values():
+                if isinstance(details, dict):
+                    add(details.get("reservation_id"))
+                    add(details.get("reservation_number"))
         return vals
 
     def render_compact(self, max_chars: int = 800) -> str:
@@ -360,6 +377,10 @@ class WorkingMemory:
             parts.append("task_completed: true")
         if self.order_details:
             parts.append(f"orders_cached: {len(self.order_details)}")
+        if self.user_profiles:
+            parts.append(f"user_profiles_cached: {len(self.user_profiles)}")
+        if self.reservation_details:
+            parts.append(f"reservations_cached: {len(self.reservation_details)}")
         parts += [
             "user_facts:",
             *(f"  {f[:90]}" for f in trim(self.user_facts, 5)),
@@ -420,6 +441,9 @@ def _typed_keys_for_path(key_path: str, value: str) -> List[str]:
     # order IDs even though the key is plural and not an argument name.
     if key == "orders" and _ORDER_ID_LOOSE_RE.fullmatch(value):
         out.append("order_id")
+    # tau airline stores a user's reservation list under "reservations".
+    if key in ("reservations", "reservation_numbers") and _RESERVATION_ID_RE.fullmatch(value):
+        out.append("reservation_id")
     if key in ("payment_methods", "payment_history") and value:
         out.append("payment_method_id")
     # Preserve alternate order-id spellings for grounding after normalization.

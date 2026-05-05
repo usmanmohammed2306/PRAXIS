@@ -509,6 +509,28 @@ class TestArgGroundingGate(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("new_item_ids[0]=made_up_item", result.reason)
 
+    def test_iso_date_argument_is_not_treated_as_opaque_id(self) -> None:
+        wm = WorkingMemory()
+        schema = ToolEffectSchema(
+            name="search_direct_flight",
+            cls=RiskClass.READ,
+            arg_id_fields=[],
+            required_params=["origin", "destination", "date"],
+        )
+        action = ProposedAction(
+            name="search_direct_flight",
+            args={
+                "origin": "New York",
+                "destination": "Seattle",
+                "date": "2024-05-20",
+            },
+            declared_class=RiskClass.READ,
+        )
+
+        result = check_arg_grounding(action, schema, wm)
+
+        self.assertTrue(result.ok, result.reason)
+
 
 class TestRepeatLoopGate(unittest.TestCase):
     def test_repeat_signature_detected(self) -> None:
@@ -1962,6 +1984,13 @@ class TestTrajectory19Regressions(unittest.TestCase):
 
         self.assertIn("Z7GOZK", wm.typed_evidence_for("reservation_id"))
 
+    def test_profile_reservation_list_is_bound_to_typed_state(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_observation({"reservations": ["Z7GOZK", "K67C4W"]})
+
+        self.assertIn("Z7GOZK", wm.typed_evidence_for("reservation_id"))
+        self.assertIn("K67C4W", wm.typed_evidence_for("reservation_id"))
+
     def test_grounded_placeholder_resolver_uses_user_provided_id(self) -> None:
         agent = self._make_agent()
         wm = WorkingMemory()
@@ -2010,6 +2039,26 @@ class TestTrajectory19Regressions(unittest.TestCase):
         gate = check_arg_grounding(resolved, schema, wm)  # type: ignore[arg-type]
 
         self.assertTrue(gate.ok, gate.reason)
+
+    def test_airline_profile_repetition_advances_to_reservation_scan(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "change my return flight reservation"
+        wm.user_profiles["olivia_gonzalez_2305"] = {
+            "reservations": ["Z7GOZK", "K67C4W"],
+        }
+        wm.absorb_observation({"reservations": ["Z7GOZK", "K67C4W"]})
+        repeated = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "olivia_gonzalez_2305"},
+            declared_class=RiskClass.READ,
+        )
+
+        result = agent._advance_reservation_retrieval(repeated, wm)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_reservation_details")  # type: ignore[union-attr]
+        self.assertEqual(result.args["reservation_id"], "Z7GOZK")  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
     # Bug B: "exchange items in my recent order" routed to product flow
@@ -4086,6 +4135,110 @@ class TestTrajectory24Regressions(unittest.TestCase):
         failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
         self.assertIsNone(failing, failing.reason if failing else "")
         self.assertIn("final_completeness", diag["gates_run"])
+
+    def test_h5_final_with_followup_user_reply_does_not_terminate_solve(self) -> None:
+        import src.cargo.cargo_agent as cargo_agent_module
+
+        class _SolveResult:
+            def __init__(self, reward: float, info: Dict[str, Any],
+                         messages: List[Dict[str, Any]], total_cost: float) -> None:
+                self.reward = reward
+                self.info = info
+                self.messages = messages
+                self.total_cost = total_cost
+
+        scripts = [
+            _proposer_json(
+                name="respond",
+                declared_class="FINAL",
+                user_text="There are 10 available options.",
+            ),
+            [_proposer_json(
+                name="respond",
+                declared_class="FINAL",
+                user_text="There are 10 available options.",
+            )] * 3,
+            json.dumps({"predicted_obs": "ok", "goal_still_reachable": True}),
+            _proposer_json(
+                name="get_status",
+                args={"ticket_id": "T1234"},
+                declared_class="READ",
+            ),
+        ]
+        agent = self._make_agent()
+        agent.client = MockClient(scripts=scripts)
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.wiki = ""
+        agent.schemas = {
+            "respond": ToolEffectSchema(name="respond", cls=RiskClass.FINAL),
+            "get_status": ToolEffectSchema(
+                name="get_status",
+                cls=RiskClass.READ,
+                arg_id_fields=["ticket_id"],
+                required_params=["ticket_id"],
+            ),
+        }
+        agent.calibration = default_calibration()
+
+        env = MockEnv(
+            "How many options are available?",
+            [
+                _StepResp("Also check ticket T1234.", reward=0.0, done=False),
+                _StepResp({"ticket_id": "T1234", "status": "ok"}, reward=1.0, done=True),
+            ],
+        )
+        old_action = cargo_agent_module.Action
+        old_solve_result = cargo_agent_module.SolveResult
+        cargo_agent_module.Action = _Action
+        cargo_agent_module.SolveResult = _SolveResult
+        try:
+            result = agent.solve(env, max_num_steps=4)
+        finally:
+            cargo_agent_module.Action = old_action
+            cargo_agent_module.SolveResult = old_solve_result
+
+        self.assertEqual([a.name for a in env.actions_executed], ["respond", "get_status"])
+        self.assertEqual(result.reward, 1.0)
+
+    def test_h6_exchange_without_target_options_asks_instead_of_guessing(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange the mechanical keyboard in order #W1"
+        wm.order_details["#W1"] = {
+            "order_id": "#W1",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "credit_card_1"}],
+            "items": [{
+                "name": "Mechanical Keyboard",
+                "product_id": "keyboard",
+                "item_id": "old_keyboard",
+                "options": {"switch type": "linear", "backlight": "RGB"},
+            }],
+        }
+        wm.product_details["keyboard"] = {
+            "name": "Mechanical Keyboard",
+            "product_id": "keyboard",
+            "variants": {
+                "old_keyboard": {
+                    "item_id": "old_keyboard",
+                    "available": True,
+                    "options": {"switch type": "linear", "backlight": "RGB"},
+                },
+                "new_keyboard": {
+                    "item_id": "new_keyboard",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "none"},
+                },
+            },
+        }
+
+        commit = agent._grounded_retail_commit_action(wm)
+        ask = agent._missing_replacement_constraints_action(wm)
+
+        self.assertIsNone(commit)
+        self.assertIsNotNone(ask)
+        self.assertEqual(ask.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------
