@@ -2,9 +2,18 @@
 from __future__ import annotations
 
 import re
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from ..core import BaseCargoAdapter, Constraint, FallbackRule, Preference, TaskState
+from ..core import (
+    BaseCargoAdapter,
+    CandidateObject,
+    Constraint,
+    ConstraintPriorityEngine,
+    FallbackRule,
+    Preference,
+    TaskState,
+    normalize_key,
+)
 
 
 class TauRetailAdapter(BaseCargoAdapter):
@@ -51,6 +60,122 @@ class TauRetailAdapter(BaseCargoAdapter):
             )
             updates.append(("compatibility", "google", False))
         return updates
+
+    def select_replacement_variant_id(
+        self,
+        details: Dict[str, Any],
+        old_item: Dict[str, Any],
+        goal: str,
+    ) -> Optional[str]:
+        """Select a replacement with hard constraints before preferences.
+
+        This adapter method owns retail semantics.  The CARGO core supplies the
+        generic priority engine; the adapter translates user wording and product
+        options into constraints/preferences/fallbacks.
+        """
+        variants = details.get("variants") or {}
+        if not isinstance(variants, dict):
+            return None
+        hard, prefs, fallbacks = self._variant_policy(details, old_item, goal)
+        if not hard and not prefs and not fallbacks:
+            return None
+        old_id = str(old_item.get("item_id") or "")
+        candidates: List[CandidateObject] = []
+        for variant_id, variant in variants.items():
+            if not isinstance(variant, dict):
+                continue
+            vid = str(variant.get("item_id") or variant_id)
+            if vid == old_id:
+                continue
+            attrs = _flatten_options(variant.get("options") or {})
+            attrs["available"] = bool(variant.get("available", True))
+            attrs["price"] = variant.get("price")
+            candidates.append(CandidateObject(
+                candidate_id=vid,
+                object_type=str(details.get("name") or ""),
+                attributes=attrs,
+                available=bool(variant.get("available", True)),
+            ))
+        selection = ConstraintPriorityEngine().select(
+            candidates,
+            hard_constraints=hard,
+            preferences=prefs,
+            fallback_rules=fallbacks,
+        )
+        return selection.candidate.candidate_id if selection.ok and selection.candidate else None
+
+    def _variant_policy(
+        self,
+        details: Dict[str, Any],
+        old_item: Dict[str, Any],
+        goal: str,
+    ) -> Tuple[List[Constraint], List[Preference], List[FallbackRule]]:
+        low = str(goal or "").lower()
+        old_options = old_item.get("options") or {}
+        hard: List[Constraint] = []
+        prefs: List[Preference] = []
+        fallbacks: List[FallbackRule] = []
+
+        if "clicky" in low:
+            hard.append(Constraint(slot="switch_type", op="eq", value="clicky", hard=True))
+        elif "tactile" in low:
+            hard.append(Constraint(slot="switch_type", op="eq", value="tactile", hard=True))
+        elif "linear" in low:
+            hard.append(Constraint(slot="switch_type", op="eq", value="linear", hard=True))
+
+        explicit_size = False
+        if re.search(r"\bfull[- ]?size\b", low):
+            hard.append(Constraint(slot="size", op="eq", value="full size", hard=True))
+            explicit_size = True
+        elif re.search(r"\b80\s*%|eighty percent\b", low):
+            hard.append(Constraint(slot="size", op="eq", value="80%", hard=True))
+            explicit_size = True
+        elif re.search(r"\b60\s*%|sixty percent\b", low):
+            hard.append(Constraint(slot="size", op="eq", value="60%", hard=True))
+            explicit_size = True
+
+        old_size = _option_lookup(old_options, "size")
+        if old_size and not explicit_size and re.search(r"\b(similar|same|exchange|swap|replace)\b", low):
+            hard.append(Constraint(slot="size", op="eq", value=old_size, hard=True))
+
+        if "google home" in low or "google assistant" in low:
+            hard.append(Constraint(slot="compatibility", op="contains", value="google", hard=True))
+
+        if "rgb" in low:
+            prefs.append(Preference(slot="backlight", value="RGB", rank=0))
+        if re.search(r"\b(no backlight|without backlight|no lights?)\b", low) and re.search(
+            r"\b(if|unless|unavailable|otherwise|if not)\b", low
+        ):
+            fallbacks.append(FallbackRule(slot="backlight", from_value="RGB", to_value="none"))
+
+        return _dedupe_constraints(hard), prefs, fallbacks
+
+
+def _flatten_options(options: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in options.items():
+        out[normalize_key(str(key))] = value
+    return out
+
+
+def _option_lookup(options: Dict[str, Any], name: str) -> Optional[Any]:
+    n = normalize_key(name)
+    for key, value in options.items():
+        if normalize_key(str(key)) == n:
+            return value
+    return None
+
+
+def _dedupe_constraints(items: List[Constraint]) -> List[Constraint]:
+    out: List[Constraint] = []
+    seen = set()
+    for item in items:
+        sig = (item.slot, item.op, str(item.value).lower())
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(item)
+    return out
 
 
 __all__ = ["TauRetailAdapter"]

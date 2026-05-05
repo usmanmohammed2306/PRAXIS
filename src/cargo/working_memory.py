@@ -415,6 +415,39 @@ class WorkingMemory:
                 if isinstance(details, dict):
                     add(details.get("reservation_id"))
                     add(details.get("reservation_number"))
+        elif key in {"payment_method_id", "card_id", "certificate_id"}:
+            for details in self.order_details.values():
+                if isinstance(details, dict):
+                    for payment in details.get("payment_history") or []:
+                        if isinstance(payment, dict):
+                            add(payment.get("payment_method_id"))
+                            add(payment.get("card_id"))
+                            add(payment.get("certificate_id"))
+            for profile in self.user_profiles.values():
+                if not isinstance(profile, dict):
+                    continue
+                for container_name in (
+                    "payment_methods", "cards", "credit_cards",
+                    "certificates", "gift_cards",
+                ):
+                    container = profile.get(container_name)
+                    if isinstance(container, dict):
+                        for cid, value in container.items():
+                            add(cid)
+                            if isinstance(value, dict):
+                                add(value.get("id"))
+                                add(value.get("payment_method_id"))
+                                add(value.get("card_id"))
+                                add(value.get("certificate_id"))
+                    elif isinstance(container, list):
+                        for value in container:
+                            if isinstance(value, dict):
+                                add(value.get("id"))
+                                add(value.get("payment_method_id"))
+                                add(value.get("card_id"))
+                                add(value.get("certificate_id"))
+                            else:
+                                add(value)
         return vals
 
     def render_compact(self, max_chars: int = 800) -> str:

@@ -37,8 +37,11 @@ if str(ROOT) not in sys.path:
 from src.cargo import (  # noqa: E402
     GateResult,
     CandidateObject,
+    ConstraintPriorityEngine,
     Constraint,
+    FallbackRule,
     GenericCargoKernel,
+    Preference,
     ProposedAction,
     RiskClass,
     SYSTEM_PROMPT,
@@ -4603,6 +4606,261 @@ class TestTrajectory24Regressions(unittest.TestCase):
 
         self.assertIsNone(failing, failing.reason if failing else "")
         self.assertIn("completeness", diag["gates_run"])
+
+
+class TestCargoV4DecisionEngine(unittest.TestCase):
+    """Regression tests for the decision-centric CARGO-v4 layer."""
+
+    def _make_retail_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = MockClient(scripts=[])
+        agent.model = "test"
+        agent.temperature = 0.0
+        agent.adapter = TauRetailAdapter()
+        agent.kernel = GenericCargoKernel(agent.adapter)
+        agent.schemas = {
+            "exchange_delivered_order_items": ToolEffectSchema(
+                name="exchange_delivered_order_items",
+                cls=RiskClass.WRITE,
+                arg_id_fields=["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+                required_params=["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+            )
+        }
+        return agent
+
+    def _make_airline_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = MockClient(scripts=[])
+        agent.model = "test"
+        agent.temperature = 0.0
+        agent.adapter = TauAirlineAdapter()
+        agent.kernel = GenericCargoKernel(agent.adapter)
+        agent.schemas = {
+            "search_direct_flight": ToolEffectSchema(
+                name="search_direct_flight",
+                cls=RiskClass.READ,
+                arg_semantic_fields=["origin", "destination", "date"],
+            ),
+            "search_onestop_flight": ToolEffectSchema(
+                name="search_onestop_flight",
+                cls=RiskClass.READ,
+                arg_semantic_fields=["origin", "destination", "date"],
+            ),
+            "respond": ToolEffectSchema(name="respond", cls=RiskClass.FINAL),
+        }
+        return agent
+
+    @staticmethod
+    def _keyboard_details() -> Dict[str, Any]:
+        return {
+            "name": "Mechanical Keyboard",
+            "product_id": "1656367028",
+            "variants": {
+                "1151293680": {
+                    "item_id": "1151293680",
+                    "available": True,
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+                },
+                "7706410293": {
+                    "item_id": "7706410293",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "none", "size": "full size"},
+                },
+                "2299424241": {
+                    "item_id": "2299424241",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "RGB", "size": "80%"},
+                },
+                "9025753381": {
+                    "item_id": "9025753381",
+                    "available": False,
+                    "options": {"switch type": "clicky", "backlight": "RGB", "size": "full size"},
+                },
+                "6342039236": {
+                    "item_id": "6342039236",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "white", "size": "full size"},
+                },
+                "1234567890": {
+                    "item_id": "1234567890",
+                    "available": True,
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+                },
+            },
+        }
+
+    @staticmethod
+    def _thermostat_details() -> Dict[str, Any]:
+        return {
+            "name": "Smart Thermostat",
+            "product_id": "4896585277",
+            "variants": {
+                "7747408585": {
+                    "item_id": "7747408585",
+                    "available": True,
+                    "options": {"compatibility": "Google Assistant", "color": "black"},
+                },
+                "1839357461": {
+                    "item_id": "1839357461",
+                    "available": True,
+                    "options": {"compatibility": "Apple HomeKit", "color": "black"},
+                },
+            },
+        }
+
+    def test_v4_constraint_priority_selects_full_size_clicky_fallback(self) -> None:
+        candidates = [
+            CandidateObject("2299424241", attributes={"switch_type": "clicky", "backlight": "RGB", "size": "80%"}),
+            CandidateObject("7706410293", attributes={"switch_type": "clicky", "backlight": "none", "size": "full size"}),
+            CandidateObject("9025753381", attributes={"switch_type": "clicky", "backlight": "RGB", "size": "full size", "available": False}, available=False),
+            CandidateObject("1234567890", attributes={"switch_type": "linear", "backlight": "RGB", "size": "full size"}),
+        ]
+
+        selected = ConstraintPriorityEngine().select(
+            candidates,
+            hard_constraints=[
+                Constraint(slot="switch_type", op="eq", value="clicky"),
+                Constraint(slot="size", op="eq", value="full size"),
+            ],
+            preferences=[Preference(slot="backlight", value="RGB")],
+            fallback_rules=[FallbackRule(slot="backlight", from_value="RGB", to_value="none")],
+        )
+
+        self.assertTrue(selected.ok)
+        self.assertEqual(selected.candidate.candidate_id, "7706410293")  # type: ignore[union-attr]
+        self.assertIsNotNone(selected.fallback_used)
+        rejected_ids = {r["candidate_id"] for r in selected.rejected}
+        self.assertIn("2299424241", rejected_ids)
+        self.assertIn("1234567890", rejected_ids)
+
+    def test_v4_retail_adapter_rejects_wrong_keyboard_variant_from_latest_logs(self) -> None:
+        adapter = TauRetailAdapter()
+        goal = (
+            "Exchange the mechanical keyboard for a clicky full-size RGB one; "
+            "if unavailable, no backlight is okay."
+        )
+        old_item = {
+            "name": "Mechanical Keyboard",
+            "item_id": "1151293680",
+            "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+        }
+
+        selected = adapter.select_replacement_variant_id(self._keyboard_details(), old_item, goal)
+
+        self.assertEqual(selected, "7706410293")
+        self.assertNotEqual(selected, "2299424241")
+
+    def test_v4_retail_two_item_exchange_uses_deterministic_selected_candidates(self) -> None:
+        agent = self._make_retail_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "Exchange the mechanical keyboard for a clicky full-size RGB one; "
+            "if unavailable, no backlight is okay. Also exchange the smart "
+            "thermostat for one compatible with Google Home."
+        )
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "credit_card_9513926"}],
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "1656367028",
+                    "item_id": "1151293680",
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+                },
+                {
+                    "name": "Smart Thermostat",
+                    "product_id": "4896585277",
+                    "item_id": "8174673829",
+                    "options": {"compatibility": "Apple HomeKit", "color": "black"},
+                },
+            ],
+        }
+        wm.product_details["1656367028"] = self._keyboard_details()
+        wm.product_details["4896585277"] = self._thermostat_details()
+
+        action = agent._grounded_retail_commit_action(wm)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.name, "exchange_delivered_order_items")  # type: ignore[union-attr]
+        self.assertEqual(action.args["item_ids"], ["1151293680", "8174673829"])  # type: ignore[union-attr]
+        self.assertEqual(action.args["new_item_ids"], ["7706410293", "7747408585"])  # type: ignore[union-attr]
+
+    def test_v4_candidate_set_memory_records_empty_search_exhaustion(self) -> None:
+        wm = WorkingMemory()
+        kernel = GenericCargoKernel(TauAirlineAdapter())
+        args = {"origin": "New York", "destination": "Seattle", "date": "2024-05-20"}
+
+        cset = kernel.record_action_candidates(wm, "search_direct_flight", args, "[]")
+
+        self.assertIsNotNone(cset)
+        self.assertTrue(cset.empty)  # type: ignore[union-attr]
+        self.assertTrue(cset.exhausted)  # type: ignore[union-attr]
+        self.assertIs(wm.task_state.candidate_set_for("search_direct_flight", args), cset)
+
+    def test_v4_airline_exhausted_searches_finalize_instead_of_looping(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "Book a flight from New York to Seattle on May 20th. "
+            "Direct is preferred but one stopover is okay."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        args = {"origin": "New York", "destination": "Seattle", "date": "2024-05-20"}
+        agent._kernel().record_action_candidates(wm, "search_direct_flight", args, "[]")
+        agent._kernel().record_action_candidates(wm, "search_onestop_flight", args, "[]")
+        ask = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="What certificate values would you like to use?",
+        )
+
+        replacement = agent._obligation_guided_action(ask, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.declared_class, RiskClass.FINAL)  # type: ignore[union-attr]
+        self.assertEqual(wm.task_state.terminal_status, "blocked_no_matching_flights")
+        self.assertIn("could not find", replacement.user_text.lower())  # type: ignore[union-attr]
+
+    def test_v4_airline_blocks_premature_payment_questions(self) -> None:
+        wm = WorkingMemory()
+        text = "Book a flight from New York to Seattle on May 20th in economy."
+        wm.absorb_user_message(text)
+        GenericCargoKernel(TauAirlineAdapter()).observe_user_message(wm, text)
+        action = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="What certificate values should I use?",
+        )
+
+        gate = TauAirlineAdapter().validate_ask_user(action, wm)
+
+        self.assertFalse(gate.ok)
+        self.assertEqual(gate.reason, "payment_question_before_flight_selection")
+
+    def test_v4_forced_id_fields_reject_plain_words(self) -> None:
+        wm = WorkingMemory()
+        action = ProposedAction(
+            name="get_reservation_details",
+            args={"reservation_id": "though"},
+            declared_class=RiskClass.READ,
+        )
+        schema = ToolEffectSchema(
+            name="get_reservation_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["reservation_id"],
+        )
+
+        gate = check_arg_grounding(action, schema, wm)
+
+        self.assertFalse(gate.ok)
+        self.assertIn("reservation_id=though", gate.diagnostics["ungrounded"])
 
 
 # ---------------------------------------------------------------------------

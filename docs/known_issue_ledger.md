@@ -1,7 +1,7 @@
 # CARGO Known-Issue Ledger
 
 This ledger is the recovery record for the uploaded CARGO runs from
-`metrics (24).json` through `metrics (36).json`, their paired trajectories,
+`metrics (24).json` through `metrics (38).json`, their paired trajectories,
 and the local regression suite.  It is intentionally phrased by failure
 class rather than benchmark task answer, so it remains a test and design
 artifact rather than an answer key.
@@ -25,6 +25,8 @@ Machine-readable companion: `docs/known_issues.json`.
 | metrics (34) | airline | 0.0 | 0.0 | 35.4 | 79 | 54 | 2 | 23 | 21 |
 | metrics (35) | airline | 0.0 | 0.0 | 35.4 | 79 | 54 | 2 | 23 | 21 |
 | metrics (36) | retail | 0.0 | 0.0 | 33.2 | 65 | 43 | 0 | 22 | 23 |
+| metrics (37) | airline | 0.0 | 0.0 | 39.4 | 68 | 45 | 1 | 22 | 32 |
+| metrics (38) | retail | 0.0 | 0.0 | 28.4 | 18 | 15 | 1 | 2 | 37 |
 
 ## Benchmark Context Used
 
@@ -39,18 +41,24 @@ Machine-readable companion: `docs/known_issues.json`.
   and decoy candidates that can look valid locally but break the full task.
   This motivates semantic constraint validation as a gate, not a scorer.
 
-## CARGO-v3 Architecture Mapping
+## CARGO-v4 Architecture Mapping
 
 - Generic core: `src/cargo/core.py` owns layered task state, fact precedence,
   open slots, constraints, preferences, fallback rules, candidate sets,
-  obligations, semantic validation hooks, completeness hooks, and diagnostics.
+  obligations, semantic validation hooks, completeness hooks, diagnostics, and
+  the deterministic decision engine.
 - Adapters: `src/cargo/adapters/` owns benchmark/domain knowledge.  Current
   adapters are `tau_retail`, `tau_airline`, `acebench`, and
   `synthetic_generic`.
-- CARGO-v3 replaces monolithic `state_validity` with action-class-specific
-  validation. READ is retrieval-permissive and may build incomplete state;
-  WRITE/IRREVERSIBLE/FINAL are commitment-strict and require semantic
-  completeness.
+- CARGO-v4 keeps action-class-specific validation and adds deterministic
+  decision before commitment. READ is retrieval-permissive and may build
+  incomplete state; WRITE/IRREVERSIBLE/FINAL are commitment-strict and require
+  semantic completeness.
+- The decision engine stores candidate sets from READ actions, applies hard
+  constraints before preferences, applies fallbacks only after strict
+  exhaustion, schedules pipeline stages, suppresses exhausted repeated
+  searches, blocks premature ASK_USER questions, and terminates after a true
+  blocker or successful write.
 - Obligation guidance converts repeated or generic ASK/FINAL proposals into
   the next grounded READ when user/tool evidence already identifies an open
   information need.
@@ -92,6 +100,11 @@ Machine-readable companion: `docs/known_issues.json`.
 | Retail READ over-blocked by semantic state | metrics (36) blocked `get_product_details(product_id=1656367028)` as `action_product_id_conflicts_with_state` | Tool-returned opaque IDs were bound into semantic slots; flat state validity treated retrieval as commitment | Opaque IDs stay typed evidence, not semantic constraints; READ ignores opaque-ID semantic conflicts and only blocks clear ordinary-slot contradictions | `test_tool_observation_ids_do_not_become_semantic_slots`, `test_read_permissive_allows_grounded_product_retrieval_with_incomplete_state` | Fixed, verified |
 | Airline booking/change intent not bound | metrics (34)/(35) tasks repeatedly emitted ASK_USER after the user stated a booking/change goal | Intent/route/date/cabin were not represented as task-closure obligations visible to the controller | Bind before propose; create open airline obligations from user text; obligation guide selects search/profile READs before asking again | `test_airline_adapter_binds_booking_intent_and_open_obligation`, `test_i2b_airline_ask_loop_pivots_to_bound_flight_search` | Fixed, verified |
 | Repeated direct search without progression | metrics (34)/(35) retried direct/onestop signatures after no progress | Repeat repair only retried/finalized instead of choosing the next information need | If direct search already ran and one-stop is allowed, pivot to grounded one-stop search instead of repeating or finalizing | `test_i2c_repeated_direct_search_pivots_to_onestop_when_allowed` | Fixed, verified |
+| Retail wrong variant after successful retrieval | metrics (38) selected clicky/RGB/80% keyboard (`2299424241`) while user required full-size and allowed no-backlight fallback | Final choice was still model/scorer-driven instead of deterministic constraint-priority selection | Hard constraints filter first; RGB is only a preference; no-backlight fallback applies only after clicky/RGB/full-size is unavailable | `test_v4_constraint_priority_selects_full_size_clicky_fallback`, `test_v4_retail_adapter_rejects_wrong_keyboard_variant_from_latest_logs`, `test_v4_retail_two_item_exchange_uses_deterministic_selected_candidates` | Fixed, verified |
+| Airline empty-search loop | metrics (37) direct and one-stop searches returned empty, then the trajectory continued with repeated search/ASK behavior | Candidate sets did not record exhausted empty results as terminal search evidence | Empty candidate sets are stored with query args and exhausted status; same search is not repeated without new evidence | `test_v4_candidate_set_memory_records_empty_search_exhaustion`, `test_v4_airline_exhausted_searches_finalize_instead_of_looping` | Fixed, verified |
+| Premature payment/certificate ask | metrics (37) asked for certificate values before a flight was selected or profile/payment state could determine options | ASK_USER policy lacked pipeline stage awareness | Payment/certificate questions are blocked until a flight/itinerary candidate is selected | `test_v4_airline_blocks_premature_payment_questions` | Fixed, verified |
+| Forced ID field accepts plain words | metrics (37) included invalid airline ID attempts such as ordinary words in `reservation_id`/`user_id` fields | Adapter-declared ID fields fell through when the value did not look ID-like | Forced ID fields must be typed evidence, or ID-looking and grounded; ordinary words are rejected | `test_v4_forced_id_fields_reject_plain_words` | Fixed, verified |
+| Structured payment IDs missing from typed state | Regression exposed by stricter forced-ID grounding | Cached order/profile payment fields were visible in evidence text but not as typed ID evidence | Payment, card, and certificate IDs are extracted from durable structured caches | `test_h2_complete_canonical_write_passes_completeness_gate` | Fixed, verified |
 
 ## Remaining Limitations
 
@@ -101,13 +114,14 @@ Machine-readable companion: `docs/known_issues.json`.
   generic helper unless `--include-ace-vllm` is used in an isolated
   environment.  Live smoke still needs a model endpoint/API key.
 - Airline full booking selection is guarded for slot completeness, state
-  consistency, and obligation-guided search progression, but a complete
-  deterministic cheapest-itinerary planner is still an open extension. CARGO
-  remains a lightweight gating controller, not a full tree-search planner.
+  consistency, obligation-guided search progression, empty-search exhaustion,
+  and premature payment asks. A complete deterministic cheapest-itinerary
+  selector after non-empty search results remains the next extension. CARGO
+  remains a lightweight risk-gated controller, not a full tree-search planner.
 
 ## Verification
 
-- `python3 -m unittest tests.test_cargo -v`: 232 local regression tests passed.
+- `python3 -m unittest tests.test_cargo -v`: 239 local regression tests passed.
 - `python3 -m compileall src tests`: passed.
 - `git diff --check`: passed.
 - `bash run_project.sh --dry-run`: passed configuration resolution without

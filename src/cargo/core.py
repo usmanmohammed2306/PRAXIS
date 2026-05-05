@@ -1,4 +1,4 @@
-"""Generic CARGO-v3 state, adapter, and validation kernel.
+"""Generic CARGO-v4 state, adapter, validation, and decision kernel.
 
 This module is intentionally domain-neutral.  It knows about facts, slots,
 constraints, preferences, obligations, candidates, actions, and gates; all
@@ -25,7 +25,18 @@ def normalize_key(value: str) -> str:
 def normalize_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
-    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    synonyms = {
+        "no backlight": "none",
+        "without backlight": "none",
+        "no lights": "none",
+        "no light": "none",
+        "full-size": "full size",
+        "fullsize": "full size",
+        "google home": "google",
+        "google assistant": "google",
+    }
+    return synonyms.get(text, text)
 
 
 @dataclass
@@ -80,6 +91,31 @@ class CandidateObject:
 
 
 @dataclass
+class CandidateSet:
+    """Stored result set from an information-gathering action."""
+
+    set_id: str
+    source_tool: str
+    query_args: Dict[str, Any] = field(default_factory=dict)
+    candidates: List[CandidateObject] = field(default_factory=list)
+    empty: bool = False
+    exhausted: bool = False
+    selected_candidate_id: str = ""
+    rejected_candidates: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class CandidateSelection:
+    """Result of deterministic candidate selection."""
+
+    ok: bool
+    candidate: Optional[CandidateObject] = None
+    reason: str = ""
+    rejected: List[Dict[str, Any]] = field(default_factory=list)
+    fallback_used: Optional[FallbackRule] = None
+
+
+@dataclass
 class Obligation:
     """Domain-neutral unit of task closure.
 
@@ -129,7 +165,7 @@ class TaskState:
     constraints: List[Constraint] = field(default_factory=list)
     preferences: List[Preference] = field(default_factory=list)
     fallback_rules: List[FallbackRule] = field(default_factory=list)
-    candidate_sets: Dict[str, List[str]] = field(default_factory=dict)
+    candidate_sets: Dict[str, CandidateSet] = field(default_factory=dict)
     candidate_objects: Dict[str, CandidateObject] = field(default_factory=dict)
     selected_objects: Dict[str, str] = field(default_factory=dict)
     obligations: Dict[str, Obligation] = field(default_factory=dict)
@@ -278,6 +314,35 @@ class TaskState:
         self.candidate_objects[cid] = candidate
         self.last_meaningful_state_change += 1
         return True
+
+    def record_candidate_set(
+        self,
+        source_tool: str,
+        query_args: Mapping[str, Any],
+        candidates: List[CandidateObject],
+    ) -> CandidateSet:
+        set_id = action_signature_key(source_tool, query_args)
+        cur = self.candidate_sets.get(set_id)
+        empty = not candidates
+        if cur is None:
+            cur = CandidateSet(
+                set_id=set_id,
+                source_tool=source_tool,
+                query_args=dict(query_args),
+                empty=empty,
+                exhausted=empty,
+            )
+            self.candidate_sets[set_id] = cur
+        cur.candidates = list(candidates)
+        cur.empty = empty
+        cur.exhausted = empty
+        for candidate in candidates:
+            self.add_candidate(candidate)
+        self.last_meaningful_state_change += 1
+        return cur
+
+    def candidate_set_for(self, source_tool: str, query_args: Mapping[str, Any]) -> Optional[CandidateSet]:
+        return self.candidate_sets.get(action_signature_key(source_tool, query_args))
 
     def upsert_obligation(self, obligation: Obligation) -> bool:
         oid = normalize_key(obligation.obligation_id)
@@ -464,11 +529,137 @@ class BaseCargoAdapter:
         return GateResult.passing("semantic_validation", candidate_id=candidate.candidate_id)
 
 
+class ConstraintPriorityEngine:
+    """Deterministic candidate selector used by adapters.
+
+    Selection order is invariant:
+    hard constraints -> global constraints -> availability -> fallback ->
+    preferences. Preferences never rescue a hard-constraint violation.
+    """
+
+    def select(
+        self,
+        candidates: Iterable[CandidateObject],
+        *,
+        hard_constraints: Iterable[Constraint] = (),
+        global_constraints: Iterable[Constraint] = (),
+        preferences: Iterable[Preference] = (),
+        fallback_rules: Iterable[FallbackRule] = (),
+    ) -> CandidateSelection:
+        all_candidates = list(candidates)
+        rejected: List[Dict[str, Any]] = []
+
+        hard_valid = self._filter_constraints(
+            all_candidates,
+            list(hard_constraints),
+            rejected,
+            stage="hard_constraints",
+        )
+        global_valid = self._filter_constraints(
+            hard_valid,
+            list(global_constraints),
+            rejected,
+            stage="global_constraints",
+        )
+        available = [
+            c for c in global_valid
+            if c.available and bool(c.attributes.get("available", True))
+        ]
+        for candidate in global_valid:
+            if candidate not in available:
+                rejected.append({
+                    "candidate_id": candidate.candidate_id,
+                    "stage": "availability",
+                    "reason": "candidate_not_actionable",
+                })
+        if not available:
+            return CandidateSelection(False, reason="no_available_candidate_after_hard_constraints", rejected=rejected)
+
+        prefs = list(preferences)
+        if prefs:
+            strict_pref = [c for c in available if self._matches_preferences(c, prefs)]
+            if strict_pref:
+                return CandidateSelection(True, candidate=self._rank(strict_pref, prefs), rejected=rejected)
+
+        for rule in fallback_rules:
+            fallback_pref = Preference(slot=rule.slot, value=rule.to_value, rank=0, source=rule.source)
+            fallback_matches = [
+                c for c in available
+                if _compare(_lookup_attr(c.attributes, rule.slot), "eq", rule.to_value)
+            ]
+            if fallback_matches:
+                return CandidateSelection(
+                    True,
+                    candidate=self._rank(fallback_matches, [fallback_pref]),
+                    rejected=rejected,
+                    fallback_used=rule,
+                )
+
+        return CandidateSelection(True, candidate=self._rank(available, prefs), rejected=rejected)
+
+    @staticmethod
+    def _filter_constraints(
+        candidates: List[CandidateObject],
+        constraints: List[Constraint],
+        rejected: List[Dict[str, Any]],
+        *,
+        stage: str,
+    ) -> List[CandidateObject]:
+        if not constraints:
+            return list(candidates)
+        out: List[CandidateObject] = []
+        for candidate in candidates:
+            failed = []
+            for constraint in constraints:
+                if not constraint.satisfied_by(candidate.attributes):
+                    failed.append({
+                        "slot": constraint.slot,
+                        "op": constraint.op,
+                        "expected": constraint.value,
+                        "actual": _lookup_attr(candidate.attributes, constraint.slot),
+                    })
+            if failed:
+                rejected.append({
+                    "candidate_id": candidate.candidate_id,
+                    "stage": stage,
+                    "failed": failed,
+                })
+                continue
+            out.append(candidate)
+        return out
+
+    @staticmethod
+    def _matches_preferences(candidate: CandidateObject, preferences: List[Preference]) -> bool:
+        return all(
+            _compare(_lookup_attr(candidate.attributes, pref.slot), "eq", pref.value)
+            for pref in preferences
+        )
+
+    @staticmethod
+    def _rank(candidates: List[CandidateObject], preferences: List[Preference]) -> CandidateObject:
+        def score(candidate: CandidateObject) -> Tuple[int, str]:
+            total = 0
+            for pref in preferences:
+                if _compare(_lookup_attr(candidate.attributes, pref.slot), "eq", pref.value):
+                    total += max(1, 100 - pref.rank)
+            return (total, str(candidate.candidate_id))
+
+        return sorted(candidates, key=score, reverse=True)[0]
+
+
+class DecisionEngine:
+    """Small domain-neutral facade for deterministic decisions."""
+
+    def __init__(self) -> None:
+        self.constraints = ConstraintPriorityEngine()
+
+
 class GenericCargoKernel:
     """Small deterministic kernel that binds state and calls adapter validators."""
 
     def __init__(self, adapter: Optional[CargoDomainAdapter] = None) -> None:
         self.adapter: CargoDomainAdapter = adapter or BaseCargoAdapter()
+        self.decision_engine = DecisionEngine()
 
     def enrich_schemas(self, schemas: Dict[str, ToolEffectSchema]) -> Dict[str, ToolEffectSchema]:
         return {name: self.adapter.enrich_schema(schema) for name, schema in schemas.items()}
@@ -490,6 +681,15 @@ class GenericCargoKernel:
             if nkey in semantic_fields or nkey in {"date", "intent", "confirmation"}:
                 wm.bind_semantic_slot(nkey, value, confirmed=confirmed)
         self.adapter.update_obligations(wm.task_state, wm)
+
+    def record_action_candidates(
+        self,
+        wm: "WorkingMemory",
+        action_name: str,
+        action_args: Mapping[str, Any],
+        obs: Any,
+    ) -> Optional[CandidateSet]:
+        return self._record_generic_candidate_set(wm.task_state, action_name, action_args, obs)
 
     def validate_action(
         self,
@@ -546,6 +746,42 @@ class GenericCargoKernel:
             skip_id_fields=True,
             validation_level="read_permissive",
         )
+
+    def _record_generic_candidate_set(
+        self,
+        state: TaskState,
+        action_name: str,
+        action_args: Mapping[str, Any],
+        obs: Any,
+    ) -> Optional[CandidateSet]:
+        if not str(action_name or "").startswith(("search", "list")):
+            return None
+        struct = _coerce_struct(obs)
+        candidates: List[CandidateObject] = []
+        if isinstance(struct, list):
+            for idx, item in enumerate(struct):
+                if isinstance(item, Mapping):
+                    cid = (
+                        item.get("id")
+                        or item.get("flight_number")
+                        or item.get("candidate_id")
+                        or item.get("item_id")
+                        or item.get("product_id")
+                        or f"{action_name}_{idx}"
+                    )
+                    candidates.append(CandidateObject(
+                        candidate_id=str(cid),
+                        object_type=str(action_name),
+                        attributes=dict(item),
+                        available=bool(item.get("available", True)),
+                    ))
+                elif item not in (None, ""):
+                    candidates.append(CandidateObject(
+                        candidate_id=f"{action_name}_{idx}",
+                        object_type=str(action_name),
+                        attributes={"value": item},
+                    ))
+        return state.record_candidate_set(action_name, action_args, candidates)
 
     def _validate_commitment_against_bound_state(
         self,
@@ -605,6 +841,14 @@ def semantic_values_match(proposed: Any, expected: Any) -> bool:
     else:
         vals = [normalize_value(expected)]
     return any(p == v or (p and v and (p in v or v in p)) for v in vals)
+
+
+def action_signature_key(name: str, args: Mapping[str, Any]) -> str:
+    try:
+        arg_text = json.dumps(dict(args or {}), sort_keys=True, default=str)
+    except Exception:
+        arg_text = str(args)
+    return f"{name}({arg_text})"
 
 
 _MONTHS = {
@@ -725,9 +969,13 @@ def _compare(actual: Any, op: str, expected: Any) -> bool:
 
 __all__ = [
     "BaseCargoAdapter",
+    "CandidateSelection",
+    "CandidateSet",
     "CandidateObject",
     "CargoDomainAdapter",
     "Constraint",
+    "ConstraintPriorityEngine",
+    "DecisionEngine",
     "FallbackRule",
     "GenericCargoKernel",
     "Obligation",
@@ -738,4 +986,5 @@ __all__ = [
     "normalize_key",
     "normalize_value",
     "semantic_values_match",
+    "action_signature_key",
 ]

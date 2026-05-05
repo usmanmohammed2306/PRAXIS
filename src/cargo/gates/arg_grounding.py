@@ -104,8 +104,21 @@ def check_arg_grounding(
             forced_id = k in id_fields or base in id_fields
             forced_semantic = k in semantic_fields or base in semantic_fields
             typed_values = wm.typed_evidence_for(base) if forced_id else []
-            if typed_values:
-                if v_str not in typed_values:
+            if forced_id:
+                if typed_values:
+                    if v_str not in typed_values:
+                        ungrounded.append(f"{path}={v_str}")
+                    continue
+                # Adapter-declared ID fields are opaque identifiers even when
+                # the value is a normal-looking word.  Without this branch,
+                # bogus airline calls such as reservation_id="though" or
+                # user_id="which" slipped through because they did not match
+                # the generic ID regex.  Semantic literals are still handled by
+                # arg_semantic_fields below; only true ID fields reach here.
+                if not _looks_like_id(v_str):
+                    ungrounded.append(f"{path}={v_str}")
+                    continue
+                if not _grounded_in_evidence(v_str, full_evidence):
                     ungrounded.append(f"{path}={v_str}")
                 continue
             if not forced_id and (forced_semantic or _is_semantic_literal_field(path)):
