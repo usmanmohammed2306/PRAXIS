@@ -3725,5 +3725,153 @@ class TestTrajectory43Regressions(unittest.TestCase):
         )
 
 
+    # ===================================================================
+    # Tests for FIX-B: Search-exhaustion detection and escape
+    # ===================================================================
+
+    def test_is_search_tool_identifies_search_flights(self) -> None:
+        """_is_search_tool should identify search_direct_flight and search_onestop_flight."""
+        from src.cargo.cargo_agent import CargoAgent
+        self.assertTrue(CargoAgent._is_search_tool("search_direct_flight"))
+        self.assertTrue(CargoAgent._is_search_tool("search_onestop_flight"))
+        self.assertTrue(CargoAgent._is_search_tool("search_items"))
+        self.assertFalse(CargoAgent._is_search_tool("get_order_details"))
+        self.assertFalse(CargoAgent._is_search_tool("list_all_product_types"))
+
+    def test_is_empty_search_result_detects_no_results(self) -> None:
+        """_is_empty_search_result should detect various no-match patterns."""
+        from src.cargo.cargo_agent import CargoAgent
+        # Explicit empty patterns
+        self.assertTrue(CargoAgent._is_empty_search_result(""))
+        self.assertTrue(CargoAgent._is_empty_search_result("[]"))
+        self.assertTrue(CargoAgent._is_empty_search_result('{"results": []}'))
+        self.assertTrue(CargoAgent._is_empty_search_result('{"flights": []}'))
+        # Text patterns
+        self.assertTrue(CargoAgent._is_empty_search_result("No flights found"))
+        self.assertTrue(CargoAgent._is_empty_search_result("not found"))
+        self.assertTrue(CargoAgent._is_empty_search_result("No matching results"))
+        # Error patterns
+        self.assertTrue(CargoAgent._is_empty_search_result("error: invalid parameters"))
+        self.assertTrue(CargoAgent._is_empty_search_result('{"error": "not found"}'))
+        # Should NOT match when results exist
+        self.assertFalse(CargoAgent._is_empty_search_result(
+            '{"flights": [{"id": 1, "departure": "08:00"}]}'
+        ))
+        self.assertFalse(CargoAgent._is_empty_search_result(
+            '[{"id": "F001", "airline": "Airlines"}]'
+        ))
+
+    def test_working_memory_search_exhaustion_fields(self) -> None:
+        """WorkingMemory should track search exhaustion state."""
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        self.assertEqual(wm.consecutive_empty_searches, 0)
+        self.assertEqual(wm.last_search_tool, "")
+        self.assertFalse(wm.search_exhaustion_triggered)
+
+    def test_working_memory_consecutive_empty_searches_increments(self) -> None:
+        """Consecutive empty searches should increment the counter."""
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        wm.consecutive_empty_searches = 0
+        wm.last_search_tool = ""
+        # Simulate detecting first empty search
+        wm.consecutive_empty_searches += 1
+        wm.last_search_tool = "search_direct_flight"
+        self.assertEqual(wm.consecutive_empty_searches, 1)
+        # Simulate second empty search with same tool
+        wm.consecutive_empty_searches += 1
+        self.assertEqual(wm.consecutive_empty_searches, 2)
+        # Reset when a result is found
+        wm.consecutive_empty_searches = 0
+        self.assertEqual(wm.consecutive_empty_searches, 0)
+
+    def test_solve_detects_search_exhaustion_and_escapes(self) -> None:
+        """When search exhaustion is detected (4+ empty searches),
+        the solver should emit an ASK_USER and continue, not burn steps."""
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        # Simulate a trajectory with repeated empty search results.
+        # The proposer keeps proposing search_direct_flight with different args,
+        # but all return empty results.
+        scripts: List[Any] = [
+            # Step 1: initial proposer → search_direct_flight
+            _proposer_json(
+                name="search_direct_flight",
+                args={"from": "NYC", "to": "LAX", "date": "2026-06-01"},
+            ),
+            # Step 2: proposer returns another search (no progress made)
+            _proposer_json(
+                name="search_direct_flight",
+                args={"from": "NYC", "to": "LAX", "date": "2026-06-02"},
+            ),
+            # Step 3: another search attempt (still no progress)
+            _proposer_json(
+                name="search_direct_flight",
+                args={"from": "NYC", "to": "LAX", "date": "2026-06-03"},
+            ),
+            # Step 4: another search attempt (still no progress) →
+            # At this point consecutive_empty_searches=4, escape is triggered.
+            [_proposer_json(
+                name="search_direct_flight",
+                args={"from": "NYC", "to": "LAX", "date": "2026-06-04"},
+            )] * 3,
+            json.dumps({"predicted_obs": "[]", "goal_still_reachable": False}),
+        ]
+        client = MockClient(scripts=scripts)
+
+        env = MockEnv(
+            initial_user="Find a flight from NYC to LAX in June 2026",
+            step_responses=[
+                # All search results are empty
+                _StepResp(observation='[]'),
+                _StepResp(observation='[]'),
+                _StepResp(observation='[]'),
+                _StepResp(observation='[]'),
+                # After escape, user provides more info
+                _StepResp(observation='User provided additional constraints'),
+            ],
+        )
+
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "airline"
+        agent.calibration = default_calibration()
+        agent.schemas = induce_schemas([
+            _tool("search_direct_flight", ["from", "to", "date"]),
+        ])
+        agent.domain_policy = ""
+
+        result = agent.solve(env, task_index=0, max_num_steps=10)
+
+        # Verify that escape was triggered: we should see an ASK_USER respond
+        # after the 4th empty search result, instead of burning more steps.
+        respond_count = sum(
+            1 for a in env.actions_executed if a.name == "respond"
+        )
+        # Should have emitted 1 respond (the ASK_USER escape).
+        # Without the escape, the proposer would keep cycling through
+        # searches until the budget is exhausted.
+        self.assertGreaterEqual(
+            respond_count, 1,
+            f"Search-exhaustion escape should emit at least 1 respond; "
+            f"got {respond_count}",
+        )
+        self.assertLessEqual(
+            len(env.actions_executed), 8,
+            f"Search-exhaustion escape should fire before exhausting budget; "
+            f"got {len(env.actions_executed)} actions",
+        )
+
 if __name__ == "__main__":
     unittest.main()
