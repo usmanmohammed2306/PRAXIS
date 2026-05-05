@@ -1104,8 +1104,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
             ):
                 wm.record_executed_mutation(action.signature())
                 wm.lock_phase("mutation")
-                wm.task_completed = True
-                break
+                # A task may require multiple distinct writes (for example,
+                # updating two separate pending orders).  Stop immediately
+                # when no further grounded mutation remains, but do not mark
+                # the whole task complete after the first successful write if
+                # the controller can assemble another fresh, non-duplicate
+                # mutation from the updated state.
+                if self._grounded_retail_commit_action(wm) is None:
+                    wm.task_completed = True
+                    break
             if done:
                 break
 
@@ -2431,7 +2438,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     name=RESPOND_TOOL_NAME,
                     args={},
                     declared_class=final_cls,
-                    declared_pre=[f"{len(fetched_names)} products fetched"],
+                    declared_pre=[],
                     declared_post=["counts answered"],
                     informational_intent=f"answer count for {', '.join(fetched_names)}",
                     raw_thought=(
@@ -2488,7 +2495,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     name=RESPOND_TOOL_NAME,
                     args={},
                     declared_class=final_cls,
-                    declared_pre=[f"{name} details fetched"],
+                    declared_pre=[],
                     declared_post=["count answered"],
                     informational_intent=f"answer count for {name}",
                     raw_thought=(
@@ -2973,15 +2980,22 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return False
         if f"instead of {v}" in g or f"rather than {v}" in g:
             return False
-        if v in g:
-            return True
         if k == "size":
+            if v == "full size" and "full size" in g:
+                return True
+            if v in {"60", "80"} and re.search(rf"\b{re.escape(v)}\s*%?\b", g):
+                return True
             if v == "s" and re.search(r"\b(s|small)\s*(?:size|t-?shirt|shirt)?\b", g):
                 return True
             if v == "m" and "medium" in g:
                 return True
             if v == "l" and re.search(r"\blarge\b", g):
                 return True
+            if v in {"xl", "xxl"} and re.search(rf"\b{re.escape(v)}\b", g):
+                return True
+            return False
+        if len(v) > 2 and v in g:
+            return True
         if k == "style" and v == "v neck" and re.search(r"\bv\s*neck\b", g):
             return True
         if k == "backlight" and v == "none" and "no backlight" in g:
@@ -2992,18 +3006,88 @@ class CargoAgent(Agent):  # type: ignore[misc]
     def _option_preferences(self, details: Dict[str, Any], goal: str) -> Dict[str, List[str]]:
         prefs: Dict[str, List[str]] = {}
         variants = details.get("variants") or {}
-        if not isinstance(variants, dict):
-            return prefs
-        for variant in variants.values():
-            if not isinstance(variant, dict):
+        if isinstance(variants, dict):
+            for variant in variants.values():
+                if not isinstance(variant, dict):
+                    continue
+                for key, value in (variant.get("options") or {}).items():
+                    if self._option_value_matches_goal(str(key), str(value), goal):
+                        bucket = prefs.setdefault(str(key), [])
+                        sv = str(value)
+                        if sv not in bucket:
+                            bucket.append(sv)
+        option_keys = set()
+        if isinstance(variants, dict):
+            for variant in variants.values():
+                if isinstance(variant, dict):
+                    option_keys.update(str(k) for k in (variant.get("options") or {}).keys())
+        for key, values in self._explicit_option_preferences(goal).items():
+            if option_keys and key not in option_keys:
                 continue
-            for key, value in (variant.get("options") or {}).items():
-                if self._option_value_matches_goal(str(key), str(value), goal):
-                    bucket = prefs.setdefault(str(key), [])
-                    sv = str(value)
-                    if sv not in bucket:
-                        bucket.append(sv)
+            bucket = prefs.setdefault(key, [])
+            for value in values:
+                if value not in bucket:
+                    bucket.append(value)
         return prefs
+
+    @staticmethod
+    def _explicit_option_preferences(goal: str) -> Dict[str, List[str]]:
+        """Parse common retail option constraints even when no variant has them.
+
+        Variant-derived matching is useful for synonyms, but it loses a hard
+        constraint when every available candidate is a decoy missing that
+        value.  This parser keeps explicitly requested option values alive so
+        constraint satisfaction remains a filter rather than a score.
+        """
+        specs = {
+            "switch type": ("clicky", "tactile", "linear"),
+            "backlight": ("RGB", "white", "none"),
+            "size": ("full size", "80%", "60%", "S", "M", "L", "XL", "XXL"),
+            "compatibility": ("Google Assistant", "Apple HomeKit", "Amazon Alexa"),
+            "color": (
+                "purple", "black", "white", "blue", "red", "green", "yellow",
+                "pink", "gold", "silver", "stainless steel",
+            ),
+            "material": ("polyester", "cotton", "leather", "silicone", "metal"),
+            "style": ("v-neck", "crew neck"),
+            "display": ("AMOLED", "LCD", "OLED"),
+            "connectivity": ("wireless", "wired"),
+        }
+        prefs: Dict[str, List[str]] = {}
+        for key, values in specs.items():
+            for value in values:
+                if CargoAgent._option_value_matches_goal(key, value, goal):
+                    prefs.setdefault(key, []).append(value)
+        return prefs
+
+    @staticmethod
+    def _same_option_keys(old_options: Dict[str, Any], goal: str) -> List[str]:
+        """Return option keys the user explicitly asked to preserve."""
+        g = CargoAgent._norm_option(goal)
+        out: List[str] = []
+        aliases = {
+            "switch type": ("switch type", "switches"),
+            "backlight": ("backlight", "lighting"),
+            "size": ("size",),
+            "style": ("style", "neck"),
+            "material": ("material", "fabric"),
+            "color": ("color", "colour"),
+            "compatibility": ("compatibility", "compatible"),
+            "band material": ("band material", "band"),
+            "display": ("display", "screen"),
+            "connectivity": ("connectivity", "connection"),
+            "type": ("type",),
+        }
+        for key, old_val in old_options.items():
+            key_norm = CargoAgent._norm_option(key)
+            val_norm = CargoAgent._norm_option(old_val)
+            terms = aliases.get(key_norm, (key_norm,))
+            if any(re.search(rf"\bsame\s+{re.escape(term)}\b", g) for term in terms):
+                out.append(str(key))
+                continue
+            if val_norm and re.search(rf"\bsame\s+{re.escape(val_norm)}\b", g):
+                out.append(str(key))
+        return out
 
     @staticmethod
     def _option_matches_pref(actual: Any, pref: Any) -> bool:
@@ -3016,6 +3100,21 @@ class CargoAgent(Agent):  # type: ignore[misc]
         a_toks = {t for t in a.split() if len(t) >= 2}
         p_toks = {t for t in p.split() if len(t) >= 2}
         return bool(a_toks and p_toks and (a_toks & p_toks))
+
+    def _variant_matches_requirements(
+        self,
+        options: Dict[str, Any],
+        prefs: Dict[str, List[str]],
+    ) -> bool:
+        for key, pref_values in prefs.items():
+            if not pref_values:
+                continue
+            if not any(
+                self._option_matches_pref(options.get(key), pref)
+                for pref in pref_values
+            ):
+                return False
+        return True
 
     def _select_variant_id(
         self,
@@ -3031,6 +3130,11 @@ class CargoAgent(Agent):  # type: ignore[misc]
         old_options = old_item.get("options") or {}
         old_id = str(old_item.get("item_id") or "")
         prefs = self._option_preferences(details, goal)
+        for key in self._same_option_keys(old_options, goal):
+            if key not in prefs and old_options.get(key) not in (None, ""):
+                prefs[key] = [str(old_options.get(key))]
+        if prefs and self._variant_matches_requirements(old_options, prefs):
+            return None
         best: Tuple[int, str] = (-1, "")
         for variant_id, variant in variants.items():
             if not isinstance(variant, dict) or not variant.get("available", True):
@@ -3039,6 +3143,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if vid == old_id:
                 continue
             options = variant.get("options") or {}
+            if mode in ("exchange", "modify") and prefs:
+                # User constraints are hard filters.  Scoring only ranks
+                # candidates after every stated option constraint (including
+                # explicit fallbacks such as "RGB or no backlight") is met.
+                if not self._variant_matches_requirements(options, prefs):
+                    continue
             score = 0
             matched_pref = False
             for key, pref_values in prefs.items():
@@ -3051,17 +3161,6 @@ class CargoAgent(Agent):  # type: ignore[misc]
             for key, old_val in old_options.items():
                 if key not in prefs and self._option_matches_pref(options.get(key), old_val):
                     score += 4
-            if mode == "modify" and len(prefs) >= 2:
-                # Modifies usually specify the target variant directly; require
-                # at least two desired options so a weak color-only match cannot
-                # rewrite an order to a random variant.
-                required_hits = sum(
-                    1
-                    for key, pref_values in prefs.items()
-                    if any(self._option_matches_pref(options.get(key), p) for p in pref_values)
-                )
-                if required_hits < 2:
-                    continue
             if mode == "exchange" and prefs and not matched_pref:
                 continue
             if score > best[0]:

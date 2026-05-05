@@ -238,15 +238,28 @@ class WorkingMemory:
         db_facts entries are evicted by the LRU cap.
         (Observed failure: trajectories(24) T0 — email evicted after
         get_user_details flooded db_facts, breaking auth-confirmation loop.)
+
+        The durable structured caches are included too.  ``db_facts`` is a
+        short prompt-facing LRU, but gates are correctness machinery; they must
+        see all grounded order item IDs, payment IDs, product variant IDs, and
+        option values that came from tool observations.  Without this, a large
+        ``get_product_details`` response can evict the very item IDs needed for
+        a later WRITE precondition, causing useless ASK_USER churn even though
+        the controller already has grounded state.
         """
         base = "\n".join(self.user_facts + self.db_facts)
         extras: list = []
         if self.product_types:
+            extras.append("\n".join(self.product_types.keys()))
             extras.append("\n".join(self.product_types.values()))
         if self.auth_user_id:
             extras.append(self.auth_user_id)
         if self.auth_email:
             extras.append(self.auth_email)
+        for order in self.order_details.values():
+            extras.extend(_flatten_scalar_facts(order))
+        for details in self.product_details.values():
+            extras.extend(_flatten_scalar_facts(details))
         if extras:
             return base + "\n" + "\n".join(extras)
         return base
@@ -449,6 +462,29 @@ def _coerce_struct(obs: Any) -> Any:
                 return s
         return s
     return obs
+
+
+def _flatten_scalar_facts(value: Any, prefix: str = "") -> List[str]:
+    """Return compact scalar facts from a durable structured cache."""
+    out: List[str] = []
+
+    def add(text: Any) -> None:
+        s = str(text).strip()
+        if s:
+            out.append(s[:100])
+
+    if isinstance(value, dict):
+        for k, v in value.items():
+            kpath = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, (str, int, float)) and v not in (None, ""):
+                add(f"{kpath}={v}")
+                add(v)
+            elif isinstance(v, (dict, list)):
+                out.extend(_flatten_scalar_facts(v, kpath))
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            out.extend(_flatten_scalar_facts(item, f"{prefix}[{i}]"))
+    return out
 
 
 __all__ = ["WorkingMemory"]
