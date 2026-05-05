@@ -4,6 +4,11 @@
 This is a Python helper rather than another shell script because the project
 intentionally keeps exactly two shell scripts: ``setup_env.sh`` and
 ``run_project.sh``.
+
+ACEBench pins a few runtime packages to versions that conflict with the
+current CARGO/tau-bench LiteLLM stack.  The default helper intentionally keeps
+those project-owned packages installed and skips only the incompatible pins;
+use a separate virtualenv for an exact upstream ACEBench environment.
 """
 from __future__ import annotations
 
@@ -21,6 +26,10 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTERNAL = ROOT / "external"
 TAU = EXTERNAL / "tau-bench"
 ACE = EXTERNAL / "ACEBench"
+ACE_DEFAULT_SKIP_REASONS = {
+    "openai": "project LiteLLM stack currently requires openai==2.24.0",
+    "python-dotenv": "project LiteLLM stack currently requires python-dotenv==1.2.2",
+}
 
 
 def run(cmd: List[str], cwd: Path | None = None, *, check: bool = False) -> Dict[str, Any]:
@@ -56,7 +65,7 @@ def install_tau() -> Dict[str, Any]:
     return run([sys.executable, "-m", "pip", "install", "-e", str(TAU)])
 
 
-def install_ace(*, include_vllm: bool) -> Dict[str, Any]:
+def install_ace(*, include_vllm: bool, include_conflicting_pins: bool) -> Dict[str, Any]:
     req = ACE / "requirements.txt"
     if not req.exists():
         return {"status": "blocked", "reason": f"missing {req}"}
@@ -69,8 +78,10 @@ def install_ace(*, include_vllm: bool) -> Dict[str, Any]:
         if not line or line.startswith("#"):
             continue
         name = line.split("==", 1)[0].strip().lower().replace("_", "-")
-        if name in {"vllm"}:
-            skipped.append(line)
+        if name in {"vllm"} and not include_vllm:
+            skipped.append(f"{line} (skipped: use --include-ace-vllm only in an isolated env)")
+        elif name in ACE_DEFAULT_SKIP_REASONS and not include_conflicting_pins:
+            skipped.append(f"{line} (skipped: {ACE_DEFAULT_SKIP_REASONS[name]})")
         else:
             safe.append(line)
     if not safe:
@@ -96,6 +107,7 @@ def main() -> int:
     parser.add_argument("--bench", choices=["all", "tau", "ace"], default="all")
     parser.add_argument("--install", action="store_true")
     parser.add_argument("--include-ace-vllm", action="store_true")
+    parser.add_argument("--include-ace-conflicting-pins", action="store_true")
     parser.add_argument("--json-out", default="")
     ns = parser.parse_args()
 
@@ -111,7 +123,10 @@ def main() -> int:
     if ns.bench in ("all", "ace"):
         summary["actions"].append(clone_repo("https://github.com/chenchen0103/ACEBench.git", ACE))
         if ns.install:
-            summary["actions"].append(install_ace(include_vllm=ns.include_ace_vllm))
+            summary["actions"].append(install_ace(
+                include_vllm=ns.include_ace_vllm,
+                include_conflicting_pins=ns.include_ace_conflicting_pins,
+            ))
     summary["import_check"] = import_check()
     summary["git_available"] = shutil.which("git") is not None
 

@@ -201,7 +201,16 @@ class WorkingMemory:
             kpath = f"{prefix}.{k}" if prefix else str(k)
             if isinstance(v, (str, int, float)) and v not in (None, ""):
                 self._add_typed_value(kpath, v)
-                self._add_semantic_slot(kpath, v, confirmed=True)
+                # Tool observations often contain nested object facts such as
+                # reservation.flights[0].date.  Those are evidence about an
+                # observed candidate, not necessarily the user's active task
+                # frame.  Only promote top-level scalar observations into
+                # generic semantic slots when missing; do not let a later
+                # observation rewrite a user-bound task frame. Domain adapters
+                # can opt into richer task-frame binding with explicit
+                # provenance.
+                if not prefix and _normalize_semantic_key(kpath) not in self.semantic_slots:
+                    self._add_semantic_slot(kpath, v, confirmed=True)
                 self._add_db_fact(f"{kpath}={v}")
                 # Also store the value alone (helps arg-grounding substring).
                 if isinstance(v, str) and v.strip():
@@ -214,7 +223,6 @@ class WorkingMemory:
                         self._absorb_dict(item, prefix=f"{kpath}[{i}]")
                     elif isinstance(item, (str, int, float)) and item not in (None, ""):
                         self._add_typed_value(kpath, item)
-                        self._add_semantic_slot(kpath, item, confirmed=True)
                         self._add_db_fact(f"{kpath}[{i}]={item}")
 
     def _bind_user_semantics(self, text: str) -> bool:

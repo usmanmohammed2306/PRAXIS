@@ -675,6 +675,26 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     })
                     action = res_action
 
+            # Pure catalog/count questions do not require identity.  If the
+            # proposer starts with an auth-style ASK_USER, route directly to
+            # retrieval so CARGO does useful READ work before asking for PII.
+            if action is not None:
+                catalog_action = self._no_auth_product_query_action(action, wm)
+                if catalog_action is not None:
+                    raw_text = json.dumps({
+                        "thought": catalog_action.raw_thought,
+                        "action": {
+                            "name": catalog_action.name,
+                            "args": catalog_action.args,
+                            "declared_class": catalog_action.declared_class.value,
+                            "declared_pre": catalog_action.declared_pre,
+                            "declared_post": catalog_action.declared_post,
+                            "informational_intent": catalog_action.informational_intent,
+                            "user_text": catalog_action.user_text,
+                        },
+                    })
+                    action = catalog_action
+
             # CARGO-v4 obligation/decision guide: READ actions build state, so when a
             # proposal is an unhelpful ASK/FINAL/repeated read but obligations
             # already identify the next information need, deterministically
@@ -1270,6 +1290,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             stats.executed_by_class[cls] = stats.executed_by_class.get(cls, 0) + 1
             step_record["executed"] = True
             stats.record_step(step_record)
+            pending_grounded_mutation = False
             if (
                 action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE)
                 and pc.ok
@@ -1277,14 +1298,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 wm.record_executed_mutation(action.signature())
                 wm.lock_phase("mutation")
                 # A task may require multiple distinct writes (for example,
-                # updating two separate pending orders).  Stop immediately
-                # when no further grounded mutation remains, but do not mark
-                # the whole task complete after the first successful write if
-                # the controller can assemble another fresh, non-duplicate
-                # mutation from the updated state.
-                if self._grounded_retail_commit_action(wm) is None:
-                    wm.task_completed = True
-                    break
+                # updating two separate pending orders).  Defer terminal
+                # completion until after the post-write respond has given the
+                # user simulator a chance to STOP.
+                pending_grounded_mutation = self._grounded_retail_commit_action(wm) is not None
             if done:
                 break
 
@@ -1451,6 +1468,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE)
                 and not done
                 and not wm.post_write_responded
+                and not pending_grounded_mutation
             ):
                 summary = self._post_write_summary(action, tool_obs)
                 env_resp2 = self._respond(env, summary)
@@ -1488,8 +1506,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 wm.post_write_responded = True
                 wm.last_final_text = summary
                 wm.consecutive_same_final = 1
+                stats.actions_executed += 1
+                stats.executed_by_class[RiskClass.FINAL.value] = (
+                    stats.executed_by_class.get(RiskClass.FINAL.value, 0) + 1
+                )
+                wm.task_completed = True
                 if done:
                     break
+                break
 
         info = dict(info) if info else {}
         if step_error:
@@ -2362,6 +2386,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
         """
         if not self._has_tool("get_reservation_details"):
             return None
+        if self._airline_booking_intent(wm):
+            return None
         if not self._reservation_task_needs_scan(wm):
             return None
         repeated_profile = action.name == "get_user_details"
@@ -2402,6 +2428,20 @@ class CargoAgent(Agent):  # type: ignore[misc]
             r"\b(reservation|booking|flight|ticket|trip|cancel|change|modify|upgrade|baggage|bags?)\b",
             text,
         ))
+
+    @staticmethod
+    def _airline_booking_intent(wm: "WorkingMemory") -> bool:
+        slots = getattr(wm, "semantic_slots", {}) or {}
+        intents = slots.get("intents") or slots.get("intent") or []
+        if not isinstance(intents, list):
+            intents = [intents]
+        if any(str(v).lower() == "book_flight" for v in intents):
+            return True
+        text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        return bool(
+            re.search(r"\b(book|reserve|purchase)\b", text)
+            and re.search(r"\b(flight|ticket|trip)\b", text)
+        )
 
     # ------------------------------------------------------------------
     # Generic grounded-argument resolver
@@ -2563,6 +2603,71 @@ class CargoAgent(Agent):  # type: ignore[misc]
         if obs_lower.startswith("[]"):
             return True
         return False
+
+    def _no_auth_product_query_action(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """Route pure catalog/count requests to retrieval before auth.
+
+        The auth override catches placeholder ``find_user_id_*`` proposals,
+        but recent traces show the model often begins pure product-count
+        tasks with ``respond`` asking for identity.  Catalog queries are
+        explicitly no-auth, so the deterministic controller should start with
+        READs instead of consuming turns on PII questions.
+        """
+        if not self._is_no_auth_query(wm) or self._is_account_order_goal(wm):
+            return None
+        unhelpful = (
+            action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
+            or action.name.lower() in (
+                RESPOND_TOOL_NAME, "respond", "send_user", "finish", "final", "answer",
+                "find_user_id_by_email", "find_user_id_by_name_zip",
+            )
+            or action.signature() in wm.recent_signatures
+            or wm.failed_without_new_evidence(action.signature())
+        )
+        if action.name == "list_all_product_types" and action.signature() not in wm.recent_signatures:
+            return None
+        if not unhelpful and action.name != "list_all_product_types":
+            return None
+        if not wm.product_types and self._has_tool("list_all_product_types"):
+            return self._fresh_action_or_none(ProposedAction(
+                name="list_all_product_types",
+                args={},
+                declared_class=RiskClass.READ,
+                declared_pre=["catalog query needs no auth"],
+                declared_post=["product types listed"],
+                informational_intent="list catalog product types",
+                raw_thought=(
+                    "Decision engine: pure product query is no-auth; list "
+                    "catalog types instead of asking for identity."
+                ),
+                user_text="",
+                raw_response="",
+            ), wm)
+        if wm.product_types and self._has_tool("get_product_details"):
+            all_user = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+            for name, pid in wm.product_types.items():
+                if not name or not pid or pid in wm.product_details:
+                    continue
+                if self._product_name_matches_user(name.lower(), all_user):
+                    return self._fresh_action_or_none(ProposedAction(
+                        name="get_product_details",
+                        args={"product_id": pid},
+                        declared_class=RiskClass.READ,
+                        declared_pre=["catalog product id grounded"],
+                        declared_post=["product details retrieved"],
+                        informational_intent=f"fetch details for {name}",
+                        raw_thought=(
+                            f"Decision engine: fetch no-auth catalog details "
+                            f"for user-mentioned product '{name}'."
+                        ),
+                        user_text="",
+                        raw_response="",
+                    ), wm)
+        return None
 
     # Product-ID / product-list helpers
     # ------------------------------------------------------------------

@@ -1,7 +1,7 @@
 # CARGO Known-Issue Ledger
 
 This ledger is the recovery record for the uploaded CARGO runs from
-`metrics (24).json` through `metrics (40).json`, their paired trajectories,
+`metrics (24).json` through `metrics (46).json`, their paired trajectories,
 and the local regression suite.  It is intentionally phrased by failure
 class rather than benchmark task answer, so it remains a test and design
 artifact rather than an answer key.
@@ -29,6 +29,12 @@ Machine-readable companion: `docs/known_issues.json`.
 | metrics (38) | retail | 0.0 | 0.0 | 28.4 | 18 | 15 | 1 | 2 | 37 |
 | metrics (39) | airline | 0.0 | 0.0 | 39.2 | 72 | 42 | 8 | 22 | 28 |
 | metrics (40) | retail | 0.0 | 0.0 | 28.2 | 16 | 15 | 0 | 1 | 38 |
+| metrics (41) | ACEBench agent | 1.0 completion | n/a | 2.0 avg steps | n/a | n/a | n/a | n/a | 1.0 avg tool calls |
+| metrics (42) | airline | 0.0 | 0.0 | 49.8 | 39 | 22 | 7 | 10 | 61 |
+| metrics (43) | retail | 0.0 | 0.0 | 28.2 | 17 | 14 | 1 | 2 | 37 |
+| metrics (44) | ACEBench agent | 1.0 completion | n/a | 2.0 avg steps | n/a | n/a | n/a | n/a | 1.0 avg tool calls |
+| metrics (45) | airline | 0.0 | 0.0 | 47.4 | 46 | 27 | 6 | 13 | 54 |
+| metrics (46) | retail | 0.0 | 0.0 | 33.6 | 27 | 22 | 0 | 5 | 42 |
 
 ## Benchmark Context Used
 
@@ -61,6 +67,14 @@ Machine-readable companion: `docs/known_issues.json`.
   exhaustion, schedules pipeline stages, suppresses exhausted repeated
   searches, blocks premature ASK_USER questions, and terminates after a true
   blocker or successful write.
+- Task-frame isolation keeps user-bound goal slots separate from nested
+  candidate/reservation/profile facts, so tool observations add evidence
+  without silently rewriting the current route/date/cabin/product objective.
+- No-auth catalog routing sends pure retail product-count/list requests to
+  catalog READ actions instead of identity collection. Account/order tasks
+  remain auth-strict.
+- Successful WRITE/IRREVERSIBLE actions emit a post-write `respond` before
+  terminal completion, unless another distinct grounded mutation is pending.
 - Obligation guidance converts repeated or generic ASK/FINAL proposals into
   the next grounded READ when user/tool evidence already identifies an open
   information need.
@@ -111,14 +125,20 @@ Machine-readable companion: `docs/known_issues.json`.
 | Airline city names used as airport-code search args | metrics (39) searched with user-facing city names such as New York/Seattle, which tau-airline tools expect as three-letter airport codes | The adapter bound semantic route text but did not canonicalize search arguments or allow city/code semantic equivalence | Domain adapters translate ordinary route text into tool-native airport codes while the core still validates against the bound semantic city state; ambiguous regions match DB airport evidence but are not guessed as a search arg | `test_v4_airline_search_uses_airport_codes_but_matches_bound_city_state`, `test_v4_airline_region_word_matches_db_airport_without_canonicalizing_search_to_guess` | Fixed, verified |
 | Adapter-declared IDs can bypass grounding when schema is missing | metrics (39) showed invalid `get_reservation_details(reservation_id='though')` style calls in trajectories | Schema enrichment may be absent for a synthesized proposal, so plain-word ID arguments must have an adapter-level state backstop | Adapter ID fields are opaque identifiers even when the schema is weak; plain words are rejected before READ execution | `test_v4_adapter_id_backstop_rejects_plain_word_when_schema_is_missing` | Fixed, verified |
 | Structured payment IDs missing from typed state | Regression exposed by stricter forced-ID grounding | Cached order/profile payment fields were visible in evidence text but not as typed ID evidence | Payment, card, and certificate IDs are extracted from durable structured caches | `test_h2_complete_canonical_write_passes_completeness_gate` | Fixed, verified |
+| Airline reservation observation overwrote booking goal | metrics (42)/(45) booking tasks bound New York→Seattle May 20, then profile/reservation reads shifted searches to unrelated stored trips such as DEN→LAS May 27 | Tool observation fields were promoted into semantic task slots without preserving user-slot provenance | User-bound task-frame slots keep provenance; tool object fields are evidence, not automatic goal updates | `test_v4_airline_reservation_obs_does_not_overwrite_booking_anchor`, `test_tool_observation_does_not_overwrite_user_bound_date` | Fixed, verified |
+| New booking scanned existing reservations before itinerary search | metrics (42)/(45) new-booking tasks retrieved reservation details after profile instead of searching the requested route/date | Reservation-scan advancement did not distinguish new booking intent from modification/cancel intent | Booking intent suppresses reservation scans and keeps the pipeline on grounded flight search | `test_v4_booking_task_does_not_scan_reservations_before_search` | Fixed, verified |
+| Pure product-count task asked for identity | metrics (46) included catalog/count requests that burned turns on auth-like asks despite no account/order operation | The no-auth override caught placeholder lookup tools but not model-proposed `respond`/ASK_USER actions | Pure catalog/count goals route to `list_all_product_types` or grounded `get_product_details` before identity collection | `test_v4_no_auth_product_query_routes_to_catalog_read` | Fixed, verified |
+| Successful write did not give simulator a terminal response | metrics (43)/(46) retail traces executed useful writes but did not always produce the post-write `respond` needed for tau-bench STOP/reward | The solve loop marked the task complete and broke before the post-write response path | Terminal completion is deferred until after a deterministic post-write `respond`, unless another distinct grounded mutation remains | `test_solve_emits_auto_respond_after_write`, `test_solve_post_write_responded_flag_set` | Fixed, verified |
 
 ## Remaining Limitations
 
 - Classic tau-bench and ACEBench were cloned into `external/`; tau-bench was
-  installed locally.  ACEBench non-vLLM data/eval dependencies were installed,
-  while upstream `vllm==0.6.1.post1` remains intentionally skipped in the
-  generic helper unless `--include-ace-vllm` is used in an isolated
-  environment.  Live smoke still needs a model endpoint/API key.
+  installed locally.  ACEBench data/eval dependencies are installed while
+  upstream pins that conflict with the CARGO/LiteLLM runtime
+  (`openai==1.64.0`, `python-dotenv==1.0.1`, `vllm==0.6.1.post1`) are skipped
+  by default. Use `--include-ace-vllm --include-ace-conflicting-pins` only in
+  an isolated virtualenv for exact upstream reproduction. Live smoke still
+  needs a model endpoint/API key.
 - Airline full booking selection is guarded for slot completeness, state
   consistency, obligation-guided search progression, empty-search exhaustion,
   and premature payment asks. A complete deterministic cheapest-itinerary
@@ -127,11 +147,14 @@ Machine-readable companion: `docs/known_issues.json`.
 
 ## Verification
 
-- `python3 -m unittest tests.test_cargo`: 245 local regression tests passed.
-- `python3 -m compileall src tests`: passed.
+- `python3 -m unittest tests.test_cargo -v`: 267 local regression tests passed.
+- `python3 -m compileall src tests scripts`: passed.
+- `python3 scripts/benchmark_setup.py --bench all --install`: passed with
+  tau-bench installed and ACEBench conflicting pins skipped by default.
+- `python3 -m pip check`: no broken requirements found.
 - `git diff --check`: passed.
 - `bash run_project.sh --dry-run`: passed configuration resolution without
   launching a model server or benchmark run.
-- `python3 scripts/run_smoke.py --target all`: synthetic checks run offline;
-  tau retail/airline and ACE live smoke are blocked unless `OPENAI_API_KEY`
-  or `OPENAI_BASE_URL` is present.
+- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_latest.json`:
+  synthetic checks passed; tau retail/airline and ACE live smoke are blocked
+  unless `OPENAI_API_KEY` or `OPENAI_BASE_URL` is present.

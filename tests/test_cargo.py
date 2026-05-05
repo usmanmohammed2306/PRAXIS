@@ -368,6 +368,13 @@ class TestWorkingMemory(unittest.TestCase):
 
         self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
 
+    def test_tool_observation_does_not_overwrite_user_bound_date(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_user_message("Book the flight on May 20th.")
+        wm.absorb_observation({"date": "2024-05-27"})
+
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
+
     def test_absorb_observation_dict_promotes_scalars(self) -> None:
         wm = WorkingMemory()
         wm.absorb_observation({"order_id": "O999", "status": "pending"})
@@ -4939,6 +4946,91 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         self.assertTrue(adapter.semantic_values_match("origin", "DFW", "Texas"))
         self.assertTrue(adapter.semantic_values_match("origin", "IAH", "Texas"))
 
+    def test_v4_airline_reservation_obs_does_not_overwrite_booking_anchor(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "Book an economy flight from New York to Seattle on May 20th. "
+            "My user id is mia_li_3668."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+
+        obs = {
+            "reservation_id": "HKEG34",
+            "origin": "DEN",
+            "destination": "LAS",
+            "cabin": "business",
+            "flights": [{"origin": "DEN", "destination": "LAS", "date": "2024-05-27"}],
+        }
+        wm.absorb_observation(obs)
+        agent._kernel().observe_tool_result(wm, "get_reservation_details", obs)
+        ask = ProposedAction(name="respond", args={}, declared_class=RiskClass.ASK_USER)
+
+        replacement = agent._obligation_guided_action(ask, wm)
+
+        self.assertEqual(wm.semantic_slots["origin"], "New York")
+        self.assertEqual(wm.semantic_slots["destination"], "Seattle")
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_direct_flight")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["origin"], "JFK")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["destination"], "SEA")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["date"], "2024-05-20")  # type: ignore[union-attr]
+
+    def test_v4_booking_task_does_not_scan_reservations_before_search(self) -> None:
+        agent = self._make_airline_agent()
+        agent.schemas["get_reservation_details"] = ToolEffectSchema(
+            name="get_reservation_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["reservation_id"],
+        )
+        wm = WorkingMemory()
+        text = (
+            "Book a flight from New York to Seattle on May 20th in economy. "
+            "My user id is mia_li_3668."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.user_profiles["mia_li_3668"] = {"reservations": ["HKEG34"]}
+        wm.typed_values["reservation_id"] = ["HKEG34"]
+        repeated_profile = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "mia_li_3668"},
+            declared_class=RiskClass.READ,
+        )
+
+        scan = agent._advance_reservation_retrieval(repeated_profile, wm)
+        replacement = agent._obligation_guided_action(
+            ProposedAction(name="respond", args={}, declared_class=RiskClass.ASK_USER),
+            wm,
+        )
+
+        self.assertIsNone(scan)
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_direct_flight")  # type: ignore[union-attr]
+
+    def test_v4_no_auth_product_query_routes_to_catalog_read(self) -> None:
+        agent = self._make_retail_agent()
+        agent.schemas["list_all_product_types"] = ToolEffectSchema(
+            name="list_all_product_types",
+            cls=RiskClass.READ,
+        )
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are currently available in the store?"
+        wm.absorb_user_message(wm.goal)
+        ask = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="Could you provide your name and ZIP?",
+        )
+
+        replacement = agent._no_auth_product_query_action(ask, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "list_all_product_types")  # type: ignore[union-attr]
+
     def test_v4_airline_blocks_premature_payment_questions(self) -> None:
         wm = WorkingMemory()
         text = "Book a flight from New York to Seattle on May 20th in economy."
@@ -5159,36 +5251,24 @@ class TestTrajectory43Regressions(unittest.TestCase):
         # Use realistic tau-bench-format IDs in the initial user message
         # so arg_grounding can ground the WRITE's args without a prior READ.
         ORDER_ID = "#W2378156"
-        ITEM_OLD = "1151293680"
-        ITEM_NEW = "7706410293"
         PAY = "credit_card_9513926"
         USER_TURN = (
-            f"Exchange order {ORDER_ID}: swap item {ITEM_OLD} for item {ITEM_NEW} "
-            f"on payment method {PAY}.  Please proceed."
+            f"Modify pending order {ORDER_ID}: change payment method to {PAY}. "
+            "Please proceed."
         )
-        # Step 0 proposer: emit a WRITE exchange (only the first step
+        # Step 0 proposer: emit a WRITE mutation (only the first step
         # matters for this test).
         scripts: List[Any] = [
             _proposer_json(
-                name="exchange_delivered_order_items",
-                args={
-                    "order_id": ORDER_ID,
-                    "item_ids": [ITEM_OLD],
-                    "new_item_ids": [ITEM_NEW],
-                    "payment_method_id": PAY,
-                },
+                name="modify_pending_order_payment",
+                args={"order_id": ORDER_ID, "payment_method_id": PAY},
                 declared_class="WRITE",
                 thought="commit",
             ),
             # SC samples for the WRITE (3 agreeing).
             [_proposer_json(
-                name="exchange_delivered_order_items",
-                args={
-                    "order_id": ORDER_ID,
-                    "item_ids": [ITEM_OLD],
-                    "new_item_ids": [ITEM_NEW],
-                    "payment_method_id": PAY,
-                },
+                name="modify_pending_order_payment",
+                args={"order_id": ORDER_ID, "payment_method_id": PAY},
                 declared_class="WRITE",
             )] * 3,
             # CF rollout: still reachable.
@@ -5203,12 +5283,12 @@ class TestTrajectory43Regressions(unittest.TestCase):
         ]
         client = MockClient(scripts=scripts)
 
-        # MockEnv: first env.step(exchange) returns the order details
+        # MockEnv: first env.step(write) returns the order details
         # (done=False, like a real WRITE).  Second env.step is the
         # auto-respond — return done=True so the loop exits cleanly with
         # reward 1.0.
         write_obs = json.dumps({
-            "order_id": ORDER_ID, "status": "exchange requested",
+            "order_id": ORDER_ID, "status": "payment modified",
         })
         env = MockEnv(
             initial_user=USER_TURN,
@@ -5232,8 +5312,8 @@ class TestTrajectory43Regressions(unittest.TestCase):
         agent.calibration = default_calibration()
         # Schema for the WRITE so gates have something to check.
         agent.schemas = induce_schemas([_tool(
-            "exchange_delivered_order_items",
-            ["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+            "modify_pending_order_payment",
+            ["order_id", "payment_method_id"],
         )])
         agent.domain_policy = ""
 
@@ -5243,7 +5323,7 @@ class TestTrajectory43Regressions(unittest.TestCase):
         # executed against the env (the WRITE and the auto-respond).
         executed_names = [a.name for a in env.actions_executed]
         self.assertIn(
-            "exchange_delivered_order_items", executed_names,
+            "modify_pending_order_payment", executed_names,
             f"WRITE never executed; env actions={executed_names}",
         )
         self.assertIn(
@@ -5252,7 +5332,7 @@ class TestTrajectory43Regressions(unittest.TestCase):
         )
         # Order matters: respond must come AFTER the exchange.
         self.assertLess(
-            executed_names.index("exchange_delivered_order_items"),
+            executed_names.index("modify_pending_order_payment"),
             executed_names.index("respond"),
             f"Auto-respond fired before WRITE; env actions={executed_names}",
         )

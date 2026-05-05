@@ -68,7 +68,10 @@ unchanged.
             │                                                         │
             │  (6)  Execute → obs                                     │
             │  (7)  Post-condition check (advisory)                   │
-            │  (8)  WM update (db_facts ← scalar keys in obs)         │
+            │  (8)  WM update                                        │
+            │       top-level scalar obs may fill missing slots;      │
+            │       nested object facts remain evidence unless an     │
+            │       adapter explicitly promotes them.                 │
             │  (9)  Loop until FINAL passes the gate.                 │
             └─────────────────────────────────────────────────────────┘
 ```
@@ -145,6 +148,10 @@ candidate or next pipeline step. The current decision engine provides:
 - **Candidate-set manager**: READ results are stored with source tool, query
   args, empty/exhausted status, rejected candidates, and selected candidates.
   Empty searches are not repeated without new evidence.
+- **Task-frame isolation**: user-stated goal slots keep their provenance.
+  Nested observation facts such as reservation flight dates or candidate
+  routes are stored as evidence but do not overwrite the active route/date/
+  cabin goal unless an adapter explicitly binds them.
 - **Pipeline scheduler**: obligations move through intent binding,
   prerequisite retrieval, candidate search, candidate selection, secondary
   details, confirmation, write, verification, and termination.
@@ -161,6 +168,13 @@ candidate or next pipeline step. The current decision engine provides:
   semantic user fact, while the airline adapter converts search arguments to
   tool-native airport codes such as `JFK`/`SEA` and validates city/code
   equivalence.
+- **Clean terminal behavior**: successful WRITE/IRREVERSIBLE actions emit a
+  deterministic post-write `respond` before terminating, so the benchmark
+  user simulator can produce `STOP` and score the final state. Multi-write
+  retail tasks can still continue when a fresh grounded mutation remains.
+- **No-auth retrieval routing**: pure catalog/count questions are routed to
+  catalog READs instead of asking for identity, while order/account tasks keep
+  strict authentication.
 - **Schema backstop for IDs**: adapter-declared ID fields remain opaque even
   if a synthesized schema is incomplete, so plain words cannot slip into
   fields such as `reservation_id`.
@@ -298,13 +312,13 @@ python3 scripts/benchmark_setup.py --bench all --install
 ```
 
 By default the ACEBench helper installs the data/evaluation dependencies and
-skips ACEBench's pinned `vllm==0.6.1.post1`; `setup_env.sh` owns the model
-serving stack and filters upstream requirements so the CARGO vLLM build is not
-clobbered.  To reproduce upstream ACEBench exactly in an isolated environment,
-run:
+skips upstream pins that would clobber the CARGO/tau-bench runtime:
+`openai==1.64.0`, `python-dotenv==1.0.1`, and `vllm==0.6.1.post1`.
+`setup_env.sh` owns the model-serving stack. To reproduce upstream ACEBench
+exactly, use a separate virtualenv and opt into the conflicting pins:
 
 ```bash
-python3 scripts/benchmark_setup.py --bench ace --install --include-ace-vllm
+python3 scripts/benchmark_setup.py --bench ace --install --include-ace-vllm --include-ace-conflicting-pins
 ```
 
 Run local smoke checks:
@@ -376,49 +390,29 @@ outputs/
     summary.md     # rendered table
 ```
 
-## Recent Fixes (FIX-A, FIX-B, FIX-C)
+## Recent Failure-Recovery Updates
 
-The tau-bench benchmark revealed three failure patterns in earlier trajectories
-(trajectories 22–43) that are now fixed:
+The uploaded trajectories through `metrics (46).json` exposed four remaining
+controller failures that are now covered by regression tests:
 
-### FIX-A: Post-WRITE Auto-Respond
-**Problem:** After a WRITE/IRREVERSIBLE action (e.g., exchange_delivered_order_items),
-the agent executed the mutation correctly but did not emit a respond. Without respond,
-the benchmark's user simulator never sees `###STOP###`, so `done` stays False and
-reward is never calculated. Even perfect WRITE args scored 0 reward.
+- **Airline task-frame drift:** reservation/profile observations could overwrite
+  the user's booking route/date/cabin. CARGO now treats nested observation
+  fields as candidate evidence, while the airline adapter filters route/date/
+  cabin updates unless they come from user intent binding.
+- **Airline booking-stage drift:** new booking tasks sometimes scanned existing
+  reservations before searching for the requested itinerary. Booking intent now
+  suppresses reservation scanning and keeps the pipeline on route/date search.
+- **Retail no-auth catalog queries:** pure product count/list questions could
+  waste turns asking for identity. The deterministic controller now routes them
+  to catalog READ actions before any auth question.
+- **Post-write termination:** successful retail writes now emit a post-write
+  `respond` before terminal completion, unless a fresh grounded mutation is
+  still pending.
 
-**Solution:** Deterministic controller-level auto-respond after successful WRITE/IRREVERSIBLE
-execution. The agent now summarizes the action outcome and calls `respond` automatically,
-allowing the user simulator to emit STOP and trigger reward calculation.
-
-**Impact:** Closed reward gap for retail tasks with successful WRITE execution.
-(10 new unit/integration tests; all 189 pass)
-
-### FIX-B: Search-Exhaustion Escape
-**Problem:** Airline task T0 (and similar multi-search tasks) executed 20+ consecutive
-search_direct_flight and search_onestop_flight calls without finding results, burning
-the step budget without progress.
-
-**Solution:** Deterministic search-exhaustion detector that tracks consecutive empty
-search results across search_* tool calls. After 4+ consecutive empty results, emits
-ASK_USER to break the loop, allowing the agent to refine search parameters or ask
-for clarification.
-
-**Impact:** Prevents search-loop dead ends in airline benchmark.
-(5 new unit/integration tests; all 194 pass)
-
-### FIX-C: Auth-Cycle Escape
-**Problem:** Airline task T1 alternated between get_user_details and respond proposals
-with 12+ abstains, unable to progress past authentication. The agent was stuck trying
-to confirm identity but not making forward progress.
-
-**Solution:** Deterministic auth-cycle detector that tracks consecutive calls to
-auth-related tools (find_user_id_by_email, find_user_id_by_name_zip, get_user_details)
-without confirming a new user_id. After 3+ consecutive auth attempts without progress,
-emits ASK_USER to clarify identity or accept current auth state.
-
-**Impact:** Prevents auth-loop dead ends in airline benchmark.
-(3 new unit/integration tests; all 197 pass)
+Older fixes are still present: repeated empty searches are marked exhausted,
+auth cycles are bounded, adapter-declared ID fields fail closed, hard
+constraints filter candidates before preferences, and WRITE/FINAL actions stay
+commitment-strict.
 
 ---
 
@@ -439,11 +433,15 @@ precondition matching; argument-grounding regex coverage; repeat-loop
 detection; self-consistency vote (mock client with `n>1`); counterfactual
 rollout (mock client); post-condition error detection; proposer JSON parsing;
 repair policy decisions; READ-permissive / WRITE-strict validation; airline
-obligation-guided search progression; and full agent loop behavior on mock
+obligation-guided search progression; task-frame isolation; no-auth catalog
+routing; post-write terminal response; and full agent loop behavior on mock
 environments.
 
-Latest local verification in this workspace: `245` tests passed. Live
-tau-bench / ACEBench smoke tests require either `OPENAI_API_KEY` or an
+Latest local verification in this workspace: `267` tests passed, compileall
+passed, `git diff --check` passed, and `bash run_project.sh --dry-run`
+resolved the benchmark configuration. Synthetic smoke passed. Classic
+tau-bench and ACEBench dependencies are present, but live tau-bench /
+ACEBench smoke tests still require either `OPENAI_API_KEY` or an
 OpenAI-compatible `OPENAI_BASE_URL`; without one, the smoke helper reports
 them as blocked and leaves exact rerun commands.
 

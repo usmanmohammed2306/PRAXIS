@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, List, Optional, Tuple
 
-from ..core import BaseCargoAdapter, Obligation, Preference, TaskState
+from ..core import BaseCargoAdapter, Obligation, Preference, TaskState, normalize_key
 from ..schemas import GateResult, ProposedAction, ToolEffectSchema
 
 
@@ -49,6 +49,30 @@ class TauAirlineAdapter(BaseCargoAdapter):
         "baggage_count", "travel_insurance", "payment_preferences",
         "payment_preference", "time_preference", "time_after", "intent",
     }
+
+    def absorb_observation(self, obs: Any, state: TaskState, action_name: str = "") -> List[Tuple[str, Any, bool]]:
+        """Store airline tool evidence without overwriting the active goal.
+
+        Reservation/profile/search observations carry fields named
+        ``origin``, ``destination``, ``date``, and ``cabin`` for many objects.
+        Those are candidate/current-reservation facts, not automatically the
+        user's requested route/date/cabin.  The generic state still records
+        them as DB-confirmed evidence, but the adapter does not return them as
+        task-frame slot updates for ``WorkingMemory.semantic_slots``.
+        """
+        updates = super().absorb_observation(obs, state, action_name)
+        task_frame_fields = {
+            "date", "origin", "destination", "cabin", "trip_type",
+            "baggage_count", "travel_insurance", "insurance",
+            "time_preference", "time_after", "flight_type",
+        }
+        filtered: List[Tuple[str, Any, bool]] = []
+        for key, value, confirmed in updates:
+            leaf = normalize_key(str(key).split(".")[-1])
+            if leaf in task_frame_fields:
+                continue
+            filtered.append((key, value, confirmed))
+        return filtered
 
     def bind_user_message(self, text: str, state: TaskState) -> List[Tuple[str, Any, bool]]:
         updates = super().bind_user_message(text, state)
