@@ -118,6 +118,40 @@ def decide(
             ),
         )
 
+    if gate == "completeness":
+        crit = (
+            "The proposed write is incomplete or does not match the complete "
+            "grounded action. Do NOT execute partial solutions. Gather any "
+            "missing order/product details first, then propose exactly one "
+            "complete write covering all requested items and constraints."
+        )
+        if retries_used < max_retries and budget_steps_remaining > 3:
+            return RepairDecision(action="RETRY", critique=crit)
+        return RepairDecision(
+            action="ASK_USER",
+            user_message=(
+                "I do not yet have a complete, verified set of changes for "
+                "all requested items. Could you confirm the missing details?"
+            ),
+        )
+
+    if gate == "final_completeness":
+        crit = (
+            "The final answer is premature: this task still has unresolved "
+            "account/order work. Do not finalize yet. Authenticate if needed, "
+            "retrieve the required order/product state, then execute the "
+            "complete grounded mutation or ask for the exact missing fact."
+        )
+        if retries_used < max_retries and budget_steps_remaining > 3:
+            return RepairDecision(action="RETRY", critique=crit)
+        return RepairDecision(
+            action="ASK_USER",
+            user_message=(
+                "I still need verified account or order details before I can "
+                "complete every requested change."
+            ),
+        )
+
     if gate == "completed_task":
         return RepairDecision(
             action="FINALIZE_GENERIC",

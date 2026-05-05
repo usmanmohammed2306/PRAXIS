@@ -3891,6 +3891,140 @@ class TestTrajectory24Regressions(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertEqual(second.args["order_id"], "#W2")
 
+    def test_h1_partial_write_is_blocked_by_completeness_gate(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "Please exchange the mechanical keyboard for clicky switches and "
+            "the smart thermostat for one compatible with Google Home. If "
+            "there is no clicky RGB full size keyboard, go for no backlight."
+        )
+        wm.auth_user_id = "u"
+        wm.order_details["#W1"] = {
+            "order_id": "#W1",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "pm"}],
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "kbd",
+                    "item_id": "oldkbd",
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+                },
+                {
+                    "name": "Smart Thermostat",
+                    "product_id": "thermo",
+                    "item_id": "oldthermo",
+                    "options": {"compatibility": "Apple HomeKit", "color": "black"},
+                },
+            ],
+        }
+        wm.product_details["kbd"] = {
+            "name": "Mechanical Keyboard",
+            "variants": {
+                "rightkbd": {
+                    "item_id": "rightkbd",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "none", "size": "full size"},
+                },
+                "decoykbd": {
+                    "item_id": "decoykbd",
+                    "available": True,
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "80%"},
+                },
+            },
+        }
+        wm.product_details["thermo"] = {
+            "name": "Smart Thermostat",
+            "variants": {
+                "rightthermo": {
+                    "item_id": "rightthermo",
+                    "available": True,
+                    "options": {"compatibility": "Google Assistant", "color": "black"},
+                }
+            },
+        }
+        partial = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={
+                "order_id": "#W1",
+                "item_ids": ["oldkbd"],
+                "new_item_ids": ["decoykbd"],
+                "payment_method_id": "pm",
+            },
+            declared_class=RiskClass.WRITE,
+        )
+        schema = ToolEffectSchema(
+            name="exchange_delivered_order_items",
+            cls=RiskClass.WRITE,
+            arg_id_fields=["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+            required_params=["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+        )
+        failing, diag = agent._run_gates(partial, schema, wm, [], CargoStats())
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "completeness")
+        self.assertIn("completeness", diag["gates_failed"])
+
+    def test_h2_complete_canonical_write_passes_completeness_gate(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "Please return the cleaner and headphone from my delivered order."
+        wm.auth_user_id = "u"
+        wm.order_details["#W1"] = {
+            "order_id": "#W1",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "pm"}],
+            "items": [
+                {"name": "Vacuum Cleaner", "item_id": "cleaner"},
+                {"name": "Headphones", "item_id": "headphones"},
+                {"name": "Smart Watch", "item_id": "watch"},
+            ],
+        }
+        action = agent._grounded_retail_commit_action(wm)
+        self.assertIsNotNone(action)
+        schema = ToolEffectSchema(
+            name="return_delivered_order_items",
+            cls=RiskClass.IRREVERSIBLE,
+            arg_id_fields=["order_id", "item_ids", "payment_method_id"],
+            required_params=["order_id", "item_ids", "payment_method_id"],
+        )
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+        self.assertIsNone(failing, failing.reason if failing else "")
+        self.assertIn("completeness", diag["gates_run"])
+
+    def test_h3_premature_final_for_account_task_is_blocked(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are available, and modify my pending order."
+        wm.product_count_finalized = True
+        action = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+            user_text="There are 10 t-shirt options.",
+        )
+        schema = ToolEffectSchema(name="respond", cls=RiskClass.FINAL)
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "final_completeness")
+        self.assertIn("final_completeness", diag["gates_failed"])
+
+    def test_h4_final_for_pure_product_count_still_passes(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are available?"
+        action = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+            user_text="There are 10 t-shirt options.",
+            bypass_gates=True,
+        )
+        schema = ToolEffectSchema(name="respond", cls=RiskClass.FINAL)
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+        self.assertIsNone(failing, failing.reason if failing else "")
+        self.assertIn("final_completeness", diag["gates_run"])
+
 
 # ---------------------------------------------------------------------------
 # Tau-bench import sanity (skipped when tau_bench is not installed)
