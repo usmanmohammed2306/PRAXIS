@@ -2730,11 +2730,16 @@ class CargoAgent(Agent):  # type: ignore[misc]
         if not self._reservation_task_needs_scan(wm):
             return None
         repeated_profile = action.name == "get_user_details"
+        malformed_reservation_lookup = (
+            action.name == "get_reservation_details"
+            and "reservation_id" not in (action.args or {})
+        )
+        search_drift = action.name in {"search_direct_flight", "search_onestop_flight"}
         generic_respond = (
             action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
             or action.name.lower() in (RESPOND_TOOL_NAME, "respond", "final", "answer")
         )
-        if not (repeated_profile or generic_respond):
+        if not (repeated_profile or malformed_reservation_lookup or search_drift or generic_respond):
             return None
         reservation_ids = wm.typed_evidence_for("reservation_id")
         if not reservation_ids:
@@ -3895,6 +3900,11 @@ class CargoAgent(Agent):  # type: ignore[misc]
             (action.name == "search_direct_flight" and direct_set is not None)
             or (action.name == "search_onestop_flight" and one_set is not None)
         )
+        cached_profile_replay = bool(
+            action.name == "get_user_details"
+            and user_id
+            and user_id in wm.user_profiles
+        )
         placeholder_args = self._action_contains_placeholder(action)
         booking_reservation_drift = bool(
             self._airline_booking_goal(wm)
@@ -3909,6 +3919,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             or wm.failed_without_new_evidence(action.signature())
             or noncanonical_search
             or recorded_search_replay
+            or cached_profile_replay
             or placeholder_args
             or booking_reservation_drift
         )
@@ -3978,8 +3989,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
 
     @staticmethod
     def _action_contains_placeholder(action: ProposedAction) -> bool:
-        for _, value in PreCommitVerifier._iter_scalars(action.args):
-            if PreCommitVerifier._looks_placeholder(value):
+        for path, value in PreCommitVerifier._iter_scalars(action.args):
+            if PreCommitVerifier._looks_placeholder(value, path):
                 return True
         return False
 
@@ -4333,7 +4344,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
         prefs = wm.semantic_slots.get("time_preferences") or wm.semantic_slots.get("time_preference") or []
         if not isinstance(prefs, list):
             prefs = [prefs]
-        return " ".join(str(v).lower() for v in prefs)
+        text = " ".join(str(v).lower() for v in prefs)
+        user = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        if "direct" in user and "direct_preferred" not in text:
+            text += " direct_preferred"
+        if re.search(r"\bone[- ]?stop|stopover\b", user) and "onestop_allowed" not in text:
+            text += " onestop_allowed"
+        if "cheapest" in user and "cheapest" not in text:
+            text += " cheapest"
+        return text.strip()
 
     def _airline_time_after_minutes(self, wm: "WorkingMemory") -> Optional[int]:
         raw = self._slot_value(wm.semantic_slots, "time_after")

@@ -1118,7 +1118,7 @@ class PreCommitVerifier:
         placeholders = [
             f"{path}={value}"
             for path, value in self._iter_scalars(action.args)
-            if self._looks_placeholder(value)
+            if self._looks_placeholder(value, path)
         ]
         if placeholders:
             return PreCommitVerdict(
@@ -1171,13 +1171,23 @@ class PreCommitVerifier:
         return bad
 
     @classmethod
-    def _looks_placeholder(cls, value: Any) -> bool:
+    def _looks_placeholder(cls, value: Any, path: str = "") -> bool:
         if isinstance(value, (int, float, bool)):
             return False
         text = str(value or "").strip()
         if not text:
             return False
-        return bool(cls.PLACEHOLDER_RE.fullmatch(text) or cls.PLACEHOLDER_RE.search(text))
+        if re.search(r"\blatest_[a-z0-9_]+\b|<[^>]+>|total_cost|taxes?_and_fees", text, re.I):
+            return True
+        low = text.lower()
+        field = str(path or "").split(".")[-1].split("[")[0].lower()
+        root = str(path or "").split(".")[0].split("[")[0].lower()
+        id_like_field = field.endswith("_id") or root.endswith("_id") or field in {
+            "id", "reservation", "reservation_id", "flight_id", "item_id",
+        }
+        if low in {"tbd", "unknown", "none", "null"}:
+            return id_like_field
+        return bool(cls.PLACEHOLDER_RE.fullmatch(text) and id_like_field)
 
     @staticmethod
     def _looks_adapter_id(value: str) -> bool:

@@ -79,6 +79,14 @@ The spine is now:
 - direct-search rechecks after existing evidence present the selected itinerary
 - cheapest invalid airline itineraries are rejected before price ranking
 - latest retail name+ZIP+order tasks authenticate before order reads
+- cached airline profile proposals route to search/progress instead of refetch
+- booking tasks do not scan unrelated reservations before flight search
+- malformed reservation lookups with `user_id` scan grounded profile reservation IDs
+- ambiguous region searches such as `Texas -> Newark` scan known reservations first
+- generic asks and pseudo cost writes after grounded booking evidence recenter to the booking summary
+- direct-flight preference survives a later one-stop allowance
+- semantic `none` values are not treated as ID placeholders, while nested ID placeholders still block
+- retail placeholder-email and generic-ask loops use known name/ZIP/order state
 
 Existing tests for read-permissive behavior, write completeness, active task-frame isolation, commit certificates, soft goal-field routing, and synthetic smoke remain part of the suite.
 
@@ -117,7 +125,7 @@ Run:
 python3 -m unittest tests.test_cargo -q
 python3 -m compileall src tests scripts -q
 bash run_project.sh --dry-run
-python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_v2_corpus.json
+python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_v2_broad_corpus.json
 ```
 
 Live tau/ACE reruns require a model endpoint. The shell scripts are intentionally unchanged in this patch.
