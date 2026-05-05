@@ -114,6 +114,27 @@ class WorkingMemory:
     # respond would both call env.step(respond), inflating message count
     # and confusing the user simulator.
     post_write_responded: bool = False
+    # Track consecutive searches (search_*, search_direct_flight, search_onestop_flight)
+    # that return empty or no-match results. When this exceeds a threshold, the
+    # solve loop triggers an ASK_USER to escape the search-exhaustion loop.
+    # (Observed failure: airline T0 executes 20+ search_* calls without progress.)
+    consecutive_empty_searches: int = 0
+    # Name of the last search tool executed (e.g. "search_direct_flight").
+    # Used to detect when we've switched search tools without finding results.
+    last_search_tool: str = ""
+    # Set once we've already emitted an ASK_USER to escape search exhaustion,
+    # so we don't fire the override twice for the same trajectory.
+    search_exhaustion_triggered: bool = False
+    # Track consecutive auth-tool attempts (find_user_id_*, get_user_details)
+    # that don't progress toward confirmed authentication. When this exceeds
+    # a threshold, indicates a stuck auth loop; should escape with ASK_USER.
+    # (Observed failure: airline T1 alternates between get_user_details and
+    # respond proposals with 12+ abstains.)
+    consecutive_auth_attempts: int = 0
+    # Set once auth_user_id was confirmed, used to reset the auth-attempt counter
+    last_confirmed_auth_user_id: str = ""
+    # Set once we've triggered auth-loop escape via ASK_USER
+    auth_cycle_triggered: bool = False
 
     # ------------------------------------------------------------------
     # Updates

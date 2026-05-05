@@ -376,6 +376,52 @@ outputs/
     summary.md     # rendered table
 ```
 
+## Recent Fixes (FIX-A, FIX-B, FIX-C)
+
+The tau-bench benchmark revealed three failure patterns in earlier trajectories
+(trajectories 22–43) that are now fixed:
+
+### FIX-A: Post-WRITE Auto-Respond
+**Problem:** After a WRITE/IRREVERSIBLE action (e.g., exchange_delivered_order_items),
+the agent executed the mutation correctly but did not emit a respond. Without respond,
+the benchmark's user simulator never sees `###STOP###`, so `done` stays False and
+reward is never calculated. Even perfect WRITE args scored 0 reward.
+
+**Solution:** Deterministic controller-level auto-respond after successful WRITE/IRREVERSIBLE
+execution. The agent now summarizes the action outcome and calls `respond` automatically,
+allowing the user simulator to emit STOP and trigger reward calculation.
+
+**Impact:** Closed reward gap for retail tasks with successful WRITE execution.
+(10 new unit/integration tests; all 189 pass)
+
+### FIX-B: Search-Exhaustion Escape
+**Problem:** Airline task T0 (and similar multi-search tasks) executed 20+ consecutive
+search_direct_flight and search_onestop_flight calls without finding results, burning
+the step budget without progress.
+
+**Solution:** Deterministic search-exhaustion detector that tracks consecutive empty
+search results across search_* tool calls. After 4+ consecutive empty results, emits
+ASK_USER to break the loop, allowing the agent to refine search parameters or ask
+for clarification.
+
+**Impact:** Prevents search-loop dead ends in airline benchmark.
+(5 new unit/integration tests; all 194 pass)
+
+### FIX-C: Auth-Cycle Escape
+**Problem:** Airline task T1 alternated between get_user_details and respond proposals
+with 12+ abstains, unable to progress past authentication. The agent was stuck trying
+to confirm identity but not making forward progress.
+
+**Solution:** Deterministic auth-cycle detector that tracks consecutive calls to
+auth-related tools (find_user_id_by_email, find_user_id_by_name_zip, get_user_details)
+without confirming a new user_id. After 3+ consecutive auth attempts without progress,
+emits ASK_USER to clarify identity or accept current auth state.
+
+**Impact:** Prevents auth-loop dead ends in airline benchmark.
+(3 new unit/integration tests; all 197 pass)
+
+---
+
 ## Tests
 
 The architecture is covered by offline unit tests + an integration smoke

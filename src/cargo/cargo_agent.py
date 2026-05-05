@@ -1091,6 +1091,33 @@ class CargoAgent(Agent):  # type: ignore[misc]
             self._kernel().observe_tool_result(wm, action.name, tool_obs)
             self._kernel().record_action_candidates(wm, action.name, action.args, tool_obs)
 
+
+            # FIX-B: Track search exhaustion. When a search tool (search_direct_flight,
+            # search_onestop_flight, search_items, etc.) returns empty results, increment
+            # consecutive_empty_searches. After N consecutive empty results, the agent
+            # is stuck in a search loop; trigger an ASK_USER to escape it.
+            # (Observed failure: airline T0 executes 20+ search_* calls without progress.)
+            if self._is_search_tool(action.name):
+                if self._is_empty_search_result(tool_obs):
+                    # Same tool: increment counter
+                    if action.name == wm.last_search_tool:
+                        wm.consecutive_empty_searches += 1
+                    else:
+                        # Switched to a different search tool: reset counter
+                        wm.consecutive_empty_searches = 1
+                        wm.last_search_tool = action.name
+                else:
+                    # Found results: reset counters
+                    wm.consecutive_empty_searches = 0
+                    wm.last_search_tool = ""
+            else:
+                # Non-search tool: reset counters
+                wm.consecutive_empty_searches = 0
+                wm.last_search_tool = ""
+
+            # If search exhaustion is detected and not yet triggered, we need to
+            # interrupt the solve loop and emit an ASK_USER. This is handled
+            # below by checking the counter before proposing the next action.
             # Track failed name+ZIP lookups so _auth_override doesn't retry the
             # same invalid ZIP on the next step.
             if action.name == "find_user_id_by_name_zip":
@@ -1262,6 +1289,145 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 break
 
             # ---------------------------------------------------------------
+            # ---------------------------------------------------------------
+            # SEARCH-EXHAUSTION ESCAPE (FIX-B)
+            # ---------------------------------------------------------------
+            # When the agent executes many consecutive search-related tool calls
+            # (search_direct_flight, search_onestop_flight, search_items, etc.)
+            # that all return empty/no-match results, it is stuck in a search loop.
+            # Rather than let it burn the entire step budget trying variations,
+            # detect this pattern and emit an ASK_USER to gather more info.
+            # (Observed failure: airline T0 executes 20+ search_* calls without progress.)
+            SEARCH_EXHAUSTION_THRESHOLD = 4
+            if (
+                wm.consecutive_empty_searches >= SEARCH_EXHAUSTION_THRESHOLD
+                and not wm.search_exhaustion_triggered
+            ):
+                # Emit an ASK_USER to break the search loop
+                search_ask = (
+                    "I've tried several search queries but haven't found matching results. "
+                    "Could you clarify your preferences or try different search parameters?"
+                )
+                env_resp_search = self._respond(env, search_ask)
+                if env_resp_search is None:
+                    break
+                # Log the respond for trajectory consumers
+                aux_call_id = f"cargo_{step}_search_escape"
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": aux_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": RESPOND_TOOL_NAME,
+                            "arguments": json.dumps(
+                                {"content": search_ask[:RESPOND_MAX_CHARS]}
+                            ),
+                        },
+                    }],
+                })
+                user_reply_search = _obs_text(env_resp_search)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": aux_call_id,
+                    "name": RESPOND_TOOL_NAME,
+                    "content": user_reply_search,
+                })
+                if user_reply_search:
+                    wm.absorb_user_message(user_reply_search)
+                reward = _float(getattr(env_resp_search, "reward", reward), reward)
+                info = getattr(env_resp_search, "info", info) or info
+                done = bool(getattr(env_resp_search, "done", False))
+                wm.search_exhaustion_triggered = True
+                stats.repair_ask_user += 1
+                if done:
+                    break
+                # Reset search counters after asking for clarification
+                wm.consecutive_empty_searches = 0
+                wm.last_search_tool = ""
+                continue
+
+            # ---------------------------------------------------------------
+            # AUTH-CYCLE ESCAPE (FIX-C)
+            # ---------------------------------------------------------------
+            # When the agent repeatedly calls auth-related tools
+            # (find_user_id_by_email, find_user_id_by_name_zip, get_user_details)
+            # without confirming a user_id, or keeps cycling between auth tools
+            # and respond proposals, it is stuck in an auth loop.  After N
+            # consecutive auth attempts without progress toward confirmed auth,
+            # emit an ASK_USER to either accept the current auth state or get
+            # clearer credentials from the user.
+            # (Observed failure: airline T1 alternates between get_user_details
+            # and respond proposals with 12+ abstains.)
+            AUTH_ATTEMPT_THRESHOLD = 3
+            is_auth_tool = action.name in (
+                "find_user_id_by_email",
+                "find_user_id_by_name_zip",
+                "get_user_details",
+            )
+            if is_auth_tool:
+                # Check if we made progress toward confirmed auth
+                if wm.auth_user_id and wm.auth_user_id != wm.last_confirmed_auth_user_id:
+                    # Just confirmed a new user_id; reset counter
+                    wm.consecutive_auth_attempts = 0
+                    wm.last_confirmed_auth_user_id = wm.auth_user_id
+                else:
+                    # No progress on auth; increment counter
+                    wm.consecutive_auth_attempts += 1
+            else:
+                # Non-auth tool: reset counter
+                wm.consecutive_auth_attempts = 0
+
+            if (
+                wm.consecutive_auth_attempts >= AUTH_ATTEMPT_THRESHOLD
+                and not wm.auth_cycle_triggered
+            ):
+                # Emit ASK_USER to break the auth loop
+                auth_ask = (
+                    "I'm having trouble confirming your identity with the information provided. "
+                    "Could you clarify your email or name+ZIP, or would you like to proceed with "
+                    "what I currently have?"
+                )
+                env_resp_auth = self._respond(env, auth_ask)
+                if env_resp_auth is None:
+                    break
+                # Log the respond
+                aux_call_id = f"cargo_{step}_auth_escape"
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": aux_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": RESPOND_TOOL_NAME,
+                            "arguments": json.dumps(
+                                {"content": auth_ask[:RESPOND_MAX_CHARS]}
+                            ),
+                        },
+                    }],
+                })
+                user_reply_auth = _obs_text(env_resp_auth)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": aux_call_id,
+                    "name": RESPOND_TOOL_NAME,
+                    "content": user_reply_auth,
+                })
+                if user_reply_auth:
+                    wm.absorb_user_message(user_reply_auth)
+                reward = _float(getattr(env_resp_auth, "reward", reward), reward)
+                info = getattr(env_resp_auth, "info", info) or info
+                done = bool(getattr(env_resp_auth, "done", False))
+                wm.auth_cycle_triggered = True
+                stats.repair_ask_user += 1
+                if done:
+                    break
+                # Reset counter to allow new auth attempts with fresh user input
+                wm.consecutive_auth_attempts = 0
+                continue
+
             # POST-WRITE AUTO-RESPOND (architectural fix — trajectories 22-43)
             # ---------------------------------------------------------------
             # After a successful WRITE/IRREVERSIBLE action, deterministically
@@ -2363,6 +2529,41 @@ class CargoAgent(Agent):  # type: ignore[misc]
         return out
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Search-exhaustion helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_search_tool(tool_name: str) -> bool:
+        """Check if a tool is a search-related tool (airline or retail)."""
+        return (
+            tool_name.startswith("search_")
+            and ("flight" in tool_name or "item" in tool_name)
+        ) or tool_name in ("search_direct_flight", "search_onestop_flight", "search_items")
+
+    @staticmethod
+    def _is_empty_search_result(tool_obs: str) -> bool:
+        """Detect if a search tool result indicates no matches / empty results."""
+        if not tool_obs:
+            return True
+        obs_lower = tool_obs.lower().strip()
+        # Check for error-like patterns
+        if obs_lower.startswith("error") or '"error"' in obs_lower:
+            return True
+        # Check for no-match patterns
+        patterns = [
+            "no ", "not found", "not available", "empty",
+            '"results": []', '"flights": []', '"items": []',
+            '"flights": null', '"results": null',
+            "no flight", "no result", "no match", "not match",
+        ]
+        for pattern in patterns:
+            if pattern in obs_lower:
+                return True
+        # JSON array with no elements
+        if obs_lower.startswith("[]"):
+            return True
+        return False
+
     # Product-ID / product-list helpers
     # ------------------------------------------------------------------
     def _resolve_product_id_name(
