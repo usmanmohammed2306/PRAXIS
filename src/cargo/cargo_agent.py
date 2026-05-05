@@ -672,6 +672,27 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     })
                     action = res_action
 
+            # CARGO-v3 obligation guide: READ actions build state, so when a
+            # proposal is an unhelpful ASK/FINAL/repeated read but obligations
+            # already identify the next information need, deterministically
+            # choose that READ.  Commitment gates remain strict later.
+            if action is not None:
+                ob_action = self._obligation_guided_action(action, wm)
+                if ob_action is not None:
+                    raw_text = json.dumps({
+                        "thought": ob_action.raw_thought,
+                        "action": {
+                            "name": ob_action.name,
+                            "args": ob_action.args,
+                            "declared_class": ob_action.declared_class.value,
+                            "declared_pre": ob_action.declared_pre,
+                            "declared_post": ob_action.declared_post,
+                            "informational_intent": ob_action.informational_intent,
+                            "user_text": ob_action.user_text,
+                        },
+                    })
+                    action = ob_action
+
             # Product-ID override: if the proposer passes a product *type name*
             # (e.g. "T-Shirt") where a numeric product_id is required, resolve it
             # from db_facts that were populated by list_all_product_types.
@@ -2975,6 +2996,144 @@ class CargoAgent(Agent):  # type: ignore[misc]
     def _has_tool(self, name: str) -> bool:
         schemas = getattr(self, "schemas", None) or {}
         return (not schemas) or name in schemas
+
+    def _obligation_guided_action(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """Choose the next information-gathering action from open obligations.
+
+        This is the CARGO-v3 controller layer.  It is deliberately narrow and
+        retrieval-focused: it may replace a stuck ASK/FINAL/repeated READ with
+        a grounded READ that reduces uncertainty, but it does not fabricate a
+        WRITE.  Writes still flow through canonicalization and completeness.
+        """
+        if self._is_airline_adapter():
+            return self._airline_obligation_action(action, wm)
+        return None
+
+    def _is_airline_adapter(self) -> bool:
+        adapter = getattr(self, "adapter", None)
+        domain = str(getattr(adapter, "domain_name", "") or "").lower()
+        if domain == "airline":
+            return True
+        names = set((getattr(self, "schemas", None) or {}).keys())
+        return bool({"search_direct_flight", "search_onestop_flight"} & names)
+
+    def _airline_obligation_action(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        if not self._has_tool("search_direct_flight") and not self._has_tool("search_onestop_flight"):
+            return None
+
+        user_id = self._known_user_id(wm)
+        if user_id and self._has_tool("get_user_details") and user_id not in wm.user_profiles:
+            candidate = ProposedAction(
+                name="get_user_details",
+                args={"user_id": user_id},
+                declared_class=RiskClass.READ,
+                declared_pre=["user id grounded"],
+                declared_post=["user profile retrieved"],
+                informational_intent="fetch profile for airline task",
+                raw_thought="Obligation guide: user_id is grounded; fetch profile before commitment.",
+                user_text="",
+                raw_response="",
+            )
+            fresh = self._fresh_action_or_none(candidate, wm)
+            if fresh is not None:
+                return fresh
+
+        slots = wm.semantic_slots
+        origin = self._slot_value(slots, "origin")
+        destination = self._slot_value(slots, "destination")
+        date = self._slot_value(slots, "date")
+        if not (origin and destination and date):
+            return None
+
+        should_intercept = (
+            action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
+            or action.name.lower() in (RESPOND_TOOL_NAME, "respond", "final", "answer")
+            or action.signature() in wm.recent_signatures
+            or wm.failed_without_new_evidence(action.signature())
+        )
+        if action.name in {"search_direct_flight", "search_onestop_flight"}:
+            should_intercept = should_intercept or action.signature() in wm.recent_signatures
+        if not should_intercept:
+            return None
+
+        direct = self._flight_search_action(
+            "search_direct_flight",
+            origin=origin,
+            destination=destination,
+            date=date,
+            thought="Obligation guide: route/date are bound; search direct flights.",
+        )
+        if direct is not None:
+            fresh = self._fresh_action_or_none(direct, wm)
+            if fresh is not None:
+                return fresh
+
+        if self._onestop_allowed(wm):
+            one = self._flight_search_action(
+                "search_onestop_flight",
+                origin=origin,
+                destination=destination,
+                date=date,
+                thought="Obligation guide: direct search is exhausted; search one-stop options.",
+            )
+            if one is not None:
+                fresh = self._fresh_action_or_none(one, wm)
+                if fresh is not None:
+                    return fresh
+        return None
+
+    def _flight_search_action(
+        self,
+        name: str,
+        *,
+        origin: str,
+        destination: str,
+        date: str,
+        thought: str,
+    ) -> Optional[ProposedAction]:
+        if not self._has_tool(name):
+            return None
+        return ProposedAction(
+            name=name,
+            args={"origin": origin, "destination": destination, "date": date},
+            declared_class=RiskClass.READ,
+            declared_pre=["route and date bound"],
+            declared_post=["flight candidates retrieved"],
+            informational_intent="retrieve flight candidates",
+            raw_thought=thought,
+            user_text="",
+            raw_response="",
+        )
+
+    @staticmethod
+    def _slot_value(slots: Dict[str, Any], key: str) -> str:
+        value = slots.get(key)
+        if isinstance(value, list):
+            value = value[-1] if value else ""
+        return str(value or "").strip()
+
+    @staticmethod
+    def _onestop_allowed(wm: "WorkingMemory") -> bool:
+        prefs = wm.semantic_slots.get("time_preferences") or wm.semantic_slots.get("time_preference")
+        values = prefs if isinstance(prefs, list) else [prefs]
+        text = " ".join(str(v).lower() for v in values if v)
+        user = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        return "onestop_allowed" in text or "one stop" in user or "stopover" in user
+
+    @staticmethod
+    def _known_user_id(wm: "WorkingMemory") -> Optional[str]:
+        if wm.auth_user_id:
+            return wm.auth_user_id
+        vals = wm.typed_evidence_for("user_id")
+        return vals[-1] if vals else None
 
     def _risk_for_tool(self, name: str, fallback: RiskClass) -> RiskClass:
         sch = (getattr(self, "schemas", None) or {}).get(name)

@@ -118,6 +118,29 @@ def decide(
             ),
         )
 
+    if gate == "state_validity":
+        level = failed_gate.diagnostics.get("validation_level") or ""
+        if "read" in str(level):
+            crit = (
+                "The READ you proposed contradicts a bound semantic slot. "
+                "READs are allowed for gathering information, but their route, "
+                "date, or other ordinary semantic arguments must match STATE. "
+                "Use the grounded values already in STATE or choose a different "
+                "READ that fills an open obligation."
+            )
+        else:
+            crit = (
+                "The action conflicts with the current task state or a completed "
+                "phase. Do not re-enter completed phases, repeat cached reads, "
+                "or commit against stale state. Choose the next open obligation."
+            )
+        if retries_used < max_retries and budget_steps_remaining > 3:
+            return RepairDecision(action="RETRY", critique=crit)
+        return RepairDecision(
+            action="ASK_USER",
+            user_message="I need one more grounded detail before I can safely continue.",
+        )
+
     if gate == "completeness":
         crit = (
             "The proposed write is incomplete or does not match the complete "

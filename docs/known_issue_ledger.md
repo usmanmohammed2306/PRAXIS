@@ -1,7 +1,7 @@
 # CARGO Known-Issue Ledger
 
 This ledger is the recovery record for the uploaded CARGO runs from
-`metrics (24).json` through `metrics (33).json`, their paired trajectories,
+`metrics (24).json` through `metrics (36).json`, their paired trajectories,
 and the local regression suite.  It is intentionally phrased by failure
 class rather than benchmark task answer, so it remains a test and design
 artifact rather than an answer key.
@@ -22,6 +22,9 @@ Machine-readable companion: `docs/known_issues.json`.
 | metrics (31) | retail | 0.0 | 0.0 | 16.6 | 1 | 1 | 0 | 0 | 24 |
 | metrics (32) | airline | 0.0 | 0.0 | 32.8 | 94 | 52 | 14 | 28 | 6 |
 | metrics (33) | retail | 0.0 | 0.0 | 22.6 | 31 | 19 | 2 | 10 | 20 |
+| metrics (34) | airline | 0.0 | 0.0 | 35.4 | 79 | 54 | 2 | 23 | 21 |
+| metrics (35) | airline | 0.0 | 0.0 | 35.4 | 79 | 54 | 2 | 23 | 21 |
+| metrics (36) | retail | 0.0 | 0.0 | 33.2 | 65 | 43 | 0 | 22 | 23 |
 
 ## Benchmark Context Used
 
@@ -36,14 +39,21 @@ Machine-readable companion: `docs/known_issues.json`.
   and decoy candidates that can look valid locally but break the full task.
   This motivates semantic constraint validation as a gate, not a scorer.
 
-## CARGO-v2 Architecture Mapping
+## CARGO-v3 Architecture Mapping
 
-- Generic core: `src/cargo/core.py` owns typed task state, fact precedence,
-  constraints, preferences, fallback rules, candidate objects, obligations,
-  semantic validation hooks, completeness hooks, and diagnostics.
+- Generic core: `src/cargo/core.py` owns layered task state, fact precedence,
+  open slots, constraints, preferences, fallback rules, candidate sets,
+  obligations, semantic validation hooks, completeness hooks, and diagnostics.
 - Adapters: `src/cargo/adapters/` owns benchmark/domain knowledge.  Current
   adapters are `tau_retail`, `tau_airline`, `acebench`, and
   `synthetic_generic`.
+- CARGO-v3 replaces monolithic `state_validity` with action-class-specific
+  validation. READ is retrieval-permissive and may build incomplete state;
+  WRITE/IRREVERSIBLE/FINAL are commitment-strict and require semantic
+  completeness.
+- Obligation guidance converts repeated or generic ASK/FINAL proposals into
+  the next grounded READ when user/tool evidence already identifies an open
+  information need.
 - Shell-script invariant: no new `.sh` files were added.  Benchmark setup and
   smoke commands are Python helpers in `scripts/`.
 
@@ -79,6 +89,9 @@ Machine-readable companion: `docs/known_issues.json`.
 | Partial solution treated as complete | Retail/airline final/write before all operations | Completion checked tool syntax instead of task closure | Completeness validator blocks partial writes/finals | H-series tests, booking completeness tests | Fixed, verified |
 | ACE-style decoy passes local checks | Candidate satisfies local slot but violates global task constraints | No adapter-owned global constraint hook | Local-pass/global-fail decoys must be rejected before write/final | `test_acebench_adapter_rejects_local_pass_global_fail_decoy` | Fixed, verified |
 | Domain logic leaking into core | Early CARGO-v2 state binding knew airline/retail names directly | Core was doing adapter work | Domain object semantics live only in adapters | `TestCargoV2Adapters` plus module split | Fixed, verified |
+| Retail READ over-blocked by semantic state | metrics (36) blocked `get_product_details(product_id=1656367028)` as `action_product_id_conflicts_with_state` | Tool-returned opaque IDs were bound into semantic slots; flat state validity treated retrieval as commitment | Opaque IDs stay typed evidence, not semantic constraints; READ ignores opaque-ID semantic conflicts and only blocks clear ordinary-slot contradictions | `test_tool_observation_ids_do_not_become_semantic_slots`, `test_read_permissive_allows_grounded_product_retrieval_with_incomplete_state` | Fixed, verified |
+| Airline booking/change intent not bound | metrics (34)/(35) tasks repeatedly emitted ASK_USER after the user stated a booking/change goal | Intent/route/date/cabin were not represented as task-closure obligations visible to the controller | Bind before propose; create open airline obligations from user text; obligation guide selects search/profile READs before asking again | `test_airline_adapter_binds_booking_intent_and_open_obligation`, `test_i2b_airline_ask_loop_pivots_to_bound_flight_search` | Fixed, verified |
+| Repeated direct search without progression | metrics (34)/(35) retried direct/onestop signatures after no progress | Repeat repair only retried/finalized instead of choosing the next information need | If direct search already ran and one-stop is allowed, pivot to grounded one-stop search instead of repeating or finalizing | `test_i2c_repeated_direct_search_pivots_to_onestop_when_allowed` | Fixed, verified |
 
 ## Remaining Limitations
 
@@ -87,14 +100,14 @@ Machine-readable companion: `docs/known_issues.json`.
   while upstream `vllm==0.6.1.post1` remains intentionally skipped in the
   generic helper unless `--include-ace-vllm` is used in an isolated
   environment.  Live smoke still needs a model endpoint/API key.
-- Airline full booking selection is guarded for slot completeness and state
-  consistency, but a complete deterministic cheapest-flight planner is still an
-  open extension.  CARGO remains a lightweight gating controller, not a full
-  tree-search planner.
+- Airline full booking selection is guarded for slot completeness, state
+  consistency, and obligation-guided search progression, but a complete
+  deterministic cheapest-itinerary planner is still an open extension. CARGO
+  remains a lightweight gating controller, not a full tree-search planner.
 
 ## Verification
 
-- `python3 -m unittest tests.test_cargo -v`: local regression suite.
+- `python3 -m unittest tests.test_cargo -v`: 232 local regression tests passed.
 - `python3 -m compileall src tests`: passed.
 - `git diff --check`: passed.
 - `bash run_project.sh --dry-run`: passed configuration resolution without

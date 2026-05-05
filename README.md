@@ -35,10 +35,10 @@ unchanged.
             │       optional via CARGO_INDUCE_VIA_LLM=1.              │
             │                                                         │
             │  (1)  Typed Working Memory  (deterministic)             │
-            │       slots: goal, user_revealed_facts,                 │
+            │       slots: goal, layered evidence, open slots,        │
             │              db_confirmed_facts, assumptions,           │
             │              semantic task slots, phase locks,          │
-            │              pending_obligations, last_obs,             │
+            │              obligation graph, last_obs,                │
             │              last_error, budget_steps                   │
             │                                                         │
             │  (2)  Proposer  (1 LLM call, JSON output)               │
@@ -48,12 +48,12 @@ unchanged.
             │                user_text}}                              │
             │                                                         │
             │  (3)  Risk Router  (deterministic, O(1))                │
-            │       READ  → fast path → execute                       │
-            │       WRITE / IRREV / FINAL → calibrated gate           │
+            │       READ  → retrieval-permissive fast path            │
+            │       WRITE / IRREV / FINAL → commitment-strict gate    │
             │                                                         │
             │  (4)  Calibrated Gate                                   │
             │       (4-) repeat-loop check (cheap; runs always)       │
-            │       (4a) state-validity check vs semantic WM          │
+            │       (4a) action-class state/obligation validity       │
             │       (4b) declared-pre ⊆ user_facts ∪ db_facts         │
             │       (4c) ID-typed args grounded in evidence           │
             │       (4d) completeness / confirmation for writes       │
@@ -73,23 +73,42 @@ unchanged.
             └─────────────────────────────────────────────────────────┘
 ```
 
-## CARGO-v2: Generic Semantic State-Constraint Risk Gating
+## CARGO-v3: Incremental State + Obligation-Guided Risk Gating
 
-CARGO remains a lightweight, training-free controller.  The v2 hardening
+CARGO remains a lightweight, training-free controller. The v3 hardening
 does not add fine-tuning, a separate judge, benchmark answer retrieval, or a
-tree-search planner.  It extends the original gate stack so the verifier asks
-two questions before acting:
+tree-search planner. It changes the controller architecture so CARGO no
+longer treats every action as a commitment. The control law is:
 
-1. Is the action grounded and well-formed?
-2. Is the action correct, complete, policy-compliant, and appropriate for the
-   current semantic task state?
+```
+observe
+→ bind_user_and_tool_evidence
+→ update_incremental_state
+→ update_obligation_graph
+→ choose_next_information_need_or_commit_action
+→ validate_by_action_class
+→ execute_or_repair
+→ verify_state_transition
+→ terminate_when_goal_closed
+```
 
-CARGO-v2 is split into a generic core plus pluggable adapters:
+The key rule is **retrieval-permissive, commitment-strict**:
+
+- `READ` actions build state. They are allowed while state is incomplete when
+  their arguments are grounded and they can reduce uncertainty. They are not
+  blocked merely because the final task is not complete.
+- `WRITE`, `IRREVERSIBLE`, and `FINAL` actions consume state. They require all
+  slots, hard constraints, selected candidates, confirmation, and completion
+  obligations to be satisfied.
+- `ASK_USER` is reserved for genuinely missing slots. If a user already
+  answered, deterministic binding updates state before the proposer is called.
+
+CARGO-v3 is split into a generic core plus pluggable adapters:
 
 - `src/cargo/core.py` defines the domain-neutral kernel: typed task state,
-  facts, constraints, preferences, fallback rules, candidate objects,
-  obligations, failed signatures, executed writes, semantic validation hooks,
-  completeness hooks, and terminal state.
+  layered facts, open slots, constraints, preferences, fallback rules,
+  candidate sets, candidate objects, obligations, failed signatures, executed
+  writes, semantic validation hooks, completeness hooks, and terminal state.
 - `src/cargo/adapters/` contains benchmark/domain adapters.  The core does
   not name retail products, flights, reservations, or ACEBench answer
   patterns.  Adapters own tool schema enrichment, ID fields, non-ID semantic
@@ -98,7 +117,7 @@ CARGO-v2 is split into a generic core plus pluggable adapters:
 - Current adapters: `tau_retail`, `tau_airline`, `acebench`, and
   `synthetic_generic`.
 
-The deterministic working memory now separates:
+The deterministic working memory and task state now separate:
 
 - opaque typed IDs such as `user_id`, `order_id`, `item_id`, `product_id`,
   `payment_method_id`, `reservation_id`, and `flight_number`
@@ -107,13 +126,22 @@ The deterministic working memory now separates:
   constraints
 - durable DB-confirmed caches such as orders, products, profiles, and
   reservations
+- open slots and obligations such as “retrieve candidates”, “select valid
+  replacement”, “obtain confirmation”, “execute once”, and “terminate”
 
-The gate stack uses that state to block completed-phase re-entry, repeated
-dead-end actions without new evidence, semantic mismatches between action
-arguments and state, partial writes, missing booking slots, and replacement
-candidate choices that violate hard constraints.  Preferences only rank
-candidates after every hard filter has passed; fallbacks apply only when the
-strict constraint set is exhausted and the user allowed the fallback.
+CARGO-v3 fixes the deeper failure from the uploaded logs: old `state_validity`
+was too flat. It sometimes blocked valid retrieval such as
+`get_product_details(product_id=...)` because a tool-returned opaque ID had
+been treated like a semantic constraint. The new validation is class-specific:
+READ may retrieve grounded IDs from user/tool evidence; WRITE and FINAL still
+run strict semantic and completeness checks.
+
+The gate stack uses state and obligations to block completed-phase re-entry,
+repeated dead-end actions without new evidence, repeated ASK_USER loops,
+partial writes, missing booking slots, and replacement candidate choices that
+violate hard constraints. Preferences only rank candidates after every hard
+filter has passed; fallbacks apply only when the strict constraint set is
+exhausted and the user allowed the fallback.
 
 The recovery ledger for uploaded failures is tracked in
 [`docs/known_issue_ledger.md`](docs/known_issue_ledger.md), with a
@@ -125,7 +153,7 @@ now protects it.
 
 | Class | Examples | Treatment |
 |---|---|---|
-| `READ` | `get_*`, `list_*`, `find_*`, `search_*`, `lookup_*`, `view_*` | Fast path with repeat-loop, state-validity, and ID grounding. |
+| `READ` | `get_*`, `list_*`, `find_*`, `search_*`, `lookup_*`, `view_*` | Retrieval-permissive fast path: repeat-loop + ID grounding + ordinary semantic contradiction checks only. |
 | `WRITE` | `update_*`, `modify_*`, `add_*`, `edit_*`, `set_*`, `place_*`, `book_*` | State-validity + confirmation + completeness + pre-cond + arg-grounding + SC. |
 | `IRREVERSIBLE` | `cancel_*`, `delete_*`, `refund_*`, `charge_*`, `send_*`, `transfer_*` | State-validity + confirmation + completeness + pre-cond + arg-grounding + SC + CF rollout. |
 | `FINAL` | `respond` (when committing the user's task) | Final-completeness + pre-cond + SC + CF rollout. |
@@ -148,7 +176,8 @@ Defaults (overridable via env vars):
 
 Override per class with `CARGO_SC_TAU_WRITE`, `CARGO_SC_TAU_IRREV`,
 `CARGO_SC_TAU_FINAL`, `CARGO_SC_K_*`, and `CARGO_CF_IRREV` /
-`CARGO_CF_FINAL`. Calibration on logged baseline rollouts is the v2 step
+`CARGO_CF_FINAL`. Calibration on logged baseline rollouts is the next
+calibration step
 (`src/cargo/calibration.py:fit_thresholds`).
 
 ## Diagnostics (per controller, per cell)
@@ -329,7 +358,14 @@ preference separation; ACEBench-style local-pass/global-fail decoy rejection;
 precondition matching; argument-grounding regex coverage; repeat-loop
 detection; self-consistency vote (mock client with `n>1`); counterfactual
 rollout (mock client); post-condition error detection; proposer JSON parsing;
-repair policy decisions; and full agent loop behavior on mock environments.
+repair policy decisions; READ-permissive / WRITE-strict validation; airline
+obligation-guided search progression; and full agent loop behavior on mock
+environments.
+
+Latest local verification in this workspace: `232` tests passed. Live
+tau-bench / ACEBench smoke tests require either `OPENAI_API_KEY` or an
+OpenAI-compatible `OPENAI_BASE_URL`; without one, the smoke helper reports
+them as blocked and leaves exact rerun commands.
 
 ## What CARGO is — and isn't
 
@@ -348,7 +384,7 @@ retrieval.
 The novelty story is the *composition*: risk-class typing of tools
 (auto-induced) + class-specific calibrated abstention + selective
 self-consistency only on risky actions + deterministic argument grounding +
-generic semantic state/constraint gates + named deterministic repair. None of the parts is
+generic semantic state/constraint gates + obligation-guided retrieval + named deterministic repair. None of the parts is
 unprecedented; the integration as a coherent training-free architecture
 for parameterized tool-using LLM agents, with **per-class** calibrated
 abstention rather than syntactic guardrails, is what differentiates it

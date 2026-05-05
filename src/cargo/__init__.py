@@ -25,6 +25,7 @@ from .core import (
     Constraint,
     FallbackRule,
     GenericCargoKernel,
+    Obligation,
     Preference,
     TaskState,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "FallbackRule",
     "GateResult",
     "GenericCargoKernel",
+    "Obligation",
     "ProposedAction",
     "Preference",
     "RiskClass",
