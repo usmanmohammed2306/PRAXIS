@@ -415,6 +415,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
             diag["gates_failed"].append("repeat_loop")
             return rl, diag
 
+        if action.declared_class == RiskClass.FINAL:
+            final_gate = self._check_final_completeness(action, wm)
+            diag["gates_run"].append("final_completeness")
+            stats.record_gate(final_gate)
+            if not final_gate.ok:
+                diag["gates_failed"].append("final_completeness")
+                return final_gate, diag
+
         # Successful writes are single-shot.  This check is durable across the
         # whole task, not just the rolling repeat window.
         if action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE):
@@ -435,6 +443,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if not confirm_gate.ok:
                 diag["gates_failed"].append("confirmation")
                 return confirm_gate, diag
+            completeness_gate = self._check_write_completeness(action, wm)
+            diag["gates_run"].append("completeness")
+            stats.record_gate(completeness_gate)
+            if not completeness_gate.ok:
+                diag["gates_failed"].append("completeness")
+                return completeness_gate, diag
 
         if not is_gated(action.declared_class):
             # Even on the fast path, run arg_grounding so hallucinated
@@ -2570,6 +2584,65 @@ class CargoAgent(Agent):  # type: ignore[misc]
             "grounded action assembled from current state."
         )
         return canonical
+
+    def _check_write_completeness(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        """Reject partial or non-canonical retail mutations.
+
+        Canonicalization fixes the common path before gates run.  This gate is
+        the safety backstop: a WRITE for a known retail mutation tool may only
+        execute if it exactly matches the complete grounded action assembled by
+        the controller from current order/product state.  That blocks partial
+        exchanges/returns/modifies, decoy variant choices, and premature writes
+        where some requested item is still unresolved.
+        """
+        if action.name not in {
+            "exchange_delivered_order_items",
+            "return_delivered_order_items",
+            "modify_pending_order_items",
+        }:
+            return GateResult.passing("completeness")
+        canonical = self._grounded_retail_commit_action(wm)
+        if canonical is None:
+            return GateResult.failing(
+                "completeness",
+                "no_complete_grounded_write_available",
+            )
+        if canonical.name != action.name:
+            return GateResult.failing(
+                "completeness",
+                "write_tool_does_not_match_grounded_task",
+                expected=canonical.name,
+                proposed=action.name,
+            )
+        if canonical.signature() != action.signature():
+            return GateResult.failing(
+                "completeness",
+                "write_args_do_not_match_complete_grounded_action",
+                expected=canonical.args,
+                proposed=action.args,
+            )
+        return GateResult.passing("completeness")
+
+    def _check_final_completeness(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        """Prevent terminal answers while account-side work is still open."""
+        if action.declared_class != RiskClass.FINAL:
+            return GateResult.passing("final_completeness")
+        if not self._is_account_order_goal(wm):
+            return GateResult.passing("final_completeness")
+        if wm.phase_locked("mutation") or wm.task_completed or wm.auth_abandoned:
+            return GateResult.passing("final_completeness")
+        return GateResult.failing(
+            "final_completeness",
+            "account_task_has_unresolved_write_phase",
+        )
 
     def _has_tool(self, name: str) -> bool:
         schemas = getattr(self, "schemas", None) or {}
