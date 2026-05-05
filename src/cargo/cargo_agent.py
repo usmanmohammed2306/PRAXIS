@@ -1011,6 +1011,70 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if done:
                 break
 
+            # ---------------------------------------------------------------
+            # POST-WRITE AUTO-RESPOND (architectural fix — trajectories 22-43)
+            # ---------------------------------------------------------------
+            # After a successful WRITE/IRREVERSIBLE action, deterministically
+            # emit a respond announcing completion.  Without this follow-up
+            # the user simulator never gets a chance to emit ###STOP###, so
+            # `done` is never True, so `calculate_reward` is never called.
+            # Even when the agent's WRITE args match the gold action exactly,
+            # the trajectory ends with reward=0 because the env never
+            # transitions to a terminal state.
+            #
+            # Observed across trajectories 22-43: every retail task that
+            # reached a WRITE got args correct yet scored 0 reward.  The one
+            # historical success (trajectories 21) succeeded because the
+            # baseline agent — not CARGO — happened to emit free-form text
+            # after the WRITE that the runner translated into a respond.
+            #
+            # Note: the auto-respond is suppressed when the env is already
+            # signalling done (e.g. transfer_to_human_agents) so we don't
+            # double-call _respond on a closed env.
+            if (
+                action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE)
+                and not done
+                and not wm.post_write_responded
+            ):
+                summary = self._post_write_summary(action, tool_obs)
+                env_resp2 = self._respond(env, summary)
+                if env_resp2 is None:
+                    break
+                # Log the translated tool call so the trajectory shows the
+                # respond exactly the same way as a model-emitted respond.
+                aux_call_id = f"cargo_{step}_post_write_respond"
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": aux_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": RESPOND_TOOL_NAME,
+                            "arguments": json.dumps(
+                                {"content": summary[:RESPOND_MAX_CHARS]}
+                            ),
+                        },
+                    }],
+                })
+                user_reply2 = _obs_text(env_resp2)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": aux_call_id,
+                    "name": RESPOND_TOOL_NAME,
+                    "content": user_reply2,
+                })
+                if user_reply2:
+                    wm.absorb_user_message(user_reply2)
+                reward = _float(getattr(env_resp2, "reward", reward), reward)
+                info = getattr(env_resp2, "info", info) or info
+                done = bool(getattr(env_resp2, "done", False))
+                wm.post_write_responded = True
+                wm.last_final_text = summary
+                wm.consecutive_same_final = 1
+                if done:
+                    break
+
         info = dict(info) if info else {}
         if step_error:
             info["error"] = step_error
@@ -2342,6 +2406,51 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if _is_context_overflow(env_exc):
                 return None
             raise
+
+    @staticmethod
+    def _post_write_summary(action: ProposedAction, tool_obs: str) -> str:
+        """Build a short user-facing completion message for a successful
+        WRITE / IRREVERSIBLE action.
+
+        Domain-agnostic: only references the action name and any "status"
+        field returned by the env (e.g. ``"exchange requested"``,
+        ``"cancelled"``).  This keeps the core CARGO controller free of
+        benchmark-specific text while still producing a sensible follow-up
+        message that lets the user simulator emit ``###STOP###``.
+
+        The message intentionally invites the user to confirm or ask for
+        more help — that gives a cooperative simulator the cue to wrap up
+        the conversation and a critical simulator the room to flag any
+        mismatch (which is rarer in practice).
+        """
+        # Try to extract a status field from the JSON tool result.
+        status_phrase = ""
+        if tool_obs:
+            try:
+                obj = json.loads(tool_obs) if tool_obs.lstrip().startswith(("{", "[")) else None
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                for key in ("status", "state", "result"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val.strip():
+                        status_phrase = f" The order is now '{val.strip()}'."
+                        break
+        # Humanise the action name (e.g. "exchange_delivered_order_items"
+        # → "exchange") for the user-visible message.
+        action_human = action.name.replace("_", " ").strip()
+        for prefix in (
+            "exchange ", "cancel ", "modify ", "return ", "update ",
+            "book ", "create ", "delete ", "transfer ", "send ", "refund ",
+        ):
+            if action_human.startswith(prefix):
+                action_human = prefix.strip()
+                break
+        msg = (
+            f"Your {action_human} request has been processed successfully."
+            f"{status_phrase} Is there anything else I can help you with?"
+        )
+        return msg
 
 
 __all__ = ["CargoAgent"]

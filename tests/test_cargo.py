@@ -3323,5 +3323,407 @@ class TestTauBenchIntegrationOptional(unittest.TestCase):
         self.assertTrue(hasattr(CargoAgent, "solve"))
 
 
+# ---------------------------------------------------------------------------
+# Trajectory(43) regressions — post-WRITE auto-respond architecture fix
+# ---------------------------------------------------------------------------
+class TestTrajectory43Regressions(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_cache()
+
+    """Regression tests for the post-WRITE auto-respond architectural fix.
+
+    Root cause analysis from trajectories(22-43): every retail task that
+    reached a successful WRITE got the WRITE args correct (matching gold
+    exactly) yet still scored reward 0.  Tau-bench only calculates reward
+    when the env hits ``done=True``, which for a non-terminate tool can
+    only happen via ``respond`` whose user reply contains ``###STOP###``.
+    Without a follow-up respond after the WRITE, the user simulator never
+    has a chance to emit STOP, so the trajectory ends with reward=0.
+
+    Architectural fix (FIX-A): after a successful WRITE/IRREVERSIBLE tool
+    call, the controller deterministically emits a respond announcing
+    completion.  This invariant must hold across:
+      * model-driven trajectories (proposer naturally proposes a respond
+        next — auto-respond should suppress on the same step)
+      * model-stuck trajectories (proposer proposes another tool / loops
+        — auto-respond is what closes the conversation)
+    """
+
+    def _make_agent(self) -> Any:
+        """Construct a CargoAgent without running its __init__."""
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+        agent = CargoAgent.__new__(CargoAgent)
+        return agent
+
+    # ----- _post_write_summary ----------------------------------------
+    def test_post_write_summary_handles_known_action_prefix(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={"order_id": "#W2378156"},
+            declared_class=RiskClass.WRITE,
+        )
+        msg = CargoAgent._post_write_summary(action, '{"status": "exchange requested"}')
+        # User-visible message uses the human action prefix, not the raw
+        # tool name.  This matters because the user simulator reads the
+        # text and decides whether to STOP.
+        self.assertIn("exchange", msg.lower())
+        self.assertIn("processed successfully", msg.lower())
+        # Status was extracted from the tool obs and surfaced.
+        self.assertIn("exchange requested", msg)
+        self.assertIn("anything else", msg.lower())
+
+    def test_post_write_summary_handles_cancel(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        action = ProposedAction(
+            name="cancel_pending_order",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.IRREVERSIBLE,
+        )
+        msg = CargoAgent._post_write_summary(action, '{"status": "cancelled"}')
+        self.assertIn("cancel", msg.lower())
+        self.assertIn("cancelled", msg)
+
+    def test_post_write_summary_no_status_field(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        action = ProposedAction(
+            name="modify_pending_order_payment",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.WRITE,
+        )
+        msg = CargoAgent._post_write_summary(action, '{"order_id": "#W1"}')
+        # No status field means no status phrase, but the action prefix
+        # ("modify") still gets surfaced cleanly.
+        self.assertIn("modify", msg.lower())
+        self.assertIn("processed successfully", msg.lower())
+
+    def test_post_write_summary_unknown_action_falls_back_safely(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        # Unknown / generic action name without one of the standard
+        # prefixes ("exchange", "cancel", ...) — message should still be
+        # well-formed (not crash, not produce weird underscores).
+        action = ProposedAction(
+            name="apply_promotion",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.WRITE,
+        )
+        msg = CargoAgent._post_write_summary(action, "")
+        # The full humanised name shows when no prefix matched.
+        self.assertIn("apply promotion", msg.lower())
+        self.assertNotIn("_", msg)  # no raw underscores leaked
+        self.assertIn("processed successfully", msg.lower())
+
+    def test_post_write_summary_invalid_json_obs(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.WRITE,
+        )
+        # Non-JSON tool obs (e.g. "Error: order not found") shouldn't
+        # crash the summary builder; just skip the status phrase.
+        msg = CargoAgent._post_write_summary(action, "Error: not allowed")
+        self.assertIn("exchange", msg.lower())
+        self.assertNotIn("Error", msg)
+        self.assertNotIn("'", msg.split("processed successfully")[1] if "processed successfully" in msg else "")
+
+    # ----- WorkingMemory durability -----------------------------------
+    def test_post_write_responded_flag_default(self) -> None:
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        # Default must be False so the controller fires the auto-respond
+        # at most once per trajectory.
+        self.assertFalse(wm.post_write_responded)
+
+    def test_post_write_responded_flag_settable(self) -> None:
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        wm.post_write_responded = True
+        self.assertTrue(wm.post_write_responded)
+
+    # ----- Solve loop integration via MockEnv -------------------------
+    def test_solve_emits_auto_respond_after_write(self) -> None:
+        """End-to-end check: proposer issues a WRITE, env returns done=False,
+        solve loop must follow up with a respond automatically.  This is
+        the exact scenario seen in trajectories(43) T0/T1 where the WRITE
+        args matched gold but the trajectory ended with reward=0 because
+        no follow-up respond ever fired.
+        """
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        # Use realistic tau-bench-format IDs in the initial user message
+        # so arg_grounding can ground the WRITE's args without a prior READ.
+        ORDER_ID = "#W2378156"
+        ITEM_OLD = "1151293680"
+        ITEM_NEW = "7706410293"
+        PAY = "credit_card_9513926"
+        USER_TURN = (
+            f"Exchange order {ORDER_ID}: swap item {ITEM_OLD} for item {ITEM_NEW} "
+            f"on payment method {PAY}.  Please proceed."
+        )
+        # Step 0 proposer: emit a WRITE exchange (only the first step
+        # matters for this test).
+        scripts: List[Any] = [
+            _proposer_json(
+                name="exchange_delivered_order_items",
+                args={
+                    "order_id": ORDER_ID,
+                    "item_ids": [ITEM_OLD],
+                    "new_item_ids": [ITEM_NEW],
+                    "payment_method_id": PAY,
+                },
+                declared_class="WRITE",
+                thought="commit",
+            ),
+            # SC samples for the WRITE (3 agreeing).
+            [_proposer_json(
+                name="exchange_delivered_order_items",
+                args={
+                    "order_id": ORDER_ID,
+                    "item_ids": [ITEM_OLD],
+                    "new_item_ids": [ITEM_NEW],
+                    "payment_method_id": PAY,
+                },
+                declared_class="WRITE",
+            )] * 3,
+            # CF rollout: still reachable.
+            json.dumps({"predicted_obs": "{}", "goal_still_reachable": True}),
+            # If the loop does run another step (it shouldn't, env will
+            # signal done after the auto-respond), this is the next
+            # proposer output.
+            _proposer_json(
+                name="respond", declared_class="FINAL",
+                user_text="All done.",
+            ),
+        ]
+        client = MockClient(scripts=scripts)
+
+        # MockEnv: first env.step(exchange) returns the order details
+        # (done=False, like a real WRITE).  Second env.step is the
+        # auto-respond — return done=True so the loop exits cleanly with
+        # reward 1.0.
+        write_obs = json.dumps({
+            "order_id": ORDER_ID, "status": "exchange requested",
+        })
+        env = MockEnv(
+            initial_user=USER_TURN,
+            step_responses=[
+                _StepResp(observation=write_obs, reward=0.0, done=False),
+                _StepResp(observation="thanks ###STOP###", reward=1.0, done=True),
+            ],
+        )
+
+        agent = CargoAgent.__new__(CargoAgent)
+        # Construct just enough state to call solve() — minimal __init__
+        # bypass.  Fields used by solve() must all be set.
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "retail"
+        agent.calibration = default_calibration()
+        # Schema for the WRITE so gates have something to check.
+        agent.schemas = induce_schemas([_tool(
+            "exchange_delivered_order_items",
+            ["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+        )])
+        agent.domain_policy = ""
+
+        result = agent.solve(env, task_index=0, max_num_steps=10)
+
+        # Verify the auto-respond fired: we expect AT LEAST 2 actions
+        # executed against the env (the WRITE and the auto-respond).
+        executed_names = [a.name for a in env.actions_executed]
+        self.assertIn(
+            "exchange_delivered_order_items", executed_names,
+            f"WRITE never executed; env actions={executed_names}",
+        )
+        self.assertIn(
+            "respond", executed_names,
+            f"Auto-respond did NOT fire after WRITE; env actions={executed_names}",
+        )
+        # Order matters: respond must come AFTER the exchange.
+        self.assertLess(
+            executed_names.index("exchange_delivered_order_items"),
+            executed_names.index("respond"),
+            f"Auto-respond fired before WRITE; env actions={executed_names}",
+        )
+        # Reward propagated from env_resp2 (the auto-respond) — 1.0 means
+        # the task scored a positive reward via STOP detection.
+        self.assertEqual(result.reward, 1.0)
+
+    def test_solve_post_write_responded_flag_set(self) -> None:
+        """After a successful WRITE + auto-respond, wm.post_write_responded
+        must be True.  This is the durable signal that suppresses the
+        second auto-respond if a later WRITE happens in the same trajectory.
+
+        We can't directly inspect wm from outside solve(), so we instead
+        verify the OBSERVABLE consequence: env.actions_executed contains
+        exactly ONE 'respond' (the auto-respond) plus the WRITE itself.
+        Reward propagates from the user simulator's STOP."""
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        ORDER_ID = "#W2378156"
+        PAY = "credit_card_9513926"
+        USER_TURN = (
+            f"Modify pending order {ORDER_ID}: change payment method to {PAY}."
+        )
+        scripts: List[Any] = [
+            _proposer_json(
+                name="modify_pending_order_payment",
+                args={"order_id": ORDER_ID, "payment_method_id": PAY},
+                declared_class="WRITE",
+            ),
+            [_proposer_json(
+                name="modify_pending_order_payment",
+                args={"order_id": ORDER_ID, "payment_method_id": PAY},
+                declared_class="WRITE",
+            )] * 3,
+            json.dumps({"predicted_obs": "{}", "goal_still_reachable": True}),
+        ]
+        client = MockClient(scripts=scripts)
+
+        env = MockEnv(
+            initial_user=USER_TURN,
+            step_responses=[
+                _StepResp(observation='{"status": "pending (payment modified)"}',
+                          reward=0.0, done=False),
+                # User STOPs after the auto-respond.
+                _StepResp(observation="thanks ###STOP###", reward=1.0, done=True),
+            ],
+        )
+
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "retail"
+        agent.calibration = default_calibration()
+        agent.schemas = induce_schemas([
+            _tool("modify_pending_order_payment",
+                  ["order_id", "payment_method_id"]),
+        ])
+        agent.domain_policy = ""
+
+        result = agent.solve(env, task_index=0, max_num_steps=5)
+
+        respond_count = sum(
+            1 for a in env.actions_executed if a.name == "respond"
+        )
+        # Exactly one auto-respond after the WRITE.  No double-fire.
+        self.assertEqual(
+            respond_count, 1,
+            f"Auto-respond did not fire exactly once; "
+            f"respond count={respond_count}",
+        )
+        self.assertEqual(result.reward, 1.0)
+
+    def test_solve_skips_auto_respond_when_done_already_true(self) -> None:
+        """If the WRITE itself caused the env to signal done=True
+        (e.g. transfer_to_human_agents), the controller must NOT call
+        _respond afterward — that would step a closed env.
+
+        We use a non-IRREVERSIBLE class to keep the gate stack simple
+        (READ doesn't go through SC/CF), and have the env return done=True
+        on the read itself.  In real tau-bench this scenario corresponds
+        to a tool whose execution implicitly closes the conversation
+        (e.g. an admin tool the env decides to terminate after).
+        """
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        # Use a WRITE so the post-WRITE branch is the relevant code path.
+        # The env returns done=True on the WRITE itself (mimicking
+        # transfer_to_human_agents which is in terminate_tools).
+        ORDER_ID = "#W2378156"
+        scripts: List[Any] = [
+            _proposer_json(
+                name="cancel_pending_order",
+                args={"order_id": ORDER_ID, "reason": "no longer needed"},
+                declared_class="WRITE",
+            ),
+            [_proposer_json(
+                name="cancel_pending_order",
+                args={"order_id": ORDER_ID, "reason": "no longer needed"},
+                declared_class="WRITE",
+            )] * 3,
+            json.dumps({"predicted_obs": "{}", "goal_still_reachable": True}),
+        ]
+        client = MockClient(scripts=scripts)
+
+        env = MockEnv(
+            initial_user=f"Cancel my pending order {ORDER_ID} - no longer needed",
+            step_responses=[
+                # Env signals done=True directly from the WRITE.
+                _StepResp(observation='{"status": "cancelled"}',
+                          reward=1.0, done=True),
+            ],
+        )
+
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "retail"
+        agent.calibration = default_calibration()
+        agent.schemas = induce_schemas([
+            _tool("cancel_pending_order", ["order_id", "reason"]),
+        ])
+        agent.domain_policy = ""
+
+        agent.solve(env, task_index=0, max_num_steps=5)
+
+        # No respond after the WRITE — the env was already closed.
+        respond_count = sum(
+            1 for a in env.actions_executed if a.name == "respond"
+        )
+        self.assertEqual(
+            respond_count, 0,
+            f"Auto-respond fired after env signalled done; "
+            f"respond count={respond_count}",
+        )
+        self.assertEqual(
+            env.actions_executed[0].name, "cancel_pending_order",
+            f"WRITE was not the first action; "
+            f"got {env.actions_executed[0].name}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -79,6 +79,13 @@ class WorkingMemory:
     # detect a "same FINAL on every step" infinite loop and break out.
     last_final_text: str = ""
     consecutive_same_final: int = 0
+    # Set once the controller has emitted a deterministic post-WRITE respond
+    # so it doesn't fire twice for the same trajectory (e.g. when the model
+    # itself proposes a follow-up respond on the next step).  Without this
+    # flag, the post-WRITE auto-respond and a subsequent model-emitted
+    # respond would both call env.step(respond), inflating message count
+    # and confusing the user simulator.
+    post_write_responded: bool = False
 
     # ------------------------------------------------------------------
     # Updates
