@@ -1,7 +1,7 @@
 # CARGO Known-Issue Ledger
 
 This ledger is the recovery record for the uploaded CARGO runs from
-`metrics (24).json` through `metrics (52).json`, their paired trajectories,
+`metrics (24).json` through `metrics (57).json`, their paired trajectories,
 and the local regression suite.  It is intentionally phrased by failure
 class rather than benchmark task answer, so it remains a test and design
 artifact rather than an answer key.
@@ -41,6 +41,11 @@ Machine-readable companion: `docs/known_issues.json`.
 | metrics (50) | ACE agent | 1.0 completion | - | 2.0 | 0 | 0 | 0 | 0 | 5 tool calls |
 | metrics (51) | airline | 0.0 | 0.0 | 40.2 | 66 | 43 | 2 | 21 | 34 |
 | metrics (52) | retail | 0.0 | 0.0 | 27.2 | 18 | 13 | 0 | 5 | 35 |
+| metrics (53) | ACE agent | 1.0 completion | - | 2.0 | 0 | 0 | 0 | 0 | 5 tool calls |
+| metrics (54) | airline | 0.0 | 0.0 | 43.2 | 57 | 37 | 4 | 16 | 43 |
+| metrics (55) | retail | 0.0 | 0.0 | 27.2 | 18 | 13 | 0 | 5 | 35 |
+| metrics (56) | retail | 0.01 | 0.01 | 45.195 | 2966 | 2044 | 173 | 752 | 1602 |
+| metrics (57) | airline | 0.04 | 0.04 | 54.175 | 4107 | 2614 | 180 | 1313 | 1612 |
 
 ## Benchmark Context Used
 
@@ -94,6 +99,15 @@ Machine-readable companion: `docs/known_issues.json`.
   tau-retail and tau-airline adapters own domain evidence for selected
   candidates, active task-frame consistency, identity/order anchoring, payment
   grounding, and full requested-operation coverage.
+- CARGO-v2 spine work now keeps the Soft Goal-Field Router as the progress
+  router, but adds a phase-aware authentication/discovery/confirmation/commit
+  boundary and a deterministic pre-commit verifier for WRITE/IRREVERSIBLE
+  actions.  Commit certificates remain final safety guards rather than a
+  planner.
+- Airline new-booking progression now records nested one-stop itinerary
+  candidate sets and can assemble a grounded booking action from profile,
+  search, baggage, insurance, and payment evidence after exact user
+  confirmation.
 - Obligation guidance converts repeated or generic ASK/FINAL proposals into
   the next grounded READ when user/tool evidence already identifies an open
   information need.
@@ -155,6 +169,7 @@ Machine-readable companion: `docs/known_issues.json`.
 | Successful write did not give simulator a terminal response | metrics (43)/(46) retail traces executed useful writes but did not always produce the post-write `respond` needed for tau-bench STOP/reward | The solve loop marked the task complete and broke before the post-write response path | Terminal completion is deferred until after a deterministic post-write `respond`, unless another distinct grounded mutation remains | `test_solve_emits_auto_respond_after_write`, `test_solve_post_write_responded_flag_set` | Fixed, verified |
 | Grounded write lacks explicit transition proof | metrics (51)/(52) showed cleaner operational traces but remaining 0-success runs still depended on implicit LLM/stage decisions for commitment, candidate coverage, and terminal readiness | The gate stack could reject bad actions but did not require a positive proof certificate that a proposed transition closes the active task frame | WRITE/IRREVERSIBLE/FINAL actions must carry adapter-verifiable proof obligations before commit | `test_v4_retail_commit_certificate_blocks_partial_exchange`, `test_v4_retail_commit_certificate_accepts_complete_exchange`, `test_v4_write_gate_requires_commit_certificate` | Fixed, verified |
 | Goal continuity still controlled by fixed override order | metrics (54)/(55) show useful retrieval followed by repeated generic ASK_USER, stale profile reads, or mixed-goal drift after an early wrong identity branch | The controller had state, obligations, and proofs, but no compact soft field to prefer progress and downweight repeated non-progress across candidate sources | Maintain a Soft Goal-Field Router with momentum, friction, tiny hypotheses, adapter stages, and recentering; score model plus deterministic candidates before gates | `test_goal_field_momentum_updates_deterministically`, `test_repeated_non_progress_raises_friction_and_changes_selection`, `test_generic_ask_suppressed_when_goal_slots_known`, `test_wrong_retail_zip_recenters_but_preserves_order_branch`, `test_airline_cached_profile_is_not_selected_over_progress`, `test_goal_field_render_stays_compact_for_small_models` | Fixed, verified |
+| Phase spine missing after useful retrieval | metrics (56)/(57) show small nonzero success but huge abstain/repair spirals; inspected traces include retail mutation before authentication/confirmation and airline search evidence followed by repeated search/ASK behavior, placeholder booking args, and pseudo-write `calculate` calls | The soft field improved candidate continuity but deterministic phase boundaries and final WRITE checks were still too weak; nested itinerary evidence was not promoted into a selectable grounded booking candidate | Account/order mutations must authenticate before order/write work, WRITE/IRREVERSIBLE actions must pass deterministic pre-commit checks, and airline booking must prefer the grounded itinerary/payment path over repeated asks/searches once evidence exists | `test_v2_repeat_window_tracks_eight_signatures`, `test_v2_precommit_blocks_placeholder_and_pseudo_write`, `test_v2_retail_account_task_authenticates_before_order_lookup`, `test_v2_retail_order_recovery_stays_live_after_failed_identity`, `test_v2_nested_airline_itinerary_candidate_set_is_recorded`, `test_v2_airline_presents_grounded_itinerary_before_booking`, `test_v2_airline_builds_complete_book_action_after_confirmation` | Fixed, verified |
 
 ## Remaining Limitations
 
@@ -165,24 +180,25 @@ Machine-readable companion: `docs/known_issues.json`.
   by default. Use `--include-ace-vllm --include-ace-conflicting-pins` only in
   an isolated virtualenv for exact upstream reproduction. Live smoke still
   needs a model endpoint/API key.
-- Airline full booking selection is guarded for slot completeness, state
+- Airline full booking selection is now guarded for slot completeness, state
   consistency, obligation-guided search progression, empty-search exhaustion,
-  premature payment asks, and commit certificates. A complete deterministic
-  cheapest/fastest itinerary selector after non-empty search results remains
-  the next extension. CARGO remains a lightweight risk-gated controller, not a
-  full tree-search planner.
+  premature payment asks, phase confirmation, pre-commit validation, and commit
+  certificates.  The deterministic builder currently covers the common new
+  booking path; modify/cancel/update reservation flows still need equivalent
+  phase-specific builders. CARGO remains a lightweight risk-gated controller,
+  not a full tree-search planner.
 
 ## Verification
 
-- `python3 -m unittest tests.test_cargo`: 276 local regression tests passed.
-- `python3 -m compileall src tests scripts`: passed.
-- `python3 scripts/benchmark_setup.py --bench all --install`: passed with
-  tau-bench installed and ACEBench conflicting pins skipped by default.
-- `python3 -m pip check`: no broken requirements found.
-- `git diff --check`: passed.
+- `python3 -m unittest tests.test_cargo -q`: 289 local regression tests passed.
+- `python3 -m compileall src tests scripts -q`: passed.
 - `bash run_project.sh --dry-run`: passed configuration resolution without
   launching a model server or benchmark run.
-- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_proof.json`:
+- `python3 -m pip check`: no broken requirements found.
+- `git diff --check`: passed.
+- `python3 -m json.tool docs/known_issues.json`: passed.
+- Shell invariant check found exactly `./run_project.sh` and `./setup_env.sh`.
+- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_v2_spine.json`:
   synthetic checks passed; tau retail/airline and ACE live smoke are blocked
   unless `OPENAI_API_KEY` or `OPENAI_BASE_URL` is present.
-- `python3 scripts/parse_smoke_results.py --smoke-summary outputs/smoke/smoke_summary_proof.json --json-out outputs/smoke/smoke_compact_proof.json`: passed.
+- `python3 scripts/parse_smoke_results.py --smoke-summary outputs/smoke/smoke_summary_v2_spine.json --json-out outputs/smoke/smoke_compact_v2_spine.json`: passed.
