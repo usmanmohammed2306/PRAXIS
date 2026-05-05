@@ -9,7 +9,7 @@ and **ACEBench Agent**:
 | 1 | **Vanilla TC** (`baseline`) | Native function-calling, minimal system prompt. |
 | 2 | **Act** (`act`)             | Yao et al. 2022 ablation: action-only, no reasoning prose. |
 | 3 | **ReAct** (`react`)         | Yao et al. 2022: one-line `Thought:` before each Action. |
-| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; deterministic gates check argument grounding and pre-conditions, and a calibrated self-consistency vote (+ counterfactual rollout for IRREVERSIBLE / FINAL) decides whether to commit, retry, ask, or finalize. Mutations execute only after every gate passes. |
+| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; deterministic gates check argument grounding, task-state validity, semantic completeness, and pre-conditions, and a calibrated self-consistency vote (+ counterfactual rollout for IRREVERSIBLE / FINAL) decides whether to commit, retry, ask, or finalize. Mutations execute only after every gate passes. |
 
 All four conditions share the **same in-process loop, model,
 temperature, max-steps, and truncation budget**. The only varying axis is
@@ -37,6 +37,7 @@ unchanged.
             │  (1)  Typed Working Memory  (deterministic)             │
             │       slots: goal, user_revealed_facts,                 │
             │              db_confirmed_facts, assumptions,           │
+            │              semantic task slots, phase locks,          │
             │              pending_obligations, last_obs,             │
             │              last_error, budget_steps                   │
             │                                                         │
@@ -52,11 +53,13 @@ unchanged.
             │                                                         │
             │  (4)  Calibrated Gate                                   │
             │       (4-) repeat-loop check (cheap; runs always)       │
-            │       (4a) declared-pre ⊆ user_facts ∪ db_facts         │
-            │       (4b) ID-typed args grounded in evidence (regex)   │
-            │       (4c) self-consistency: k=3 samples at T=0.7,      │
+            │       (4a) state-validity check vs semantic WM          │
+            │       (4b) declared-pre ⊆ user_facts ∪ db_facts         │
+            │       (4c) ID-typed args grounded in evidence           │
+            │       (4d) completeness / confirmation for writes       │
+            │       (4e) self-consistency: k=3 samples at T=0.7,      │
             │            agreement ≥ τ_c                              │
-            │       (4d) counterfactual rollout (IRREV/FINAL only)    │
+            │       (4f) counterfactual rollout (IRREV/FINAL only)    │
             │                                                         │
             │  (5)  Repair on ABSTAIN  (deterministic)                │
             │       grounding/precond  → ASK_USER                     │
@@ -70,14 +73,46 @@ unchanged.
             └─────────────────────────────────────────────────────────┘
 ```
 
+## CARGO-v2: Semantic State-Constraint Risk Gating
+
+CARGO remains a lightweight, training-free controller.  The v2 hardening
+does not add fine-tuning, a separate judge, benchmark answer retrieval, or a
+tree-search planner.  It extends the original gate stack so the verifier asks
+two questions before acting:
+
+1. Is the action grounded and well-formed?
+2. Is the action correct for the current semantic task state?
+
+The deterministic working memory now separates:
+
+- opaque typed IDs such as `user_id`, `order_id`, `item_id`, `product_id`,
+  `payment_method_id`, `reservation_id`, and `flight_number`
+- semantic task slots such as date, route, cabin, trip type, baggage count,
+  insurance choice, payment preferences, intent, and product-option
+  constraints
+- durable DB-confirmed caches such as orders, products, profiles, and
+  reservations
+
+The gate stack uses that state to block completed-phase re-entry, repeated
+dead-end actions without new evidence, semantic mismatches between action
+arguments and state, partial writes, missing booking slots, and replacement
+candidate choices that violate hard constraints.  Preferences only rank
+candidates after every hard filter has passed; fallbacks apply only when the
+strict constraint set is exhausted and the user allowed the fallback.
+
+The recovery ledger for uploaded failures is tracked in
+[`docs/known_issue_ledger.md`](docs/known_issue_ledger.md).  It maps each
+observed failure class to the invariant and regression test that now protects
+it.
+
 ## The five risk classes
 
 | Class | Examples | Treatment |
 |---|---|---|
-| `READ` | `get_*`, `list_*`, `find_*`, `search_*`, `lookup_*`, `view_*` | Fast path. Repeat-loop check only. |
-| `WRITE` | `update_*`, `modify_*`, `add_*`, `edit_*`, `set_*`, `place_*`, `book_*` | Pre-cond + arg-grounding + SC. |
-| `IRREVERSIBLE` | `cancel_*`, `delete_*`, `refund_*`, `charge_*`, `send_*`, `transfer_*` | Pre-cond + arg-grounding + SC + CF rollout. |
-| `FINAL` | `respond` (when committing the user's task) | Pre-cond + SC + CF rollout. |
+| `READ` | `get_*`, `list_*`, `find_*`, `search_*`, `lookup_*`, `view_*` | Fast path with repeat-loop, state-validity, and ID grounding. |
+| `WRITE` | `update_*`, `modify_*`, `add_*`, `edit_*`, `set_*`, `place_*`, `book_*` | State-validity + confirmation + completeness + pre-cond + arg-grounding + SC. |
+| `IRREVERSIBLE` | `cancel_*`, `delete_*`, `refund_*`, `charge_*`, `send_*`, `transfer_*` | State-validity + confirmation + completeness + pre-cond + arg-grounding + SC + CF rollout. |
+| `FINAL` | `respond` (when committing the user's task) | Final-completeness + pre-cond + SC + CF rollout. |
 | `ASK_USER` | `respond` (when asking a clarifying question) | Pass-through. |
 
 Auto-induction is rule-based (name prefix + parameter shape) by default —

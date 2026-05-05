@@ -415,6 +415,13 @@ class CargoAgent(Agent):  # type: ignore[misc]
             diag["gates_failed"].append("repeat_loop")
             return rl, diag
 
+        state_gate = self._check_state_action_validity(action, wm)
+        diag["gates_run"].append("state_validity")
+        stats.record_gate(state_gate)
+        if not state_gate.ok:
+            diag["gates_failed"].append("state_validity")
+            return state_gate, diag
+
         if action.declared_class == RiskClass.FINAL:
             final_gate = self._check_final_completeness(action, wm)
             diag["gates_run"].append("final_completeness")
@@ -2779,6 +2786,56 @@ class CargoAgent(Agent):  # type: ignore[misc]
     # ------------------------------------------------------------------
     # Grounded task progress / commit layer
     # ------------------------------------------------------------------
+    def _check_state_action_validity(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        """Validate that an action is appropriate for current task state."""
+        name = action.name.lower()
+        if wm.phase_locked("auth") and name.startswith("find_user_id_"):
+            return GateResult.failing(
+                "state_validity",
+                "auth_phase_already_complete",
+                action=action.name,
+            )
+        if name == "get_user_details":
+            uid = str(action.args.get("user_id") or "").strip()
+            if uid and uid in wm.user_profiles:
+                return GateResult.failing(
+                    "state_validity",
+                    "user_profile_already_cached",
+                    user_id=uid,
+                )
+
+        semantic_fields = ("date", "origin", "destination", "cabin", "trip_type")
+        for field in semantic_fields:
+            expected = wm.semantic_slots.get(field)
+            if expected in (None, "", []):
+                continue
+            proposed = action.args.get(field)
+            if proposed in (None, "", []):
+                continue
+            if not self._semantic_values_match(proposed, expected):
+                return GateResult.failing(
+                    "state_validity",
+                    f"action_{field}_conflicts_with_state",
+                    expected=expected,
+                    proposed=proposed,
+                )
+        return GateResult.passing("state_validity")
+
+    @staticmethod
+    def _semantic_values_match(proposed: Any, expected: Any) -> bool:
+        def norm(v: Any) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", str(v or "").lower()).strip()
+        p = norm(proposed)
+        if isinstance(expected, list):
+            vals = [norm(v) for v in expected]
+        else:
+            vals = [norm(expected)]
+        return any(p == v or (p and v and (p in v or v in p)) for v in vals)
+
     def _check_write_confirmation(
         self,
         action: ProposedAction,
@@ -2801,6 +2858,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             "modify": ("modify", "change", "update", "adjust"),
             "cancel": ("cancel",),
             "update": ("update", "change", "modify", "set"),
+            "book": ("book", "reserve", "purchase"),
         }
         for group, verbs in verb_groups.items():
             if group in name and any(re.search(rf"\b{re.escape(v)}\b", text) for v in verbs):
@@ -2858,6 +2916,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
             "return_delivered_order_items",
             "modify_pending_order_items",
         }:
+            if action.name == "book_reservation":
+                return self._check_booking_completeness(action, wm)
             return GateResult.passing("completeness")
         canonical = self._grounded_retail_commit_action(wm)
         if canonical is None:
@@ -2878,6 +2938,36 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 "write_args_do_not_match_complete_grounded_action",
                 expected=canonical.args,
                 proposed=action.args,
+            )
+        return GateResult.passing("completeness")
+
+    def _check_booking_completeness(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        args = action.args or {}
+        missing: List[str] = []
+        if not (args.get("user_id") or wm.auth_user_id or wm.typed_evidence_for("user_id")):
+            missing.append("user_id")
+        if not (args.get("flights") or args.get("flight_numbers") or args.get("flight_number")):
+            missing.append("flights")
+        if not args.get("passengers"):
+            missing.append("passengers")
+        if not (
+            args.get("payment_methods")
+            or args.get("payment_method_id")
+            or wm.semantic_slots.get("payment_preferences")
+            or wm.typed_evidence_for("payment_method_id")
+        ):
+            missing.append("payment")
+        if not (args.get("cabin") or args.get("cabin_class") or wm.semantic_slots.get("cabin")):
+            missing.append("cabin")
+        if missing:
+            return GateResult.failing(
+                "completeness",
+                "booking_missing_required_slots",
+                missing=missing,
             )
         return GateResult.passing("completeness")
 

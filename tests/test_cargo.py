@@ -337,6 +337,28 @@ class TestWorkingMemory(unittest.TestCase):
         self.assertIn("O1234", wm.user_facts)
         self.assertIn("alex_smith_42", wm.user_facts)
 
+    def test_absorb_user_message_binds_airline_semantic_slots(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_user_message(
+            "Book an economy flight from New York to Seattle on May 20th, "
+            "with three checked bags, no insurance, and use my credit card."
+        )
+
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
+        self.assertEqual(wm.semantic_slots["origin"], "New York")
+        self.assertEqual(wm.semantic_slots["destination"], "Seattle")
+        self.assertEqual(wm.semantic_slots["cabin"], "economy")
+        self.assertEqual(wm.semantic_slots["baggage_count"], 3)
+        self.assertEqual(wm.semantic_slots["travel_insurance"], "no")
+        self.assertIn("credit_card", wm.semantic_slots["payment_preferences"])
+
+    def test_db_confirmed_semantic_slot_outranks_later_user_claim(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_observation({"date": "2024-05-20"})
+        wm.absorb_user_message("Actually make that 2024-05-21.")
+
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
+
     def test_absorb_observation_dict_promotes_scalars(self) -> None:
         wm = WorkingMemory()
         wm.absorb_observation({"order_id": "O999", "status": "pending"})
@@ -3834,6 +3856,7 @@ class TestTrajectory24Regressions(unittest.TestCase):
                 "payment_method_id": "pm",
             },
             declared_class=RiskClass.WRITE,
+            bypass_gates=True,
         )
         fixed = agent._canonicalize_write_action(bad, wm)
         self.assertIsNotNone(fixed)
@@ -4239,6 +4262,103 @@ class TestTrajectory24Regressions(unittest.TestCase):
         self.assertIsNone(commit)
         self.assertIsNotNone(ask)
         self.assertEqual(ask.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+
+    def test_i1_completed_auth_phase_blocks_auth_tool_reentry(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.auth_user_id = "alex_smith_42"
+        wm.lock_phase("auth")
+        action = ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": "alex.smith@example.com"},
+            declared_class=RiskClass.READ,
+        )
+        schema = ToolEffectSchema(name="find_user_id_by_email", cls=RiskClass.READ)
+
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "state_validity")
+        self.assertIn("state_validity", diag["gates_failed"])
+
+    def test_i2_state_gate_blocks_search_conflicting_with_bound_date(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("Book a flight from New York to Seattle on May 20th.")
+        action = ProposedAction(
+            name="search_direct_flight",
+            args={
+                "origin": "New York",
+                "destination": "Seattle",
+                "date": "2024-05-21",
+            },
+            declared_class=RiskClass.READ,
+        )
+        schema = ToolEffectSchema(name="search_direct_flight", cls=RiskClass.READ)
+
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "state_validity")
+        self.assertIn("action_date_conflicts_with_state", failing.reason)
+
+    def test_i3_booking_write_requires_complete_slots(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("Please book an economy flight for alex_smith_42.")
+        action = ProposedAction(
+            name="book_reservation",
+            args={"user_id": "alex_smith_42"},
+            declared_class=RiskClass.WRITE,
+        )
+        schema = ToolEffectSchema(
+            name="book_reservation",
+            cls=RiskClass.WRITE,
+            arg_id_fields=["user_id"],
+            required_params=["user_id"],
+        )
+
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "completeness")
+        self.assertIn("booking_missing_required_slots", failing.reason)
+        self.assertIn("completeness", diag["gates_failed"])
+
+    def test_i4_booking_write_passes_slot_completeness_when_filled(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message(
+            "Please book an economy flight for alex_smith_42 using my credit card."
+        )
+        action = ProposedAction(
+            name="book_reservation",
+            args={
+                "user_id": "alex_smith_42",
+                "flights": [{"flight_number": "TEST_FLIGHT_001"}],
+                "passengers": [{"first_name": "Alex", "last_name": "Smith"}],
+                "payment_method_id": "credit_card_1234",
+                "cabin": "economy",
+            },
+            declared_class=RiskClass.WRITE,
+            bypass_gates=True,
+        )
+        wm.absorb_observation({
+            "user_id": "alex_smith_42",
+            "flight_number": "TEST_FLIGHT_001",
+            "payment_methods": {"credit_card_1234": {"id": "credit_card_1234"}},
+        })
+        schema = ToolEffectSchema(
+            name="book_reservation",
+            cls=RiskClass.WRITE,
+            arg_id_fields=["user_id", "payment_method_id"],
+            required_params=["user_id"],
+        )
+
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+
+        self.assertIsNone(failing, failing.reason if failing else "")
+        self.assertIn("completeness", diag["gates_run"])
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,12 @@ class WorkingMemory:
     failed_signatures: Dict[str, int] = field(default_factory=dict)
     evidence_version: int = 0
     typed_values: Dict[str, List[str]] = field(default_factory=dict)
+    # CARGO-v2 semantic task state.  ``typed_values`` stores opaque IDs;
+    # semantic_slots stores ordinary task facts such as dates, routes, cabin,
+    # baggage count, insurance choice, payment preferences, and operations.
+    # DB-confirmed slots outrank later user claims.
+    semantic_slots: Dict[str, Any] = field(default_factory=dict)
+    db_confirmed_slots: Dict[str, bool] = field(default_factory=dict)
     # Auth-loop guard: how many times we've already asked the user for identity
     # credentials.  The override stops asking after 2 attempts to avoid an
     # infinite ASK_USER bounce.
@@ -137,6 +143,8 @@ class WorkingMemory:
             self._add_typed_value(key, value)
             if self.typed_values.get(_normalize_typed_key(key), []) != before:
                 changed = True
+        if self._bind_user_semantics(clean):
+            changed = True
         if changed:
             self.evidence_version += 1
 
@@ -162,6 +170,7 @@ class WorkingMemory:
             kpath = f"{prefix}.{k}" if prefix else str(k)
             if isinstance(v, (str, int, float)) and v not in (None, ""):
                 self._add_typed_value(kpath, v)
+                self._add_semantic_slot(kpath, v, confirmed=True)
                 self._add_db_fact(f"{kpath}={v}")
                 # Also store the value alone (helps arg-grounding substring).
                 if isinstance(v, str) and v.strip():
@@ -174,7 +183,54 @@ class WorkingMemory:
                         self._absorb_dict(item, prefix=f"{kpath}[{i}]")
                     elif isinstance(item, (str, int, float)) and item not in (None, ""):
                         self._add_typed_value(kpath, item)
+                        self._add_semantic_slot(kpath, item, confirmed=True)
                         self._add_db_fact(f"{kpath}[{i}]={item}")
+
+    def _bind_user_semantics(self, text: str) -> bool:
+        changed = False
+        for key, value in _extract_semantic_slots(text):
+            if self._add_semantic_slot(key, value, confirmed=False):
+                changed = True
+        return changed
+
+    def _add_semantic_slot(self, key_path: str, value: Any, *, confirmed: bool) -> bool:
+        key = _normalize_semantic_key(key_path)
+        if not key:
+            return False
+        if key == "intent":
+            return self._add_semantic_list_value("intents", value, confirmed=confirmed)
+        if key == "payment_preference":
+            return self._add_semantic_list_value("payment_preferences", value, confirmed=confirmed)
+        val = str(value).strip() if not isinstance(value, (int, float)) else value
+        if val in (None, ""):
+            return False
+        if self.db_confirmed_slots.get(key) and not confirmed:
+            return False
+        cur = self.semantic_slots.get(key)
+        if cur == val:
+            if confirmed and not self.db_confirmed_slots.get(key):
+                self.db_confirmed_slots[key] = True
+                return True
+            return False
+        self.semantic_slots[key] = val
+        if confirmed:
+            self.db_confirmed_slots[key] = True
+        return True
+
+    def _add_semantic_list_value(self, key: str, value: Any, *, confirmed: bool) -> bool:
+        val = str(value).strip()
+        if not val:
+            return False
+        cur = self.semantic_slots.setdefault(key, [])
+        if not isinstance(cur, list):
+            cur = [str(cur)]
+            self.semantic_slots[key] = cur
+        if val in cur:
+            return False
+        cur.append(val)
+        if confirmed:
+            self.db_confirmed_slots[key] = True
+        return True
 
     def _add_db_fact(self, fact: str) -> None:
         if not fact:
@@ -273,6 +329,12 @@ class WorkingMemory:
             extras.append(self.auth_user_id)
         if self.auth_email:
             extras.append(self.auth_email)
+        for key, value in self.semantic_slots.items():
+            if isinstance(value, list):
+                extras.extend(str(v) for v in value)
+            else:
+                extras.append(f"{key}={value}")
+                extras.append(str(value))
         for order in self.order_details.values():
             extras.extend(_flatten_scalar_facts(order))
         for profile in self.user_profiles.values():
@@ -381,6 +443,16 @@ class WorkingMemory:
             parts.append(f"user_profiles_cached: {len(self.user_profiles)}")
         if self.reservation_details:
             parts.append(f"reservations_cached: {len(self.reservation_details)}")
+        if self.semantic_slots:
+            rendered = []
+            for key in sorted(self.semantic_slots.keys()):
+                val = self.semantic_slots[key]
+                if isinstance(val, list):
+                    val_s = ",".join(str(v) for v in val[-4:])
+                else:
+                    val_s = str(val)
+                rendered.append(f"{key}={val_s}")
+            parts.append("task_slots: " + "; ".join(rendered)[:220])
         parts += [
             "user_facts:",
             *(f"  {f[:90]}" for f in trim(self.user_facts, 5)),
@@ -456,6 +528,154 @@ def _typed_keys_for_path(key_path: str, value: str) -> List[str]:
         if item not in dedup:
             dedup.append(item)
     return dedup
+
+
+def _normalize_semantic_key(key_path: str) -> str:
+    key = str(key_path or "").strip().lower()
+    key = re.sub(r"\[\d+\]", "", key)
+    key = key.split(".")[-1]
+    key = key.replace("-", "_")
+    aliases = {
+        "departure_date": "date",
+        "arrival_date": "date",
+        "scheduled_departure_date": "date",
+        "scheduled_arrival_date": "date",
+        "origin_airport": "origin",
+        "destination_airport": "destination",
+        "cabin_class": "cabin",
+        "class": "cabin",
+        "trip": "trip_type",
+        "insurance": "travel_insurance",
+        "total_bags": "baggage_count",
+        "total_baggages": "baggage_count",
+        "checked_bags": "baggage_count",
+        "checked_baggages": "baggage_count",
+    }
+    key = aliases.get(key, key)
+    semantic_keys = {
+        "date", "origin", "destination", "cabin", "trip_type",
+        "baggage_count", "travel_insurance", "intent",
+        "payment_preference", "time_preference",
+    }
+    return key if key in semantic_keys else ""
+
+
+_MONTHS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+_NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+}
+
+
+def _extract_semantic_slots(text: str) -> List[tuple]:
+    s = str(text or "")
+    if not s:
+        return []
+    out: List[tuple] = []
+    seen: set = set()
+
+    def push(key: str, value: Any) -> None:
+        if value in (None, ""):
+            return
+        pair = (key, str(value))
+        if pair in seen:
+            return
+        seen.add(pair)
+        out.append((key, value))
+
+    low = s.lower()
+    if re.search(r"\b(book|reserve|purchase)\b", low):
+        push("intent", "book")
+    if re.search(r"\b(cancel)\b", low):
+        push("intent", "cancel")
+    if re.search(r"\b(change|modify|upgrade|downgrade|update)\b", low):
+        push("intent", "modify")
+    if re.search(r"\b(exchange|swap|replace)\b", low):
+        push("intent", "exchange")
+    if re.search(r"\b(return|refund)\b", low):
+        push("intent", "return")
+
+    for m in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", s):
+        push("date", m.group(0))
+    for m in re.finditer(
+        r"\b("
+        + "|".join(sorted(_MONTHS, key=len, reverse=True))
+        + r")\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?\b",
+        low,
+    ):
+        year = int(m.group(3) or 2024)
+        month = _MONTHS[m.group(1)]
+        day = int(m.group(2))
+        if 1 <= day <= 31:
+            push("date", f"{year:04d}-{month:02d}-{day:02d}")
+
+    route = re.search(r"\bfrom\s+([A-Za-z][A-Za-z .'-]{1,40}?)\s+to\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:[.,;]| on | in | at |$)", s, re.I)
+    if route:
+        push("origin", _clean_semantic_phrase(route.group(1)))
+        push("destination", _clean_semantic_phrase(route.group(2)))
+    depart = re.search(r"\b(?:departing|leaving|flying out)\s+from\s+([A-Z]{3}|[A-Za-z][A-Za-z .'-]{1,40})(?:[.,;]| on | in | at |$)", s, re.I)
+    if depart:
+        push("origin", _clean_semantic_phrase(depart.group(1)))
+
+    if "basic economy" in low:
+        push("cabin", "basic economy")
+    elif "business class" in low or re.search(r"\bbusiness\b", low):
+        push("cabin", "business")
+    elif re.search(r"\beconomy\b", low):
+        push("cabin", "economy")
+
+    if re.search(r"\bround[- ]trip\b", low):
+        push("trip_type", "round trip")
+    if re.search(r"\bone[- ]way\b", low):
+        push("trip_type", "one way")
+    if re.search(r"\breturn (?:flight|trip)\b", low):
+        push("trip_type", "round trip")
+
+    bag_match = re.search(r"\b(\d+|zero|one|two|three|four|five|six|seven|eight|nine)\s+checked\s+bags?\b", low)
+    if bag_match:
+        raw = bag_match.group(1)
+        push("baggage_count", int(raw) if raw.isdigit() else _NUMBER_WORDS.get(raw))
+
+    if re.search(r"\b(no|without|do not want|don't want)\s+(?:travel\s+)?insurance\b", low):
+        push("travel_insurance", "no")
+    elif re.search(r"\b(?:buy|get|add|want|need|using my)\s+(?:travel\s+)?insurance\b", low):
+        push("travel_insurance", "yes")
+
+    if "certificate" in low:
+        push("payment_preference", "certificate")
+    if "gift card" in low or "gift_card" in low:
+        push("payment_preference", "gift_card")
+    if "credit card" in low or "card" in low:
+        push("payment_preference", "credit_card")
+
+    if re.search(r"\bcheapest\b", low):
+        push("time_preference", "cheapest")
+    if re.search(r"\bdirect\b", low):
+        push("time_preference", "direct_preferred")
+    if re.search(r"\bone[- ]?stop|stopover\b", low):
+        push("time_preference", "onestop_allowed")
+    if re.search(r"\bafter\s+\d{1,2}\s*(?:am|pm)?\b", low):
+        push("time_preference", re.search(r"\bafter\s+\d{1,2}\s*(?:am|pm)?\b", low).group(0))
+    return out
+
+
+def _clean_semantic_phrase(value: str) -> str:
+    val = re.sub(r"\s+", " ", str(value or "")).strip(" .,;:!?")
+    return val
 
 
 def _typed_keys_for_token(token: str) -> List[str]:
