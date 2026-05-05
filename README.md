@@ -155,6 +155,15 @@ candidate or next pipeline step. The current decision engine provides:
   user-only values at the current stage. Payment/certificate details are not
   requested before a flight candidate exists and profile/tool state has been
   consulted.
+- **Adapter-scoped decisions**: retail option constraints are scoped to the
+  current product's actual option keys, so a thermostat compatibility request
+  cannot make a keyboard candidate invalid. Airline route text remains a
+  semantic user fact, while the airline adapter converts search arguments to
+  tool-native airport codes such as `JFK`/`SEA` and validates city/code
+  equivalence.
+- **Schema backstop for IDs**: adapter-declared ID fields remain opaque even
+  if a synthesized schema is incomplete, so plain words cannot slip into
+  fields such as `reservation_id`.
 
 The same class-specific validation remains: READ may retrieve grounded IDs
 from user/tool evidence while state is incomplete; WRITE and FINAL still run
@@ -309,7 +318,8 @@ python3 scripts/parse_smoke_results.py
 If no `OPENAI_API_KEY` or `OPENAI_BASE_URL` is present, live tau/ACE smoke
 runs are marked `blocked` with rerun commands instead of being faked.  The
 synthetic smoke remains fully offline and exercises the generic core and
-adapter invariants.
+adapter invariants. The tau smoke helper covers both retail and airline when
+a model endpoint is available.
 
 ### Auto-selected defaults
 
@@ -386,7 +396,7 @@ repair policy decisions; READ-permissive / WRITE-strict validation; airline
 obligation-guided search progression; and full agent loop behavior on mock
 environments.
 
-Latest local verification in this workspace: `239` tests passed. Live
+Latest local verification in this workspace: `245` tests passed. Live
 tau-bench / ACEBench smoke tests require either `OPENAI_API_KEY` or an
 OpenAI-compatible `OPENAI_BASE_URL`; without one, the smoke helper reports
 them as blocked and leaves exact rerun commands.

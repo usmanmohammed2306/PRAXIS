@@ -4498,7 +4498,8 @@ class TestTrajectory24Regressions(unittest.TestCase):
         wm = WorkingMemory()
         text = (
             "I'm looking to book a flight from New York to Seattle on May 20th. "
-            "Economy class, after 11 am, and one stopover is okay."
+            "My user id is alex_smith_42. Economy class, after 11 am, and "
+            "one stopover is okay."
         )
         wm.absorb_user_message(text)
         agent._kernel().observe_user_message(wm, text)
@@ -4532,13 +4533,14 @@ class TestTrajectory24Regressions(unittest.TestCase):
         wm = WorkingMemory()
         text = (
             "Book a flight from New York to Seattle on May 20th. "
-            "Direct is preferred but one stopover is okay."
+            "My user id is alex_smith_42. Direct is preferred but one "
+            "stopover is okay."
         )
         wm.absorb_user_message(text)
         agent._kernel().observe_user_message(wm, text)
         direct = ProposedAction(
             name="search_direct_flight",
-            args={"origin": "New York", "destination": "Seattle", "date": "2024-05-20"},
+            args={"origin": "JFK", "destination": "SEA", "date": "2024-05-20"},
             declared_class=RiskClass.READ,
         )
         wm.record_action_signature(direct.signature())
@@ -4739,7 +4741,8 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         adapter = TauRetailAdapter()
         goal = (
             "Exchange the mechanical keyboard for a clicky full-size RGB one; "
-            "if unavailable, no backlight is okay."
+            "if unavailable, no backlight is okay. Also exchange the smart "
+            "thermostat for one compatible with Google Home."
         )
         old_item = {
             "name": "Mechanical Keyboard",
@@ -4751,6 +4754,23 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
 
         self.assertEqual(selected, "7706410293")
         self.assertNotEqual(selected, "2299424241")
+
+    def test_v4_retail_adapter_skips_keyboard_when_exact_spec_unavailable_and_user_says_other_only(self) -> None:
+        adapter = TauRetailAdapter()
+        goal = (
+            "Exchange the mechanical keyboard for a clicky full-size RGB one. "
+            "If no keyboard meets those specs, I'd rather only exchange the "
+            "smart thermostat for one compatible with Google Home."
+        )
+        old_item = {
+            "name": "Mechanical Keyboard",
+            "item_id": "1151293680",
+            "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+        }
+
+        selected = adapter.select_replacement_variant_id(self._keyboard_details(), old_item, goal)
+
+        self.assertIsNone(selected)
 
     def test_v4_retail_two_item_exchange_uses_deterministic_selected_candidates(self) -> None:
         agent = self._make_retail_agent()
@@ -4789,6 +4809,43 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         self.assertEqual(action.args["item_ids"], ["1151293680", "8174673829"])  # type: ignore[union-attr]
         self.assertEqual(action.args["new_item_ids"], ["7706410293", "7747408585"])  # type: ignore[union-attr]
 
+    def test_v4_retail_exact_keyboard_unavailable_commits_thermostat_only_when_requested(self) -> None:
+        agent = self._make_retail_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "Exchange the mechanical keyboard for a clicky full-size RGB one. "
+            "If no keyboard meets those specs, I'd rather only exchange the "
+            "smart thermostat for one compatible with Google Home."
+        )
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "credit_card_9513926"}],
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "1656367028",
+                    "item_id": "1151293680",
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+                },
+                {
+                    "name": "Smart Thermostat",
+                    "product_id": "4896585277",
+                    "item_id": "8174673829",
+                    "options": {"compatibility": "Apple HomeKit", "color": "black"},
+                },
+            ],
+        }
+        wm.product_details["1656367028"] = self._keyboard_details()
+        wm.product_details["4896585277"] = self._thermostat_details()
+
+        action = agent._grounded_retail_commit_action(wm)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.name, "exchange_delivered_order_items")  # type: ignore[union-attr]
+        self.assertEqual(action.args["item_ids"], ["8174673829"])  # type: ignore[union-attr]
+        self.assertEqual(action.args["new_item_ids"], ["7747408585"])  # type: ignore[union-attr]
+
     def test_v4_candidate_set_memory_records_empty_search_exhaustion(self) -> None:
         wm = WorkingMemory()
         kernel = GenericCargoKernel(TauAirlineAdapter())
@@ -4806,11 +4863,11 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         wm = WorkingMemory()
         text = (
             "Book a flight from New York to Seattle on May 20th. "
-            "Direct is preferred but one stopover is okay."
+            "My user id is alex_smith_42. Direct is preferred but one stopover is okay."
         )
         wm.absorb_user_message(text)
         agent._kernel().observe_user_message(wm, text)
-        args = {"origin": "New York", "destination": "Seattle", "date": "2024-05-20"}
+        args = {"origin": "JFK", "destination": "SEA", "date": "2024-05-20"}
         agent._kernel().record_action_candidates(wm, "search_direct_flight", args, "[]")
         agent._kernel().record_action_candidates(wm, "search_onestop_flight", args, "[]")
         ask = ProposedAction(
@@ -4826,6 +4883,61 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         self.assertEqual(replacement.declared_class, RiskClass.FINAL)  # type: ignore[union-attr]
         self.assertEqual(wm.task_state.terminal_status, "blocked_no_matching_flights")
         self.assertIn("could not find", replacement.user_text.lower())  # type: ignore[union-attr]
+
+    def test_v4_airline_missing_user_id_asks_precisely_before_search(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = "I need to change my return flight from Texas to Newark, not JFK."
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        generic = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="How can I help?",
+        )
+
+        replacement = agent._obligation_guided_action(generic, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertIn("user ID", replacement.user_text)  # type: ignore[union-attr]
+
+    def test_v4_airline_search_uses_airport_codes_but_matches_bound_city_state(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "Book a flight from New York to Seattle on May 20th. "
+            "My user id is alex_smith_42."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        ask = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="What would you like to do?",
+        )
+
+        replacement = agent._obligation_guided_action(ask, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_direct_flight")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["origin"], "JFK")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["destination"], "SEA")  # type: ignore[union-attr]
+        gate = agent._kernel().validate_action(
+            replacement,  # type: ignore[arg-type]
+            agent._schema_for(replacement),  # type: ignore[arg-type]
+            wm,
+        )
+        self.assertTrue(gate.ok, gate.reason)
+
+    def test_v4_airline_region_word_matches_db_airport_without_canonicalizing_search_to_guess(self) -> None:
+        adapter = TauAirlineAdapter()
+
+        self.assertEqual(adapter.canonicalize_airport("Texas"), "Texas")
+        self.assertTrue(adapter.semantic_values_match("origin", "DFW", "Texas"))
+        self.assertTrue(adapter.semantic_values_match("origin", "IAH", "Texas"))
 
     def test_v4_airline_blocks_premature_payment_questions(self) -> None:
         wm = WorkingMemory()
@@ -4861,6 +4973,21 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
 
         self.assertFalse(gate.ok)
         self.assertIn("reservation_id=though", gate.diagnostics["ungrounded"])
+
+    def test_v4_adapter_id_backstop_rejects_plain_word_when_schema_is_missing(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        action = ProposedAction(
+            name="get_reservation_details",
+            args={"reservation_id": "though"},
+            declared_class=RiskClass.READ,
+        )
+
+        gate = agent._check_state_action_validity(action, wm)
+
+        self.assertFalse(gate.ok)
+        self.assertEqual(gate.reason, "adapter_id_field_plain_word")
+        self.assertIn("reservation_id=though", gate.diagnostics["invalid"])
 
 
 # ---------------------------------------------------------------------------

@@ -429,6 +429,22 @@ class CargoAgent(Agent):  # type: ignore[misc]
             diag["gates_failed"].append("repeat_loop")
             return rl, diag
 
+        # Successful writes are single-shot.  Check this before semantic
+        # validation so a duplicate mutation is reported as a terminal
+        # lifecycle error instead of a secondary grounding/completeness issue.
+        if action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE):
+            sig = action.signature()
+            if wm.mutation_already_executed(sig) or wm.task_completed:
+                done_gate = GateResult.failing(
+                    "completed_task",
+                    "state_change_already_executed",
+                    signature=sig,
+                )
+                diag["gates_run"].append("completed_task")
+                diag["gates_failed"].append("completed_task")
+                stats.record_gate(done_gate)
+                return done_gate, diag
+
         state_gate = self._check_state_action_validity(action, wm)
         diag["gates_run"].append("state_validity")
         stats.record_gate(state_gate)
@@ -444,20 +460,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 diag["gates_failed"].append("final_completeness")
                 return final_gate, diag
 
-        # Successful writes are single-shot.  This check is durable across the
-        # whole task, not just the rolling repeat window.
         if action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE):
-            sig = action.signature()
-            if wm.mutation_already_executed(sig) or wm.task_completed:
-                done_gate = GateResult.failing(
-                    "completed_task",
-                    "state_change_already_executed",
-                    signature=sig,
-                )
-                diag["gates_run"].append("completed_task")
-                diag["gates_failed"].append("completed_task")
-                stats.record_gate(done_gate)
-                return done_gate, diag
             confirm_gate = self._check_write_confirmation(action, wm)
             diag["gates_run"].append("confirmation")
             stats.record_gate(confirm_gate)
@@ -2846,6 +2849,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 "auth_phase_already_complete",
                 action=action.name,
             )
+        id_gate = self._adapter_id_field_gate(action, wm)
+        if not id_gate.ok:
+            return id_gate
         if name == "get_user_details":
             uid = str(action.args.get("user_id") or "").strip()
             if uid and uid in wm.user_profiles:
@@ -2856,6 +2862,74 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 )
 
         return self._kernel().validate_action(action, self._schema_for(action), wm)
+
+    def _adapter_id_field_gate(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        """Backstop adapter-declared IDs even when a tool schema is weak.
+
+        tau-bench tools generally expose clear parameter schemas, but a
+        proposer repair can synthesize an action before schema enrichment sees
+        the tool definition.  Adapter-declared ID names still mean "opaque ID",
+        so plain words such as reservation_id="though" must never pass as a
+        READ just because they do not match the generic ID regex.
+        """
+        id_fields = {str(v) for v in getattr(getattr(self, "adapter", None), "id_fields", set()) or set()}
+        if not id_fields:
+            return GateResult.passing("state_validity")
+        bad: List[str] = []
+        for path, value in self._iter_action_scalars(action.args):
+            base = path.split(".")[-1].split("[")[0]
+            root = path.split(".")[0].split("[")[0]
+            if base not in id_fields and root not in id_fields:
+                continue
+            v = str(value or "").strip()
+            if not v:
+                continue
+            typed = wm.typed_evidence_for(base) or wm.typed_evidence_for(root)
+            if typed and v in typed:
+                continue
+            if not self._looks_like_adapter_id(v):
+                bad.append(f"{path}={v}")
+        if bad:
+            return GateResult.failing(
+                "state_validity",
+                "adapter_id_field_plain_word",
+                invalid=bad[:3],
+            )
+        return GateResult.passing("state_validity")
+
+    @classmethod
+    def _iter_action_scalars(cls, value: Any, prefix: str = ""):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                yield from cls._iter_action_scalars(item, path)
+            return
+        if isinstance(value, list):
+            for idx, item in enumerate(value):
+                yield from cls._iter_action_scalars(item, f"{prefix}[{idx}]")
+            return
+        yield prefix, value
+
+    @staticmethod
+    def _looks_like_adapter_id(value: str) -> bool:
+        v = str(value or "").strip()
+        if not v:
+            return False
+        if re.fullmatch(r"\d{4,}", v):
+            return True
+        if re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{3,}", v):
+            return True
+        if re.fullmatch(r"[a-z]+_[a-z]+_\d{1,8}", v):
+            return True
+        if re.fullmatch(r"(?:credit_card|gift_card|certificate|paypal)_\d+", v):
+            return True
+        if re.fullmatch(r"#[A-Za-z]?\d{4,}", v):
+            return True
+        return False
 
     @staticmethod
     def _semantic_values_match(proposed: Any, expected: Any) -> bool:
@@ -3031,6 +3105,11 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return None
 
         user_id = self._known_user_id(wm)
+        if not user_id and self._airline_task_needs_identity(wm):
+            ask = self._airline_user_id_request(action, wm)
+            if ask is not None:
+                return ask
+
         if user_id and self._has_tool("get_user_details") and user_id not in wm.user_profiles:
             candidate = ProposedAction(
                 name="get_user_details",
@@ -3053,6 +3132,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
         date = self._slot_value(slots, "date")
         if not (origin and destination and date):
             return None
+        origin = self._canonical_airport_arg(origin, field="origin")
+        destination = self._canonical_airport_arg(destination, field="destination")
         direct_args = {"origin": origin, "destination": destination, "date": date}
         direct_set = wm.task_state.candidate_set_for("search_direct_flight", direct_args)
         direct_exhausted = bool(direct_set and direct_set.exhausted)
@@ -3123,6 +3204,70 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 bypass_gates=True,
             )
         return None
+
+    def _airline_user_id_request(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        should_intercept = (
+            action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
+            or action.name.lower() in (RESPOND_TOOL_NAME, "respond", "final", "answer")
+            or action.name.lower() in {
+                "search_direct_flight",
+                "search_onestop_flight",
+                "get_reservation_details",
+                "book_reservation",
+                "update_reservation_flights",
+                "cancel_reservation",
+            }
+        )
+        if not should_intercept:
+            return None
+        if wm.auth_ask_count >= _MAX_AUTH_ASKS:
+            return None
+        ask = ProposedAction(
+            name=RESPOND_TOOL_NAME,
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            declared_pre=["airline task requires account identity"],
+            declared_post=["user provides airline user_id"],
+            informational_intent="ask for missing airline user_id",
+            raw_thought=(
+                "Decision engine: airline policy requires user_id before "
+                "profile, reservation, or booking work; ask precisely instead "
+                "of a generic clarification."
+            ),
+            user_text="Please provide your airline user ID so I can access the relevant profile or reservation.",
+            raw_response="",
+            bypass_gates=True,
+        )
+        fresh = self._fresh_action_or_none(ask, wm)
+        if fresh is not None:
+            wm.auth_ask_count += 1
+            return fresh
+        return None
+
+    @staticmethod
+    def _airline_task_needs_identity(wm: "WorkingMemory") -> bool:
+        text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        slots = wm.semantic_slots
+        intents = slots.get("intents") or slots.get("intent") or []
+        if not isinstance(intents, list):
+            intents = [intents]
+        intent_text = " ".join(str(v).lower() for v in intents if v)
+        return bool(
+            re.search(r"\b(book|reserve|purchase|change|modify|update|reschedule|cancel|refund|downgrade|upgrade)\b", text)
+            and re.search(r"\b(flight|ticket|trip|reservation)\b", text)
+        ) or bool({"book_flight", "modify_flight"} & set(intent_text.split()))
+
+    def _canonical_airport_arg(self, value: str, *, field: str) -> str:
+        mapper = getattr(getattr(self, "adapter", None), "canonicalize_airport", None)
+        if callable(mapper):
+            mapped = mapper(value, field=field)
+            if mapped:
+                return str(mapped)
+        return value
 
     def _flight_search_action(
         self,
@@ -3788,6 +3933,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
         adapter_selector = getattr(getattr(self, "adapter", None), "select_replacement_variant_id", None)
         if callable(adapter_selector):
             selected = adapter_selector(details, old_item, goal)
+            if str(getattr(getattr(self, "adapter", None), "name", "")) == "tau_retail":
+                return selected
             if selected:
                 return selected
 
