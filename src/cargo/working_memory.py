@@ -120,6 +120,19 @@ class WorkingMemory:
             if tok not in self.user_facts:
                 self.user_facts.append(tok)
                 changed = True
+            for key in _typed_keys_for_token(tok):
+                before = list(self.typed_values.get(key, []))
+                self._add_typed_value(key, tok)
+                if self.typed_values.get(key, []) != before:
+                    changed = True
+        for key, value in _extract_labeled_values(clean):
+            if value not in self.user_facts:
+                self.user_facts.append(value)
+                changed = True
+            before = list(self.typed_values.get(_normalize_typed_key(key), []))
+            self._add_typed_value(key, value)
+            if self.typed_values.get(_normalize_typed_key(key), []) != before:
+                changed = True
         if changed:
             self.evidence_version += 1
 
@@ -335,6 +348,10 @@ class WorkingMemory:
             parts.append("phase_locked: auth")
         if self.auth_email:
             parts.append(f"confirmed_email: {self.auth_email}")
+        if not self.auth_user_id:
+            user_ids = self.typed_evidence_for("user_id")
+            if user_ids:
+                parts.append(f"known_user_id: {user_ids[-1]}")
         if self.product_count_finalized:
             parts.append("phase_locked: product_count")
         if self.phase_locked("mutation"):
@@ -372,6 +389,7 @@ _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 # tau-bench retail order IDs: "#W" + digits, with or without the leading #.
 # We capture both forms so arg_grounding accepts either.
 _ORDER_ID_LOOSE_RE = re.compile(r"#?[Ww](\d{5,10})")
+_RESERVATION_ID_RE = re.compile(r"\b[A-Z0-9]{6}\b")
 
 _TYPED_ID_KEYS = {
     "account_id", "booking_id", "customer_id", "email", "flight_id",
@@ -416,6 +434,74 @@ def _typed_keys_for_path(key_path: str, value: str) -> List[str]:
     return dedup
 
 
+def _typed_keys_for_token(token: str) -> List[str]:
+    tok = str(token or "").strip()
+    if not tok:
+        return []
+    out: List[str] = []
+    if _USER_ID_RE.fullmatch(tok):
+        out.append("user_id")
+    if _EMAIL_RE.fullmatch(tok):
+        out.append("email")
+    if _ORDER_ID_LOOSE_RE.fullmatch(tok):
+        out.append("order_id")
+    if _RESERVATION_ID_RE.fullmatch(tok):
+        out.append("reservation_id")
+    if tok.startswith(("credit_card_", "gift_card_", "certificate_")):
+        out.extend(["payment_id", "payment_method_id"])
+    dedup: List[str] = []
+    for item in out:
+        if item not in dedup:
+            dedup.append(item)
+    return dedup
+
+
+_LABEL_ALIASES = {
+    "user_id": ("user id", "user_id", "userid"),
+    "reservation_id": ("reservation id", "reservation_id", "booking id", "booking_id"),
+    "order_id": ("order id", "order number", "order_id"),
+    "payment_id": ("payment id", "payment_id", "payment method", "payment_method_id"),
+}
+
+
+def _extract_labeled_values(text: str) -> List[tuple]:
+    """Extract field-labelled values from user text.
+
+    This is intentionally conservative: it binds values only when the user
+    labels the field directly ("my user ID is ...", "reservation_id: ...").
+    Free-floating opaque tokens still remain evidence but are not assigned to
+    arbitrary argument fields unless their shape is unambiguous.
+    """
+    out: List[tuple] = []
+    seen: set = set()
+
+    def push(key: str, value: str) -> None:
+        value = value.strip().strip(".,;:!?()[]{}\"'")
+        if not value:
+            return
+        pair = (key, value)
+        if pair in seen:
+            return
+        seen.add(pair)
+        out.append(pair)
+
+    for key, aliases in _LABEL_ALIASES.items():
+        for alias in aliases:
+            alias_pat = re.escape(alias).replace(r"\ ", r"\s+")
+            pattern = re.compile(
+                rf"\b{alias_pat}\b"
+                r"(?:\s*(?:is|=|:|#|number)?\s*)"
+                r"([A-Za-z0-9][A-Za-z0-9_\-]{2,80})",
+                re.IGNORECASE,
+            )
+            for m in pattern.finditer(text):
+                candidate = m.group(1)
+                if candidate.lower() in {"not", "unknown", "missing", "forgot", "remembered"}:
+                    continue
+                push(key, candidate)
+    return out
+
+
 def _extract_id_tokens(s: str) -> List[str]:
     if not s:
         return []
@@ -431,6 +517,8 @@ def _extract_id_tokens(s: str) -> List[str]:
     for m in _USER_ID_RE.finditer(s):
         _push(m.group(0))
     for m in _EMAIL_RE.finditer(s):
+        _push(m.group(0))
+    for m in _RESERVATION_ID_RE.finditer(s):
         _push(m.group(0))
     # Order IDs: emit BOTH the bare ("W2378156") and the canonical ("#W2378156")
     # form so arg_grounding accepts either when the action layer normalises

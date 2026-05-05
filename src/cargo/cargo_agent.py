@@ -564,6 +564,29 @@ class CargoAgent(Agent):  # type: ignore[misc]
             proposer_messages = self._build_proposer_messages(wm, messages, critique)
             action, raw_text = self._call_proposer(proposer_messages)
 
+            # Grounded placeholder resolver: if the proposer emits an argument
+            # such as {"user_id": "user_id"} after the user already supplied a
+            # concrete user_id, substitute the single grounded value before any
+            # domain-specific override or gate sees it. Ambiguous state is left
+            # untouched so the normal grounding/repair path asks for clarity
+            # instead of guessing.
+            if action is not None:
+                grounded_action = self._resolve_grounded_placeholders(action, wm)
+                if grounded_action is not None:
+                    raw_text = json.dumps({
+                        "thought": grounded_action.raw_thought,
+                        "action": {
+                            "name": grounded_action.name,
+                            "args": grounded_action.args,
+                            "declared_class": grounded_action.declared_class.value,
+                            "declared_pre": grounded_action.declared_pre,
+                            "declared_post": grounded_action.declared_post,
+                            "informational_intent": grounded_action.informational_intent,
+                            "user_text": grounded_action.user_text,
+                        },
+                    })
+                    action = grounded_action
+
             # Authentication override: if the proposer is stuck using a
             # placeholder email, replace the action with the best alternative
             # we can construct from what the user has actually provided.
@@ -1986,6 +2009,131 @@ class CargoAgent(Agent):  # type: ignore[misc]
             user_text=action.user_text,
             raw_response=action.raw_response,
         )
+
+    # ------------------------------------------------------------------
+    # Generic grounded-argument resolver
+    # ------------------------------------------------------------------
+    def _resolve_grounded_placeholders(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """Replace argument placeholders with one unambiguous grounded value.
+
+        This is the general state-consistency repair for cross-domain tasks:
+        the proposer may correctly select the next tool but still pass the
+        schema field name as the value (for example ``user_id="user_id"``).
+        If working memory has exactly one typed value for that argument field,
+        use it.  If there are zero or multiple candidates, do not guess; the
+        normal grounding gate remains responsible for blocking the action.
+        """
+        if not action.args:
+            return None
+        new_args, changed = self._resolve_placeholder_obj(action.args, wm)
+        if not changed:
+            return None
+        return ProposedAction(
+            name=action.name,
+            args=new_args if isinstance(new_args, dict) else action.args,
+            declared_class=action.declared_class,
+            declared_pre=action.declared_pre,
+            declared_post=action.declared_post,
+            informational_intent=action.informational_intent,
+            raw_thought=(
+                f"Grounded placeholder resolver: replaced placeholder args "
+                f"using persisted typed state for {action.name}."
+            ),
+            user_text=action.user_text,
+            raw_response=action.raw_response,
+            bypass_gates=action.bypass_gates,
+        )
+
+    @classmethod
+    def _resolve_placeholder_obj(
+        cls,
+        obj: Any,
+        wm: "WorkingMemory",
+        field_path: str = "",
+    ) -> Tuple[Any, bool]:
+        if isinstance(obj, dict):
+            changed = False
+            out: Dict[str, Any] = {}
+            for key, value in obj.items():
+                child_path = f"{field_path}.{key}" if field_path else str(key)
+                new_value, did_change = cls._resolve_placeholder_obj(value, wm, child_path)
+                out[key] = new_value
+                changed = changed or did_change
+            return out, changed
+        if isinstance(obj, list):
+            changed = False
+            out: List[Any] = []
+            for i, value in enumerate(obj):
+                child_path = f"{field_path}[{i}]"
+                new_value, did_change = cls._resolve_placeholder_obj(value, wm, child_path)
+                out.append(new_value)
+                changed = changed or did_change
+            return out, changed
+        if not isinstance(obj, str):
+            return obj, False
+
+        field = cls._placeholder_field_name(field_path)
+        if not cls._is_grounded_placeholder_value(field, obj):
+            return obj, False
+        candidates = cls._dedupe_strings(
+            [str(v).strip() for v in wm.typed_evidence_for(field) if str(v).strip()]
+        )
+        if len(candidates) != 1:
+            return obj, False
+        return candidates[0], candidates[0] != obj
+
+    @staticmethod
+    def _placeholder_field_name(field_path: str) -> str:
+        key = str(field_path or "").strip().lower()
+        key = re.sub(r"\[\d+\]", "", key)
+        key = key.split(".")[-1]
+        if key in ("item_ids", "new_item_ids"):
+            return "item_id"
+        if key.endswith("_ids"):
+            return key[:-1]
+        if key.endswith("ids") and len(key) > 3:
+            return key[:-1]
+        return key
+
+    @classmethod
+    def _is_grounded_placeholder_value(cls, field_name: str, value: str) -> bool:
+        field = cls._placeholder_field_name(field_name)
+        if not field:
+            return False
+        # Restrict generic replacement to opaque/typed fields.  This avoids
+        # treating free-form values like insurance="none" as placeholders.
+        if not (field.endswith("_id") or field == "email"):
+            return False
+        raw = str(value or "").strip()
+        if not raw:
+            return True
+        norm = raw.lower().strip("<>{}[]() \t\r\n\"'")
+        norm = norm.removeprefix("$")
+        compact_field = field.replace("_", "")
+        compact_norm = norm.replace("_", "").replace("-", "").replace(" ", "")
+        if norm in {field, f"{field}?", f"{field}."}:
+            return True
+        if compact_norm == compact_field:
+            return True
+        return norm in {
+            "id", "unknown", "placeholder", "todo", "tbd", "n/a", "na",
+            "none", "null",
+        }
+
+    @staticmethod
+    def _dedupe_strings(values: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
 
     # ------------------------------------------------------------------
     # Product-ID / product-list helpers

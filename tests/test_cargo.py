@@ -1949,6 +1949,68 @@ class TestTrajectory19Regressions(unittest.TestCase):
         )
         self.assertIsNone(agent._resolve_get_user_details(good, wm))
 
+    def test_user_supplied_user_id_is_bound_to_typed_state(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_user_message("Sure, my user ID is mia_li_3668 and I can continue.")
+
+        self.assertIn("mia_li_3668", wm.typed_evidence_for("user_id"))
+        self.assertIn("known_user_id: mia_li_3668", wm.render_compact())
+
+    def test_user_supplied_reservation_id_is_bound_to_typed_state(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_user_message("Please cancel reservation id Z7GOZK.")
+
+        self.assertIn("Z7GOZK", wm.typed_evidence_for("reservation_id"))
+
+    def test_grounded_placeholder_resolver_uses_user_provided_id(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("My user ID is mia_li_3668.")
+        action = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "user_id"},
+            declared_class=RiskClass.READ,
+        )
+
+        result = agent._resolve_grounded_placeholders(action, wm)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.args["user_id"], "mia_li_3668")  # type: ignore[union-attr]
+
+    def test_grounded_placeholder_resolver_does_not_guess_ambiguous_ids(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("My user ID is mia_li_3668.")
+        wm.absorb_user_message("Actually, the other user ID is olivia_gonzalez_2305.")
+        action = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "user_id"},
+            declared_class=RiskClass.READ,
+        )
+
+        self.assertIsNone(agent._resolve_grounded_placeholders(action, wm))
+
+    def test_resolved_placeholder_passes_arg_grounding(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("Sure, my user ID is mia_li_3668.")
+        action = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "user_id"},
+            declared_class=RiskClass.READ,
+        )
+        resolved = agent._resolve_grounded_placeholders(action, wm)
+        self.assertIsNotNone(resolved)
+        schema = ToolEffectSchema(
+            name="get_user_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["user_id"],
+        )
+
+        gate = check_arg_grounding(resolved, schema, wm)  # type: ignore[arg-type]
+
+        self.assertTrue(gate.ok, gate.reason)
+
     # ------------------------------------------------------------------
     # Bug B: "exchange items in my recent order" routed to product flow
     # ------------------------------------------------------------------
