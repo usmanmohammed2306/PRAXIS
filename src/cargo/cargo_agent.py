@@ -1328,48 +1328,6 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 # the whole task complete after the first successful write if
                 # the controller can assemble another fresh, non-duplicate
                 # mutation from the updated state.
-                if self._grounded_retail_commit_action(wm) is None:
-                    if done:
-                        wm.task_completed = True
-                        break
-                    if not wm.post_write_responded:
-                        summary = self._post_write_summary(action)
-                        env_resp2 = self._respond(env, summary)
-                        if env_resp2 is None:
-                            wm.task_completed = True
-                            break
-                        post_call_id = f"cargo_{step}_post_write_respond"
-                        messages.append({
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [{
-                                "id": post_call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": RESPOND_TOOL_NAME,
-                                    "arguments": json.dumps({"content": summary[:RESPOND_MAX_CHARS]}),
-                                },
-                            }],
-                        })
-                        post_reply = _obs_text(env_resp2)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": post_call_id,
-                            "name": RESPOND_TOOL_NAME,
-                            "content": post_reply,
-                        })
-                        if post_reply:
-                            wm.absorb_user_message(post_reply)
-                            self._kernel().observe_user_message(wm, post_reply)
-                        reward = _float(getattr(env_resp2, "reward", reward), reward)
-                        info = getattr(env_resp2, "info", info) or info
-                        done = bool(getattr(env_resp2, "done", False))
-                        stats.actions_executed += 1
-                        final_cls = RiskClass.FINAL.value
-                        stats.executed_by_class[final_cls] = stats.executed_by_class.get(final_cls, 0) + 1
-                        wm.post_write_responded = True
-                    wm.task_completed = True
-                    break
                 # updating two separate pending orders).  Defer terminal
                 # completion until after the post-write respond has given the
                 # user simulator a chance to STOP.
@@ -4552,21 +4510,6 @@ class CargoAgent(Agent):  # type: ignore[misc]
             ):
                 return False
         return True
-
-    @staticmethod
-    def _post_write_summary(action: ProposedAction) -> str:
-        name = action.name.lower()
-        if "exchange" in name:
-            return "Done, I completed the exchange."
-        if "return" in name or "refund" in name:
-            return "Done, I completed the return."
-        if "cancel" in name:
-            return "Done, I completed the cancellation."
-        if "modify" in name or "update" in name or "change" in name:
-            return "Done, I completed the requested change."
-        if "book" in name or "reservation" in name:
-            return "Done, I completed the reservation update."
-        return "Done, I completed the requested action."
 
     # ------------------------------------------------------------------
     # Internals

@@ -211,7 +211,6 @@ class WorkingMemory:
             kpath = f"{prefix}.{k}" if prefix else str(k)
             if isinstance(v, (str, int, float)) and v not in (None, ""):
                 self._add_typed_value(kpath, v)
-                if not prefix:
                 # Tool observations often contain nested object facts such as
                 # reservation.flights[0].date.  Those are evidence about an
                 # observed candidate, not necessarily the user's active task
