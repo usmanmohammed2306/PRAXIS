@@ -433,6 +433,13 @@ class TauAirlineAdapter(BaseCargoAdapter):
             proposed = args.get(slot)
             if slot == "cabin":
                 proposed = proposed or args.get("cabin_class")
+            if slot == "date" and proposed in (None, "", []):
+                flight_dates = [
+                    str(f.get("date") or "").strip()
+                    for f in _flight_entries(args)
+                    if str(f.get("date") or "").strip()
+                ]
+                proposed = flight_dates[0] if len(set(flight_dates)) == 1 else flight_dates
             if expected in (None, "", []):
                 continue
             cert.require(
@@ -694,6 +701,11 @@ def _seen_flight_numbers(wm) -> set[str]:
             val = str(attrs.get(key) or "").strip()
             if val:
                 seen.add(val)
+        for flight in attrs.get("flights") or attrs.get("value") or []:
+            if isinstance(flight, Mapping):
+                val = str(flight.get("flight_number") or flight.get("id") or "").strip()
+                if val:
+                    seen.add(val)
     text = getattr(wm, "all_evidence", lambda: "")()
     seen.update(re.findall(r"\bHAT\d{3}\b", text))
     for match in re.finditer(r"flight_number[\"'=:\s]+([A-Za-z0-9_/-]+)", text):

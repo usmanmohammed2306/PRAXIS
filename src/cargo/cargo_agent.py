@@ -29,7 +29,7 @@ except Exception:  # noqa: BLE001
 from . import repair
 from .adapters import select_adapter
 from .calibration import default_calibration
-from .core import BaseCargoAdapter, GenericCargoKernel, GoalActionCandidate
+from .core import BaseCargoAdapter, GenericCargoKernel, GoalActionCandidate, PreCommitVerifier
 from .gates import (
     check_arg_grounding,
     check_counterfactual,
@@ -504,6 +504,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
         the action passed every gate.
         """
         diag: Dict[str, Any] = {"gates_run": [], "gates_failed": []}
+        phase_decision = self._kernel().decision_engine.phase_engine.decide(wm, self.adapter)
+        diag["phase"] = phase_decision.phase
+        diag["stage"] = phase_decision.stage
 
         # Repeat-loop is checked for every class — cheap and high-yield.
         rl = check_repeat_loop(action, schema, wm)
@@ -557,6 +560,17 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if not completeness_gate.ok:
                 diag["gates_failed"].append("completeness")
                 return completeness_gate, diag
+            precommit_gate = self._kernel().decision_engine.precommit_verifier.verify(
+                action,
+                schema,
+                wm,
+                self.adapter,
+            ).to_gate()
+            diag["gates_run"].append("precommit_verifier")
+            stats.record_gate(precommit_gate)
+            if not precommit_gate.ok:
+                diag["gates_failed"].append("precommit_verifier")
+                return precommit_gate, diag
 
         if action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE, RiskClass.FINAL):
             cert_gate = self._kernel().validate_commit_certificate(action, schema, wm)
@@ -1040,6 +1054,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 "args": dict(action.args),
                 "thought": action.raw_thought[:200],
                 "fast_path": not is_gated(action.declared_class),
+                "phase": diag.get("phase"),
+                "stage": diag.get("stage"),
                 "gates_run": diag.get("gates_run", []),
                 "gates_failed": diag.get("gates_failed", []),
                 "abstain_reason": failing.reason if failing else "",
@@ -1871,6 +1887,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
         asks for credentials.  Account/order goals still use the normal auth
         and write-gating pipeline.
         """
+        retail_auth = self._retail_auth_phase_action(action, wm)
+        if retail_auth is not None:
+            return retail_auth
+
         if not self._is_no_auth_query(wm) or self._is_account_order_goal(wm):
             return None
         if wm.product_count_finalized:
@@ -1929,6 +1949,97 @@ class CargoAgent(Agent):  # type: ignore[misc]
             )
             return self._fresh_action_or_none(candidate, wm)
         return None
+
+    def _retail_auth_phase_action(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """Keep retail account tasks in AUTHENTICATE before order reads."""
+        if not self._is_account_order_goal(wm):
+            return None
+        if self._existing_user_id(wm) or wm.auth_abandoned:
+            return None
+        name = action.name.lower()
+        should_intercept = (
+            name in {"get_order_details", "get_user_details"}
+            or action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
+            or name in (RESPOND_TOOL_NAME, "respond", "final", "answer")
+        )
+        if not should_intercept:
+            return None
+
+        evidence = wm.user_facts
+        real_email = self._extract_any_email(evidence)
+        if real_email:
+            return self._fresh_action_or_none(ProposedAction(
+                name="find_user_id_by_email",
+                args={"email": real_email},
+                declared_class=RiskClass.READ,
+                declared_pre=["user provided email"],
+                declared_post=["user_id retrieved"],
+                informational_intent="authenticate via user-provided email",
+                raw_thought="Phase gate: authenticate retail account task with email before order reads.",
+                user_text="",
+                raw_response="",
+            ), wm)
+        name_pair = self._extract_name_pair(evidence, wm.auth_ask_count > 0)
+        zip_code = self._extract_zip(evidence, wm.auth_failed_zips)
+        if name_pair and zip_code:
+            return self._fresh_action_or_none(ProposedAction(
+                name="find_user_id_by_name_zip",
+                args={"first_name": name_pair[0], "last_name": name_pair[1], "zip": zip_code},
+                declared_class=RiskClass.READ,
+                declared_pre=["user provided name and zip"],
+                declared_post=["user_id retrieved"],
+                informational_intent="authenticate via name zip",
+                raw_thought="Phase gate: authenticate retail account task with name and ZIP before order reads.",
+                user_text="",
+                raw_response="",
+            ), wm)
+        order_id = self._extract_order_id(wm)
+        all_user_text = " ".join(wm.user_facts).lower()
+        soft_order_pivot = any(phrase in all_user_text for phrase in _AUTH_REFUSAL_PHRASES) and any(
+            kw in all_user_text
+            for kw in (
+                "order", "order number", "order id", "recent order",
+                "tracking", "some other", "identifier", "another way",
+                "different way", "instead",
+            )
+        )
+        if order_id and (wm.auth_failed_zips or wm.auth_ask_count >= _MAX_AUTH_ASKS or soft_order_pivot):
+            return self._fresh_action_or_none(ProposedAction(
+                name="get_order_details",
+                args={"order_id": order_id},
+                declared_class=RiskClass.READ,
+                declared_pre=["identity branch failed", "user provided order id"],
+                declared_post=["order details retrieved"],
+                informational_intent="recover through order id",
+                raw_thought="Phase gate: identity lookup is failing; preserve order-id recovery branch.",
+                user_text="",
+                raw_response="",
+            ), wm)
+        if wm.auth_ask_count >= _MAX_AUTH_ASKS:
+            return None
+        ask = ProposedAction(
+            name=RESPOND_TOOL_NAME,
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            declared_pre=[],
+            declared_post=["user provides name+zip or email"],
+            informational_intent="ask for authentication credentials",
+            raw_thought="Phase gate: retail account task requires authentication before order lookup.",
+            user_text=(
+                "To access your account, could you please provide your full "
+                "name and ZIP code? Your email address works too."
+            ),
+            raw_response="",
+            bypass_gates=True,
+        )
+        fresh = self._fresh_action_or_none(ask, wm)
+        if fresh is not None:
+            wm.auth_ask_count += 1
+        return fresh
 
     @staticmethod
     def _order_product_catalog(wm: "WorkingMemory") -> Dict[str, str]:
@@ -2188,7 +2299,27 @@ class CargoAgent(Agent):  # type: ignore[misc]
         # gave a tracking/order number ("#W2378156" in tau-bench retail).
         order_id = self._extract_order_id(wm)
         order_signature = f"get_order_details(order_id={order_id!r})"
-        if order_id and order_signature not in wm.recent_signatures:
+        all_user_text = " ".join(wm.user_facts).lower()
+        raw_refused = any(phrase in all_user_text for phrase in _AUTH_REFUSAL_PHRASES)
+        offering_alt = any(
+            kw in all_user_text
+            for kw in (
+                "order", "order number", "order id", "recent order",
+                "tracking", "some other", "identifier", "another way",
+                "different way", "instead",
+            )
+        )
+        soft_order_pivot = raw_refused and offering_alt
+        if (
+            order_id
+            and order_signature not in wm.recent_signatures
+            and (
+                wm.auth_failed_zips
+                or wm.auth_abandoned
+                or wm.auth_ask_count >= _MAX_AUTH_ASKS
+                or soft_order_pivot
+            )
+        ):
             return ProposedAction(
                 name="get_order_details",
                 args={"order_id": order_id},
@@ -2208,22 +2339,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
         # Path 3: No usable PII.  Now check if auth has been abandoned
         # (refused / ask budget exhausted).
         # ---------------------------------------------------------------
-        all_user_text = " ".join(wm.user_facts).lower()
-        raw_refused = any(phrase in all_user_text for phrase in _AUTH_REFUSAL_PHRASES)
         # B6 fix: soft-refusal detection.  A message like "I'd rather not
         # share too much — can we proceed based on my recent orders?" is a
         # NEGOTIATION, not a hard refusal.  If the user also mentions an
         # alternative path (order number, different identifier) do not set
         # auth_abandoned yet; give the order-ID fallback a chance to run.
         if raw_refused:
-            offering_alt = any(
-                kw in all_user_text
-                for kw in (
-                    "order", "order number", "order id", "recent order",
-                    "tracking", "some other", "identifier", "another way",
-                    "different way", "instead",
-                )
-            )
             user_refused = not offering_alt
         else:
             user_refused = False
@@ -2609,11 +2730,16 @@ class CargoAgent(Agent):  # type: ignore[misc]
         if not self._reservation_task_needs_scan(wm):
             return None
         repeated_profile = action.name == "get_user_details"
+        malformed_reservation_lookup = (
+            action.name == "get_reservation_details"
+            and "reservation_id" not in (action.args or {})
+        )
+        search_drift = action.name in {"search_direct_flight", "search_onestop_flight"}
         generic_respond = (
             action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
             or action.name.lower() in (RESPOND_TOOL_NAME, "respond", "final", "answer")
         )
-        if not (repeated_profile or generic_respond):
+        if not (repeated_profile or malformed_reservation_lookup or search_drift or generic_respond):
             return None
         reservation_ids = wm.typed_evidence_for("reservation_id")
         if not reservation_ids:
@@ -3564,6 +3690,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
         action requests and later "yes / confirm / go ahead" replies as
         confirmation, but not mere retrieved DB facts or model assumptions.
         """
+        if getattr(wm, "commit_confirmed", lambda _sig: False)(action.signature()):
+            return GateResult.passing("confirmation", mode="exact_pending_commit")
         text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
         if re.search(r"\b(yes|confirm|confirmed|go ahead|proceed|do it|please do|sounds good)\b", text):
             return GateResult.passing("confirmation")
@@ -3746,16 +3874,62 @@ class CargoAgent(Agent):  # type: ignore[misc]
         destination = self._canonical_airport_arg(destination, field="destination")
         direct_args = {"origin": origin, "destination": destination, "date": date}
         direct_set = wm.task_state.candidate_set_for("search_direct_flight", direct_args)
-        direct_exhausted = bool(direct_set and direct_set.exhausted)
+        direct_viable = self._airline_candidate_set_has_viable_itinerary(direct_set, wm)
+        direct_exhausted = bool(
+            direct_set
+            and (direct_set.exhausted or (self._onestop_allowed(wm) and not direct_viable))
+        )
+        one_set = None
+        one_exhausted = False
+        if self._onestop_allowed(wm):
+            one_args = {"origin": origin, "destination": destination, "date": date}
+            one_set = wm.task_state.candidate_set_for("search_onestop_flight", one_args)
+            one_exhausted = bool(one_set and one_set.exhausted)
+        proposed_origin = str(action.args.get("origin") or "").strip() if isinstance(action.args, dict) else ""
+        proposed_destination = str(action.args.get("destination") or "").strip() if isinstance(action.args, dict) else ""
+        proposed_date = str(action.args.get("date") or "").strip() if isinstance(action.args, dict) else ""
+        noncanonical_search = bool(
+            action.name in {"search_direct_flight", "search_onestop_flight"}
+            and (
+                proposed_origin != origin
+                or proposed_destination != destination
+                or (proposed_date and proposed_date != str(date))
+            )
+        )
+        recorded_search_replay = bool(
+            (action.name == "search_direct_flight" and direct_set is not None)
+            or (action.name == "search_onestop_flight" and one_set is not None)
+        )
+        cached_profile_replay = bool(
+            action.name == "get_user_details"
+            and user_id
+            and user_id in wm.user_profiles
+        )
+        placeholder_args = self._action_contains_placeholder(action)
+        booking_reservation_drift = bool(
+            self._airline_booking_goal(wm)
+            and action.name == "get_reservation_details"
+        )
 
         should_intercept = (
             action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
+            or action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE)
             or action.name.lower() in (RESPOND_TOOL_NAME, "respond", "final", "answer")
             or action.signature() in wm.recent_signatures
             or wm.failed_without_new_evidence(action.signature())
+            or noncanonical_search
+            or recorded_search_replay
+            or cached_profile_replay
+            or placeholder_args
+            or booking_reservation_drift
         )
         if action.name in {"search_direct_flight", "search_onestop_flight"}:
-            should_intercept = should_intercept or action.signature() in wm.recent_signatures
+            should_intercept = (
+                should_intercept
+                or action.signature() in wm.recent_signatures
+                or noncanonical_search
+                or recorded_search_replay
+            )
         if not should_intercept:
             return None
 
@@ -3772,13 +3946,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 if fresh is not None:
                     return fresh
 
-        one_set = None
-        one_exhausted = False
-        if self._onestop_allowed(wm):
-            one_args = {"origin": origin, "destination": destination, "date": date}
-            one_set = wm.task_state.candidate_set_for("search_onestop_flight", one_args)
-            one_exhausted = bool(one_set and one_set.exhausted)
-        if self._onestop_allowed(wm) and not one_exhausted:
+        if self._onestop_allowed(wm) and one_set is None:
             one = self._flight_search_action(
                 "search_onestop_flight",
                 origin=origin,
@@ -3790,6 +3958,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 fresh = self._fresh_action_or_none(one, wm)
                 if fresh is not None:
                     return fresh
+
+        booking = self._airline_booking_progress_action(wm)
+        if booking is not None:
+            return booking
         all_searches_exhausted = direct_exhausted and (
             not self._onestop_allowed(wm) or bool(one_set and one_set.exhausted)
         )
@@ -3814,6 +3986,13 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 bypass_gates=True,
             )
         return None
+
+    @staticmethod
+    def _action_contains_placeholder(action: ProposedAction) -> bool:
+        for path, value in PreCommitVerifier._iter_scalars(action.args):
+            if PreCommitVerifier._looks_placeholder(value, path):
+                return True
+        return False
 
     def _airline_user_id_request(
         self,
@@ -3901,6 +4080,296 @@ class CargoAgent(Agent):  # type: ignore[misc]
             user_text="",
             raw_response="",
         )
+
+    def _airline_booking_progress_action(self, wm: "WorkingMemory") -> Optional[ProposedAction]:
+        if not self._has_tool("book_reservation") or not self._airline_booking_goal(wm):
+            return None
+        itinerary = self._select_airline_itinerary(wm)
+        if not itinerary:
+            return None
+        action = self._build_airline_book_action(wm, itinerary)
+        if action is None:
+            return None
+        summary = self._airline_booking_summary(action, itinerary)
+        if not getattr(wm, "commit_confirmed", lambda _sig: False)(action.signature()):
+            wm.stage_commit_confirmation(action.signature(), summary)
+            ask = ProposedAction(
+                name=RESPOND_TOOL_NAME,
+                args={},
+                declared_class=RiskClass.ASK_USER,
+                declared_pre=["itinerary selected"],
+                declared_post=["user confirms booking"],
+                informational_intent="confirm selected itinerary",
+                raw_thought="Airline phase gate: present selected itinerary and ask for exact confirmation before booking.",
+                user_text=summary + " Should I book this itinerary?",
+                raw_response="",
+                bypass_gates=True,
+            )
+            return self._fresh_action_or_none(ask, wm)
+        action.bypass_gates = True
+        return self._fresh_action_or_none(action, wm)
+
+    def _airline_booking_goal(self, wm: "WorkingMemory") -> bool:
+        slots = wm.semantic_slots
+        intents = slots.get("intents") or slots.get("intent") or []
+        if not isinstance(intents, list):
+            intents = [intents]
+        text = " ".join(str(v).lower() for v in intents)
+        user = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        return "book_flight" in text or (
+            re.search(r"\b(book|reserve|purchase)\b", user)
+            and re.search(r"\b(flight|ticket|trip)\b", user)
+        )
+
+    def _select_airline_itinerary(self, wm: "WorkingMemory") -> List[Dict[str, Any]]:
+        slots = wm.semantic_slots
+        origin = self._canonical_airport_arg(self._slot_value(slots, "origin"), field="origin")
+        destination = self._canonical_airport_arg(self._slot_value(slots, "destination"), field="destination")
+        date = self._slot_value(slots, "date")
+        if not (origin and destination and date):
+            return []
+        direct = wm.task_state.candidate_set_for(
+            "search_direct_flight",
+            {"origin": origin, "destination": destination, "date": date},
+        )
+        one = wm.task_state.candidate_set_for(
+            "search_onestop_flight",
+            {"origin": origin, "destination": destination, "date": date},
+        )
+        direct_options = self._viable_itineraries_from_set(direct, wm)
+        one_options = self._viable_itineraries_from_set(one, wm)
+        direct_preferred = "direct_preferred" in self._airline_pref_text(wm)
+        if direct_preferred and direct_options:
+            return direct_options[0]
+        if one_options:
+            return one_options[0]
+        if direct_options:
+            return direct_options[0]
+        return []
+
+    def _airline_candidate_set_has_viable_itinerary(self, candidate_set: Any, wm: "WorkingMemory") -> bool:
+        return bool(self._viable_itineraries_from_set(candidate_set, wm))
+
+    def _viable_itineraries_from_set(self, candidate_set: Any, wm: "WorkingMemory") -> List[List[Dict[str, Any]]]:
+        if candidate_set is None or getattr(candidate_set, "empty", False):
+            return []
+        itineraries: List[List[Dict[str, Any]]] = []
+        for candidate in getattr(candidate_set, "candidates", []) or []:
+            attrs = getattr(candidate, "attributes", {}) or {}
+            if "flights" in attrs and isinstance(attrs.get("flights"), list):
+                flights = [dict(f) for f in attrs["flights"] if isinstance(f, dict)]
+            elif "value" in attrs and isinstance(attrs.get("value"), list):
+                flights = [dict(f) for f in attrs["value"] if isinstance(f, dict)]
+            else:
+                flights = [dict(attrs)] if attrs else []
+            if flights and self._airline_itinerary_viable(flights, wm):
+                itineraries.append(flights)
+        itineraries.sort(key=lambda flights: (self._airline_itinerary_price(flights, wm), self._airline_departure_minutes(flights[0])))
+        return itineraries
+
+    def _airline_itinerary_viable(self, flights: List[Dict[str, Any]], wm: "WorkingMemory") -> bool:
+        if not flights:
+            return False
+        cabin = self._airline_cabin(wm)
+        for flight in flights:
+            if str(flight.get("status") or "available").lower() != "available":
+                return False
+            seats = flight.get("available_seats") or {}
+            if isinstance(seats, dict) and int(seats.get(cabin, 0) or 0) <= 0:
+                return False
+        after = self._airline_time_after_minutes(wm)
+        return after is None or self._airline_departure_minutes(flights[0]) >= after
+
+    def _build_airline_book_action(
+        self,
+        wm: "WorkingMemory",
+        itinerary: List[Dict[str, Any]],
+    ) -> Optional[ProposedAction]:
+        user_id = self._known_user_id(wm)
+        if not user_id:
+            return None
+        profile = (wm.user_profiles or {}).get(user_id)
+        if not isinstance(profile, dict):
+            return None
+        slots = wm.semantic_slots
+        origin = self._canonical_airport_arg(self._slot_value(slots, "origin"), field="origin")
+        destination = self._canonical_airport_arg(self._slot_value(slots, "destination"), field="destination")
+        date = self._slot_value(slots, "date")
+        cabin = self._airline_cabin(wm)
+        if not (origin and destination and date and cabin):
+            return None
+        passenger = self._airline_profile_passenger(profile)
+        if not passenger:
+            return None
+        total = self._airline_itinerary_price(itinerary, wm)
+        payments = self._airline_payment_plan(profile, total, wm)
+        if not payments:
+            return None
+        total_bags = self._airline_baggage_count(wm)
+        nonfree = max(0, total_bags - self._airline_free_bag_allowance(profile, cabin))
+        action = ProposedAction(
+            name="book_reservation",
+            args={
+                "user_id": user_id,
+                "origin": origin,
+                "destination": destination,
+                "flight_type": "round_trip" if self._slot_value(slots, "trip_type").replace(" ", "_") == "round_trip" else "one_way",
+                "cabin": cabin,
+                "flights": [
+                    {"flight_number": str(f.get("flight_number")), "date": str(f.get("date") or date)}
+                    for f in itinerary
+                ],
+                "passengers": [passenger],
+                "payment_methods": payments,
+                "total_baggages": total_bags,
+                "nonfree_baggages": nonfree,
+                "insurance": self._airline_insurance(wm),
+            },
+            declared_class=self._risk_for_tool("book_reservation", RiskClass.WRITE),
+            declared_pre=[],
+            declared_post=["reservation booked"],
+            informational_intent="book selected itinerary",
+            raw_thought="Airline commit trigger: profile, itinerary, passenger, baggage, insurance, and payment are grounded.",
+            user_text="",
+            raw_response="",
+        )
+        return action
+
+    def _airline_booking_summary(self, action: ProposedAction, itinerary: List[Dict[str, Any]]) -> str:
+        cabin = str(action.args.get("cabin") or "").replace("_", " ")
+        flights = ", ".join(
+            f"{f.get('flight_number')} {f.get('origin')}->{f.get('destination')} at {f.get('scheduled_departure_time_est')}"
+            for f in itinerary
+        )
+        total = self._airline_itinerary_price(itinerary, None)
+        payments = action.args.get("payment_methods") or []
+        pay_text = ", ".join(f"{p.get('payment_id')} ${p.get('amount')}" for p in payments if isinstance(p, dict))
+        return (
+            f"I found this {cabin} itinerary: {flights}. "
+            f"The fare is ${total:g}; payment would be {pay_text}. "
+            f"Checked bags: {action.args.get('total_baggages')} total, "
+            f"{action.args.get('nonfree_baggages')} non-free; insurance: {action.args.get('insurance')}."
+        )
+
+    def _airline_profile_passenger(self, profile: Dict[str, Any]) -> Dict[str, str]:
+        name = profile.get("name") or {}
+        first = str(name.get("first_name") or profile.get("first_name") or "").strip()
+        last = str(name.get("last_name") or profile.get("last_name") or "").strip()
+        dob = str(profile.get("dob") or profile.get("date_of_birth") or "").strip()
+        if not (first and last and dob):
+            return {}
+        return {"first_name": first, "last_name": last, "dob": dob}
+
+    def _airline_payment_plan(self, profile: Dict[str, Any], total: float, wm: "WorkingMemory") -> List[Dict[str, Any]]:
+        methods = profile.get("payment_methods") or {}
+        if not isinstance(methods, dict):
+            return []
+        text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        certificates: List[Tuple[str, float]] = []
+        cards: List[Tuple[str, str]] = []
+        for pid, details in methods.items():
+            if not isinstance(details, dict):
+                continue
+            source = str(details.get("source") or "").lower()
+            if source == "certificate" or str(pid).startswith("certificate_"):
+                try:
+                    certificates.append((str(details.get("id") or pid), float(details.get("amount") or 0)))
+                except Exception:
+                    continue
+            if source == "credit_card" or str(pid).startswith("credit_card_"):
+                cards.append((str(details.get("id") or pid), str(details.get("last_four") or "")))
+        payments: List[Dict[str, Any]] = []
+        remaining = float(total)
+        if "certificate" in text and certificates:
+            cert_id, amount = sorted(certificates, key=lambda item: item[1], reverse=True)[0]
+            use_amount = min(remaining, amount)
+            if use_amount > 0:
+                payments.append({"payment_id": cert_id, "amount": round(use_amount, 2)})
+                remaining = round(remaining - use_amount, 2)
+        if remaining > 0:
+            preferred_last4 = re.search(r"\b(\d{4})\s+card\b", text)
+            card_id = ""
+            if preferred_last4:
+                target = preferred_last4.group(1)
+                for cid, last4 in cards:
+                    if last4 == target:
+                        card_id = cid
+                        break
+            if not card_id and cards:
+                card_id = cards[0][0]
+            if card_id:
+                payments.append({"payment_id": card_id, "amount": round(remaining, 2)})
+                remaining = 0.0
+        return payments if remaining <= 0.001 else []
+
+    def _airline_itinerary_price(self, flights: List[Dict[str, Any]], wm: Optional["WorkingMemory"]) -> float:
+        cabin = self._airline_cabin(wm) if wm is not None else "economy"
+        total = 0.0
+        for flight in flights:
+            prices = flight.get("prices") or {}
+            try:
+                total += float(prices.get(cabin) or 0)
+            except Exception:
+                total += 0.0
+        return round(total, 2)
+
+    def _airline_cabin(self, wm: Optional["WorkingMemory"]) -> str:
+        if wm is None:
+            return "economy"
+        cabin = self._slot_value(wm.semantic_slots, "cabin") or "economy"
+        return str(cabin).strip().lower().replace(" ", "_")
+
+    def _airline_baggage_count(self, wm: "WorkingMemory") -> int:
+        raw = wm.semantic_slots.get("baggage_count") or wm.semantic_slots.get("total_baggages") or 0
+        try:
+            return int(raw)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _airline_free_bag_allowance(profile: Dict[str, Any], cabin: str) -> int:
+        membership = str(profile.get("membership") or "regular").lower()
+        table = {
+            "regular": {"basic_economy": 0, "economy": 1, "business": 2},
+            "silver": {"basic_economy": 1, "economy": 2, "business": 3},
+            "gold": {"basic_economy": 2, "economy": 3, "business": 3},
+        }
+        return table.get(membership, table["regular"]).get(cabin, 0)
+
+    def _airline_insurance(self, wm: "WorkingMemory") -> str:
+        raw = self._slot_value(wm.semantic_slots, "travel_insurance") or self._slot_value(wm.semantic_slots, "insurance")
+        return "yes" if str(raw).lower() in {"yes", "true", "1"} else "no"
+
+    def _airline_pref_text(self, wm: "WorkingMemory") -> str:
+        prefs = wm.semantic_slots.get("time_preferences") or wm.semantic_slots.get("time_preference") or []
+        if not isinstance(prefs, list):
+            prefs = [prefs]
+        text = " ".join(str(v).lower() for v in prefs)
+        user = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        if "direct" in user and "direct_preferred" not in text:
+            text += " direct_preferred"
+        if re.search(r"\bone[- ]?stop|stopover\b", user) and "onestop_allowed" not in text:
+            text += " onestop_allowed"
+        if "cheapest" in user and "cheapest" not in text:
+            text += " cheapest"
+        return text.strip()
+
+    def _airline_time_after_minutes(self, wm: "WorkingMemory") -> Optional[int]:
+        raw = self._slot_value(wm.semantic_slots, "time_after")
+        if not raw:
+            return None
+        match = re.match(r"(\d{1,2}):(\d{2})", raw)
+        if not match:
+            return None
+        return int(match.group(1)) * 60 + int(match.group(2))
+
+    @staticmethod
+    def _airline_departure_minutes(flight: Dict[str, Any]) -> int:
+        raw = str(flight.get("scheduled_departure_time_est") or "00:00")
+        match = re.match(r"(\d{1,2}):(\d{2})", raw)
+        if not match:
+            return 0
+        return int(match.group(1)) * 60 + int(match.group(2))
 
     @staticmethod
     def _slot_value(slots: Dict[str, Any], key: str) -> str:

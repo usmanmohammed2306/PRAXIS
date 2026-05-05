@@ -315,6 +315,44 @@ class GoalFieldDecision:
 
 
 @dataclass
+class PhaseDecision:
+    """Compact controller phase decision.
+
+    Adapters name domain stages; the generic core maps them into broad control
+    phases so READs stay permissive while WRITEs have to pass a commitment
+    boundary.
+    """
+
+    phase: str = "DISCOVER"
+    stage: str = ""
+    reason: str = ""
+
+
+@dataclass
+class PreCommitVerdict:
+    """Result of the cheap deterministic verifier for mutating actions."""
+
+    ok: bool
+    reason: str = ""
+    missing: List[str] = field(default_factory=list)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+    def to_gate(self) -> GateResult:
+        if self.ok:
+            return GateResult.passing(
+                "precommit_verifier",
+                missing=list(self.missing),
+                **self.diagnostics,
+            )
+        return GateResult.failing(
+            "precommit_verifier",
+            self.reason or "precommit_verifier_failed",
+            missing=list(self.missing),
+            **self.diagnostics,
+        )
+
+
+@dataclass
 class ProofObligation:
     """Machine-checkable proof item for a proposed task transition."""
 
@@ -1021,6 +1059,159 @@ class DecisionEngine:
     def __init__(self) -> None:
         self.constraints = ConstraintPriorityEngine()
         self.goal_router = SoftGoalFieldRouter()
+        self.phase_engine = PhaseEngine()
+        self.precommit_verifier = PreCommitVerifier()
+
+
+class PhaseEngine:
+    """Map adapter stages into coarse CARGO v2 phases."""
+
+    AUTH_STAGES = {"identity", "authenticate", "authentication", "identity_or_order_anchor", "profile"}
+    WRAP_STAGES = {"terminal", "complete", "post_write"}
+
+    def decide(self, wm: "WorkingMemory", adapter: CargoDomainAdapter) -> PhaseDecision:
+        try:
+            stage = str(adapter.goal_stage(wm) or "start")
+        except Exception:
+            stage = "start"
+        norm = normalize_key(stage)
+        if norm in self.AUTH_STAGES:
+            phase = "AUTHENTICATE"
+        elif norm in {"confirm", "confirmation"}:
+            phase = "CONFIRM"
+        elif norm in {"commit", "commit_ready"}:
+            phase = "COMMIT"
+        elif norm in self.WRAP_STAGES:
+            phase = "WRAP"
+        else:
+            phase = "DISCOVER"
+        return PhaseDecision(phase=phase, stage=stage, reason=f"adapter_stage:{stage}")
+
+
+class PreCommitVerifier:
+    """Cheap deterministic verifier for WRITE/IRREVERSIBLE actions."""
+
+    PLACEHOLDER_RE = re.compile(
+        r"\b("
+        r"latest_[a-z0-9_]+|<[^>]+>|tbd|unknown|none|null|"
+        r"total_cost|taxes?_and_fees|reservation_id|flight_id|item_id"
+        r")\b",
+        re.I,
+    )
+    PSEUDO_WRITE_TOOLS = {"calculate", "calculator", "lookup_policy", "reason", "plan"}
+
+    def verify(
+        self,
+        action: ProposedAction,
+        schema: ToolEffectSchema,
+        wm: "WorkingMemory",
+        adapter: CargoDomainAdapter,
+    ) -> PreCommitVerdict:
+        if action.declared_class not in (RiskClass.WRITE, RiskClass.IRREVERSIBLE):
+            return PreCommitVerdict(ok=True, reason="not_a_mutation")
+        if normalize_key(action.name) in self.PSEUDO_WRITE_TOOLS:
+            return PreCommitVerdict(
+                ok=False,
+                reason="unsupported_pseudo_write_tool",
+                diagnostics={"action_name": action.name},
+            )
+        placeholders = [
+            f"{path}={value}"
+            for path, value in self._iter_scalars(action.args)
+            if self._looks_placeholder(value, path)
+        ]
+        if placeholders:
+            return PreCommitVerdict(
+                ok=False,
+                reason="placeholder_argument",
+                diagnostics={"placeholders": placeholders[:5]},
+            )
+        missing = [
+            name for name in (getattr(schema, "required_params", []) or [])
+            if action.args.get(name) in (None, "", [])
+        ]
+        if missing:
+            return PreCommitVerdict(
+                ok=False,
+                reason="missing_required_args",
+                missing=missing,
+            )
+        wrong_typed = self._wrong_typed_ids(action, wm, adapter)
+        if wrong_typed:
+            return PreCommitVerdict(
+                ok=False,
+                reason="wrong_typed_id",
+                diagnostics={"wrong_typed_ids": wrong_typed[:5]},
+            )
+        return PreCommitVerdict(ok=True, reason="deterministic_precommit_ok")
+
+    def _wrong_typed_ids(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+        adapter: CargoDomainAdapter,
+    ) -> List[str]:
+        id_fields = {str(v) for v in getattr(adapter, "id_fields", set()) or set()}
+        bad: List[str] = []
+        for path, value in self._iter_scalars(action.args):
+            base = path.split(".")[-1].split("[")[0]
+            root = path.split(".")[0].split("[")[0]
+            if base not in id_fields and root not in id_fields:
+                continue
+            v = str(value or "").strip()
+            if not v:
+                continue
+            typed = list(getattr(wm, "typed_evidence_for", lambda _k: [])(base))
+            typed += list(getattr(wm, "typed_evidence_for", lambda _k: [])(root))
+            if typed and v in typed:
+                continue
+            if self._looks_adapter_id(v):
+                continue
+            bad.append(f"{path}={v}")
+        return bad
+
+    @classmethod
+    def _looks_placeholder(cls, value: Any, path: str = "") -> bool:
+        if isinstance(value, (int, float, bool)):
+            return False
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if re.search(r"\blatest_[a-z0-9_]+\b|<[^>]+>|total_cost|taxes?_and_fees", text, re.I):
+            return True
+        low = text.lower()
+        field = str(path or "").split(".")[-1].split("[")[0].lower()
+        root = str(path or "").split(".")[0].split("[")[0].lower()
+        id_like_field = field.endswith("_id") or root.endswith("_id") or field in {
+            "id", "reservation", "reservation_id", "flight_id", "item_id",
+        }
+        if low in {"tbd", "unknown", "none", "null"}:
+            return id_like_field
+        return bool(cls.PLACEHOLDER_RE.fullmatch(text) and id_like_field)
+
+    @staticmethod
+    def _looks_adapter_id(value: str) -> bool:
+        v = str(value or "").strip()
+        return bool(
+            re.fullmatch(r"\d{4,}", v)
+            or re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{3,}", v)
+            or re.fullmatch(r"[a-z]+_[a-z]+_\d{1,8}", v)
+            or re.fullmatch(r"(?:credit_card|gift_card|certificate|paypal)_\d+", v)
+            or re.fullmatch(r"#[A-Za-z]?\d{4,}", v)
+        )
+
+    @classmethod
+    def _iter_scalars(cls, value: Any, prefix: str = "") -> Iterable[Tuple[str, Any]]:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                yield from cls._iter_scalars(item, path)
+            return
+        if isinstance(value, list):
+            for idx, item in enumerate(value):
+                yield from cls._iter_scalars(item, f"{prefix}[{idx}]")
+            return
+        yield prefix, value
 
 
 class SoftGoalFieldRouter:
@@ -1414,6 +1605,19 @@ class GenericCargoKernel:
                         attributes=dict(item),
                         available=bool(item.get("available", True)),
                     ))
+                elif isinstance(item, list) and all(isinstance(x, Mapping) for x in item):
+                    flight_numbers = [
+                        str(x.get("flight_number") or x.get("id") or "").strip()
+                        for x in item
+                        if str(x.get("flight_number") or x.get("id") or "").strip()
+                    ]
+                    cid = "+".join(flight_numbers) or f"{action_name}_{idx}"
+                    candidates.append(CandidateObject(
+                        candidate_id=cid,
+                        object_type=str(action_name),
+                        attributes={"flights": [dict(x) for x in item], "value": [dict(x) for x in item]},
+                        available=all(bool(x.get("available", True)) for x in item),
+                    ))
                 elif item not in (None, ""):
                     candidates.append(CandidateObject(
                         candidate_id=f"{action_name}_{idx}",
@@ -1638,7 +1842,11 @@ __all__ = [
     "GoalHypothesis",
     "GenericCargoKernel",
     "Obligation",
+    "PhaseDecision",
+    "PhaseEngine",
     "Preference",
+    "PreCommitVerdict",
+    "PreCommitVerifier",
     "StateFact",
     "SoftGoalFieldRouter",
     "TaskState",

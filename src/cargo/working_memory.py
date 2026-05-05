@@ -18,7 +18,7 @@ from .core import GoalField, TaskState
 
 
 # A short rolling window of recent action signatures (for repeat detection).
-_RECENT_WINDOW = 5
+_RECENT_WINDOW = 8
 
 
 @dataclass
@@ -143,6 +143,12 @@ class WorkingMemory:
     # Last proof-carrying commit certificate checked by the kernel.  Stored as
     # a plain dict so diagnostics stay JSON-serializable.
     last_commit_certificate: Dict[str, Any] = field(default_factory=dict)
+    # Pending exact-action confirmation.  The controller stages the signature
+    # when it asks the user to approve a fully specified mutation; a later
+    # affirmative user reply confirms exactly that signature.
+    pending_commit_signature: str = ""
+    pending_commit_summary: str = ""
+    confirmed_commit_signature: str = ""
     # Soft goal field used by the router.  This compact state tracks momentum,
     # friction, active task frame, and tiny live hypotheses without turning
     # CARGO into a planner or tree search.
@@ -187,6 +193,8 @@ class WorkingMemory:
             if self.typed_values.get(_normalize_typed_key(key), []) != before:
                 changed = True
         if self._bind_user_semantics(clean):
+            changed = True
+        if self._bind_commit_confirmation(clean):
             changed = True
         if changed:
             self.evidence_version += 1
@@ -371,6 +379,32 @@ class WorkingMemory:
     def phase_locked(self, phase: str) -> bool:
         return bool(self.phase_locks.get(str(phase or "").strip().lower()))
 
+    def stage_commit_confirmation(self, signature: str, summary: str = "") -> None:
+        sig = str(signature or "").strip()
+        if not sig:
+            return
+        if self.pending_commit_signature != sig:
+            self.pending_commit_signature = sig
+            self.confirmed_commit_signature = ""
+        self.pending_commit_summary = str(summary or "")[:400]
+
+    def commit_confirmed(self, signature: str) -> bool:
+        sig = str(signature or "").strip()
+        return bool(sig and sig == self.confirmed_commit_signature)
+
+    def _bind_commit_confirmation(self, text: str) -> bool:
+        if not self.pending_commit_signature:
+            return False
+        low = str(text or "").lower()
+        if not re.search(
+            r"\b(yes|confirm|confirmed|go ahead|proceed|do it|please do|"
+            r"sounds good|that works|book it|take it|let'?s go|use that)\b",
+            low,
+        ):
+            return False
+        self.confirmed_commit_signature = self.pending_commit_signature
+        return True
+
     # ------------------------------------------------------------------
     # Queries used by gates
     # ------------------------------------------------------------------
@@ -475,7 +509,7 @@ class WorkingMemory:
                 if isinstance(details, dict):
                     add(details.get("reservation_id"))
                     add(details.get("reservation_number"))
-        elif key in {"payment_method_id", "card_id", "certificate_id"}:
+        elif key in {"payment_method_id", "payment_id", "card_id", "certificate_id"}:
             for details in self.order_details.values():
                 if isinstance(details, dict):
                     for payment in details.get("payment_history") or []:

@@ -43,6 +43,7 @@ from src.cargo import (  # noqa: E402
     GenericCargoKernel,
     GoalActionCandidate,
     GoalField,
+    PreCommitVerifier,
     SoftGoalFieldRouter,
     Preference,
     ProposedAction,
@@ -416,12 +417,12 @@ class TestWorkingMemory(unittest.TestCase):
 
     def test_recent_signatures_window(self) -> None:
         wm = WorkingMemory()
-        for i in range(8):
+        for i in range(9):
             wm.record_action_signature(f"sig_{i}")
-        # Window is 5 by design.
-        self.assertEqual(len(list(wm.recent_signatures)), 5)
+        # Window is 8 by design for tau-bench loop suppression.
+        self.assertEqual(len(list(wm.recent_signatures)), 8)
         self.assertNotIn("sig_0", wm.recent_signatures)
-        self.assertIn("sig_7", wm.recent_signatures)
+        self.assertIn("sig_8", wm.recent_signatures)
 
     def test_render_compact_truncates(self) -> None:
         wm = WorkingMemory(goal="g")
@@ -4688,9 +4689,188 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
                 cls=RiskClass.READ,
                 arg_id_fields=["reservation_id"],
             ),
+            "get_user_details": ToolEffectSchema(
+                name="get_user_details",
+                cls=RiskClass.READ,
+                arg_id_fields=["user_id"],
+            ),
+            "book_reservation": ToolEffectSchema(
+                name="book_reservation",
+                cls=RiskClass.WRITE,
+                arg_id_fields=["user_id", "flight_number", "payment_id"],
+                required_params=[
+                    "user_id", "origin", "destination", "flight_type",
+                    "cabin", "flights", "passengers", "payment_methods",
+                    "total_baggages", "nonfree_baggages", "insurance",
+                ],
+            ),
             "respond": ToolEffectSchema(name="respond", cls=RiskClass.FINAL),
         }
         return agent
+
+    def _seed_mia_booking_trace_state(self, agent: Any) -> WorkingMemory:
+        wm = WorkingMemory()
+        text = (
+            "My user id is mia_li_3668. I want to book a one-way economy flight "
+            "from New York to Seattle on May 20 after 11am. I prefer direct "
+            "flights but one stopover is okay. "
+            "I have 3 bags, no insurance, and want to use my larger certificate "
+            "then my 7447 card."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.auth_user_id = "mia_li_3668"
+        wm.user_profiles["mia_li_3668"] = {
+            "name": {"first_name": "Mia", "last_name": "Li"},
+            "dob": "1990-04-05",
+            "membership": "gold",
+            "payment_methods": {
+                "credit_card_4421486": {"source": "credit_card", "last_four": "7447", "id": "credit_card_4421486"},
+                "certificate_4856383": {"source": "certificate", "amount": 100, "id": "certificate_4856383"},
+                "certificate_7504069": {"source": "certificate", "amount": 250, "id": "certificate_7504069"},
+            },
+        }
+        return wm
+
+    def _record_mia_booking_search_results(self, agent: Any, wm: WorkingMemory) -> None:
+        args = {"origin": "JFK", "destination": "SEA", "date": "2024-05-20"}
+        direct_obs = [
+            {
+                "flight_number": "HAT069",
+                "origin": "JFK",
+                "destination": "SEA",
+                "scheduled_departure_time_est": "06:00:00",
+                "status": "available",
+                "available_seats": {"economy": 12},
+                "prices": {"economy": 121},
+            },
+            {
+                "flight_number": "HAT083",
+                "origin": "JFK",
+                "destination": "SEA",
+                "scheduled_departure_time_est": "01:00:00",
+                "status": "available",
+                "available_seats": {"economy": 7},
+                "prices": {"economy": 100},
+            },
+        ]
+        wm.absorb_observation(direct_obs)
+        agent._kernel().record_action_candidates(wm, "search_direct_flight", args, direct_obs)
+        one_obs = [
+            [
+                {
+                    "flight_number": "HAT057",
+                    "origin": "JFK",
+                    "destination": "ATL",
+                    "scheduled_departure_time_est": "07:00:00",
+                    "status": "available",
+                    "available_seats": {"economy": 3},
+                    "prices": {"economy": 141},
+                    "date": "2024-05-20",
+                },
+                {
+                    "flight_number": "HAT039",
+                    "origin": "ATL",
+                    "destination": "SEA",
+                    "scheduled_departure_time_est": "22:00:00",
+                    "status": "available",
+                    "available_seats": {"economy": 10},
+                    "prices": {"economy": 103},
+                    "date": "2024-05-20",
+                },
+            ],
+            [
+                {
+                    "flight_number": "HAT136",
+                    "origin": "JFK",
+                    "destination": "ATL",
+                    "scheduled_departure_time_est": "19:00:00",
+                    "status": "available",
+                    "available_seats": {"economy": 14},
+                    "prices": {"economy": 152},
+                    "date": "2024-05-20",
+                },
+                {
+                    "flight_number": "HAT039",
+                    "origin": "ATL",
+                    "destination": "SEA",
+                    "scheduled_departure_time_est": "22:00:00",
+                    "status": "available",
+                    "available_seats": {"economy": 10},
+                    "prices": {"economy": 103},
+                    "date": "2024-05-20",
+                },
+            ],
+            [
+                {
+                    "flight_number": "HAT218",
+                    "origin": "JFK",
+                    "destination": "ATL",
+                    "scheduled_departure_time_est": "18:00:00",
+                    "status": "available",
+                    "available_seats": {"economy": 1},
+                    "prices": {"economy": 158},
+                    "date": "2024-05-20",
+                },
+                {
+                    "flight_number": "HAT039",
+                    "origin": "ATL",
+                    "destination": "SEA",
+                    "scheduled_departure_time_est": "22:00:00",
+                    "status": "available",
+                    "available_seats": {"economy": 10},
+                    "prices": {"economy": 103},
+                    "date": "2024-05-20",
+                },
+            ],
+            [
+                {
+                    "flight_number": "HAT268",
+                    "origin": "JFK",
+                    "destination": "ATL",
+                    "scheduled_departure_time_est": "07:00:00",
+                    "status": "available",
+                    "available_seats": {"economy": 19},
+                    "prices": {"economy": 101},
+                    "date": "2024-05-20",
+                },
+                {
+                    "flight_number": "HAT039",
+                    "origin": "ATL",
+                    "destination": "SEA",
+                    "scheduled_departure_time_est": "22:00:00",
+                    "status": "available",
+                    "available_seats": {"economy": 10},
+                    "prices": {"economy": 103},
+                    "date": "2024-05-20",
+                },
+            ],
+        ]
+        wm.absorb_observation(one_obs)
+        agent._kernel().record_action_candidates(wm, "search_onestop_flight", args, one_obs)
+
+    def _seed_olivia_reservation_trace_state(self, agent: Any) -> WorkingMemory:
+        wm = WorkingMemory()
+        text = (
+            "My user id is olivia_gonzalez_2305. I have a half-day Texas trip "
+            "in my reservations but do not remember the reservation id. I need "
+            "a later return to Newark, and if basic economy cannot be modified "
+            "I am willing to cancel using insurance because I feel unwell."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.auth_user_id = "olivia_gonzalez_2305"
+        wm.user_profiles["olivia_gonzalez_2305"] = {
+            "name": {"first_name": "Olivia", "last_name": "Gonzalez"},
+            "reservations": ["Z7GOZK", "K67C4W", "THY2DG"],
+        }
+        wm.absorb_observation(wm.user_profiles["olivia_gonzalez_2305"])
+        agent._kernel().observe_tool_result(
+            wm,
+            "get_user_details",
+            wm.user_profiles["olivia_gonzalez_2305"],
+        )
+        return wm
 
     @staticmethod
     def _keyboard_details() -> Dict[str, Any]:
@@ -5080,6 +5260,7 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         )
         wm.absorb_user_message(text)
         agent._kernel().observe_user_message(wm, text)
+        wm.user_profiles["alex_smith_42"] = {"name": {"first_name": "Alex", "last_name": "Smith"}}
         args = {"origin": "JFK", "destination": "SEA", "date": "2024-05-20"}
         agent._kernel().record_action_candidates(wm, "search_direct_flight", args, "[]")
         agent._kernel().record_action_candidates(wm, "search_onestop_flight", args, "[]")
@@ -5125,6 +5306,7 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         )
         wm.absorb_user_message(text)
         agent._kernel().observe_user_message(wm, text)
+        wm.user_profiles["alex_smith_42"] = {"name": {"first_name": "Alex", "last_name": "Smith"}}
         ask = ProposedAction(
             name="respond",
             args={},
@@ -5297,6 +5479,7 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         )
         wm.absorb_user_message(text)
         agent._kernel().observe_user_message(wm, text)
+        wm.user_profiles["mia_li_3668"] = {"name": {"first_name": "Mia", "last_name": "Li"}}
 
         obs = {
             "reservation_id": "HKEG34",
@@ -5422,6 +5605,622 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         self.assertFalse(gate.ok)
         self.assertEqual(gate.reason, "adapter_id_field_plain_word")
         self.assertIn("reservation_id=though", gate.diagnostics["invalid"])
+
+    def test_v2_repeat_window_tracks_eight_signatures(self) -> None:
+        wm = WorkingMemory()
+        for idx in range(9):
+            wm.record_action_signature(f"sig_{idx}")
+
+        self.assertNotIn("sig_0", wm.recent_signatures)
+        self.assertEqual(list(wm.recent_signatures), [f"sig_{idx}" for idx in range(1, 9)])
+
+    def test_v2_precommit_blocks_placeholder_and_pseudo_write(self) -> None:
+        wm = WorkingMemory()
+        verifier = PreCommitVerifier()
+        schema = ToolEffectSchema(name="calculate", cls=RiskClass.WRITE)
+        calculate = ProposedAction(
+            name="calculate",
+            args={"expression": "total_cost + taxes_and_fees"},
+            declared_class=RiskClass.WRITE,
+        )
+
+        verdict = verifier.verify(calculate, schema, wm, TauAirlineAdapter())
+
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, "unsupported_pseudo_write_tool")
+
+        schema = ToolEffectSchema(name="book_reservation", cls=RiskClass.WRITE)
+        placeholder = ProposedAction(
+            name="book_reservation",
+            args={"reservation_id": "latest_search_result"},
+            declared_class=RiskClass.WRITE,
+        )
+        verdict = verifier.verify(placeholder, schema, wm, TauAirlineAdapter())
+
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, "placeholder_argument")
+
+    def test_v2_retail_account_task_authenticates_before_order_lookup(self) -> None:
+        agent = self._make_retail_agent()
+        agent.schemas["get_order_details"] = ToolEffectSchema(
+            name="get_order_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["order_id"],
+        )
+        wm = WorkingMemory()
+        wm.goal = "Please exchange the keyboard in order W2378156."
+        wm.absorb_user_message(wm.goal)
+        proposed = ProposedAction(
+            name="get_order_details",
+            args={"order_id": "#W2378156"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._task_frame_stage_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertIn("full name and ZIP", replacement.user_text)  # type: ignore[union-attr]
+
+    def test_v2_retail_order_recovery_stays_live_after_failed_identity(self) -> None:
+        agent = self._make_retail_agent()
+        agent.schemas["get_order_details"] = ToolEffectSchema(
+            name="get_order_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["order_id"],
+        )
+        wm = WorkingMemory()
+        wm.goal = "Exchange the keyboard in order W2378156."
+        wm.absorb_user_message(wm.goal)
+        wm.auth_failed_zips.append("99999")
+        proposed = ProposedAction(
+            name="get_order_details",
+            args={"order_id": "#W2378156"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._task_frame_stage_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "get_order_details")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["order_id"], "#W2378156")  # type: ignore[union-attr]
+
+    def test_v2_nested_airline_itinerary_candidate_set_is_recorded(self) -> None:
+        wm = WorkingMemory()
+        kernel = GenericCargoKernel(TauAirlineAdapter())
+        args = {"origin": "JFK", "destination": "SEA", "date": "2024-05-20"}
+        obs = [[
+            {
+                "flight_number": "HAT136",
+                "origin": "JFK",
+                "destination": "ATL",
+                "scheduled_departure_time_est": "19:00:00",
+                "status": "available",
+                "available_seats": {"economy": 14},
+                "prices": {"economy": 152},
+                "date": "2024-05-20",
+            },
+            {
+                "flight_number": "HAT039",
+                "origin": "ATL",
+                "destination": "SEA",
+                "scheduled_departure_time_est": "22:00:00",
+                "status": "available",
+                "available_seats": {"economy": 10},
+                "prices": {"economy": 103},
+                "date": "2024-05-20",
+            },
+        ]]
+
+        cset = kernel.record_action_candidates(wm, "search_onestop_flight", args, obs)
+
+        self.assertIsNotNone(cset)
+        self.assertEqual(cset.candidates[0].candidate_id, "HAT136+HAT039")  # type: ignore[union-attr]
+        self.assertEqual(len(cset.candidates[0].attributes["flights"]), 2)  # type: ignore[union-attr]
+
+    def test_v2_airline_presents_grounded_itinerary_before_booking(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "My user id is mia_li_3668. I want to book a one-way economy flight "
+            "from New York to Seattle on May 20 after 11am. One stopover is okay. "
+            "I have 3 bags, no insurance, and want to use my larger certificate "
+            "then my 7447 card."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.auth_user_id = "mia_li_3668"
+        wm.user_profiles["mia_li_3668"] = {
+            "name": {"first_name": "Mia", "last_name": "Li"},
+            "dob": "1990-04-05",
+            "membership": "gold",
+            "payment_methods": {
+                "certificate_7504069": {"source": "certificate", "amount": 250, "id": "certificate_7504069"},
+                "credit_card_4421486": {"source": "credit_card", "last_four": "7447", "id": "credit_card_4421486"},
+            },
+        }
+        args = {"origin": "JFK", "destination": "SEA", "date": "2024-05-20"}
+        direct_obs = [
+            {
+                "flight_number": "HAT069",
+                "origin": "JFK",
+                "destination": "SEA",
+                "scheduled_departure_time_est": "06:00:00",
+                "status": "available",
+                "available_seats": {"economy": 12},
+                "prices": {"economy": 121},
+            }
+        ]
+        wm.absorb_observation(direct_obs)
+        agent._kernel().record_action_candidates(wm, "search_direct_flight", args, direct_obs)
+        one_obs = [[
+            {
+                "flight_number": "HAT136",
+                "origin": "JFK",
+                "destination": "ATL",
+                "scheduled_departure_time_est": "19:00:00",
+                "status": "available",
+                "available_seats": {"economy": 14},
+                "prices": {"economy": 152},
+                "date": "2024-05-20",
+            },
+            {
+                "flight_number": "HAT039",
+                "origin": "ATL",
+                "destination": "SEA",
+                "scheduled_departure_time_est": "22:00:00",
+                "status": "available",
+                "available_seats": {"economy": 10},
+                "prices": {"economy": 103},
+                "date": "2024-05-20",
+            },
+        ]]
+        wm.absorb_observation(one_obs)
+        agent._kernel().record_action_candidates(wm, "search_onestop_flight", args, one_obs)
+
+        replacement = agent._obligation_guided_action(
+            ProposedAction(name="respond", args={}, declared_class=RiskClass.ASK_USER),
+            wm,
+        )
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertIn("HAT136", replacement.user_text)  # type: ignore[union-attr]
+        self.assertIn("HAT039", replacement.user_text)  # type: ignore[union-attr]
+        self.assertIn("certificate_7504069", replacement.user_text)  # type: ignore[union-attr]
+        self.assertTrue(wm.pending_commit_signature)
+
+    def test_v2_airline_builds_complete_book_action_after_confirmation(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "My user id is mia_li_3668. I want to book a one-way economy flight "
+            "from New York to Seattle on May 20 after 11am. One stopover is okay. "
+            "I have 3 bags, no insurance, and want to use my larger certificate "
+            "then my 7447 card."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.auth_user_id = "mia_li_3668"
+        wm.user_profiles["mia_li_3668"] = {
+            "name": {"first_name": "Mia", "last_name": "Li"},
+            "dob": "1990-04-05",
+            "membership": "gold",
+            "payment_methods": {
+                "certificate_7504069": {"source": "certificate", "amount": 250, "id": "certificate_7504069"},
+                "credit_card_4421486": {"source": "credit_card", "last_four": "7447", "id": "credit_card_4421486"},
+            },
+        }
+        args = {"origin": "JFK", "destination": "SEA", "date": "2024-05-20"}
+        one_obs = [[
+            {
+                "flight_number": "HAT136",
+                "origin": "JFK",
+                "destination": "ATL",
+                "scheduled_departure_time_est": "19:00:00",
+                "status": "available",
+                "available_seats": {"economy": 14},
+                "prices": {"economy": 152},
+                "date": "2024-05-20",
+            },
+            {
+                "flight_number": "HAT039",
+                "origin": "ATL",
+                "destination": "SEA",
+                "scheduled_departure_time_est": "22:00:00",
+                "status": "available",
+                "available_seats": {"economy": 10},
+                "prices": {"economy": 103},
+                "date": "2024-05-20",
+            },
+        ]]
+        wm.absorb_observation(one_obs)
+        agent._kernel().record_action_candidates(wm, "search_onestop_flight", args, one_obs)
+        first = agent._airline_booking_progress_action(wm)
+        self.assertIsNotNone(first)
+        wm.absorb_user_message("Yes, that works. Please proceed.")
+        action = agent._airline_booking_progress_action(wm)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.name, "book_reservation")  # type: ignore[union-attr]
+        self.assertEqual(action.args["flights"], [  # type: ignore[union-attr]
+            {"flight_number": "HAT136", "date": "2024-05-20"},
+            {"flight_number": "HAT039", "date": "2024-05-20"},
+        ])
+        self.assertEqual(action.args["payment_methods"], [  # type: ignore[union-attr]
+            {"payment_id": "certificate_7504069", "amount": 250.0},
+            {"payment_id": "credit_card_4421486", "amount": 5.0},
+        ])
+        self.assertEqual(action.args["total_baggages"], 3)  # type: ignore[union-attr]
+        self.assertEqual(action.args["nonfree_baggages"], 0)  # type: ignore[union-attr]
+        failing, diag = agent._run_gates(action, agent._schema_for(action), wm, [], CargoStats())
+        self.assertIsNone(failing, failing.reason if failing else "")
+        self.assertIn("precommit_verifier", diag["gates_run"])
+
+    def test_v2_latest_airline_city_name_search_is_canonicalized(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        proposed = ProposedAction(
+            name="search_direct_flight",
+            args={"origin": "New York", "destination": "Seattle", "date": "2024-05-20"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._obligation_guided_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_direct_flight")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args, {  # type: ignore[union-attr]
+            "origin": "JFK",
+            "destination": "SEA",
+            "date": "2024-05-20",
+        })
+
+    def test_v2_latest_airline_placeholder_reservation_read_recenters_to_booking(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        self._record_mia_booking_search_results(agent, wm)
+        proposed = ProposedAction(
+            name="get_reservation_details",
+            args={"reservation_id": "latest_search_result"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._obligation_guided_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertIn("HAT136", replacement.user_text)  # type: ignore[union-attr]
+        self.assertNotIn("latest_search_result", replacement.user_text)  # type: ignore[union-attr]
+
+    def test_v2_latest_airline_direct_recheck_uses_existing_search_evidence(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        self._record_mia_booking_search_results(agent, wm)
+        proposed = ProposedAction(
+            name="search_direct_flight",
+            args={"origin": "JFK", "destination": "SEA", "date": "2024-05-20"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._obligation_guided_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertIn("HAT136", replacement.user_text)  # type: ignore[union-attr]
+        self.assertNotIn("HAT069", replacement.user_text)  # type: ignore[union-attr]
+
+    def test_v2_latest_airline_selects_cheapest_valid_not_cheapest_invalid(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        self._record_mia_booking_search_results(agent, wm)
+
+        itinerary = agent._select_airline_itinerary(wm)
+
+        self.assertEqual([f["flight_number"] for f in itinerary], ["HAT136", "HAT039"])
+
+    def test_v2_latest_retail_name_zip_order_uses_auth_before_order_read(self) -> None:
+        agent = self._make_retail_agent()
+        agent.schemas["find_user_id_by_name_zip"] = ToolEffectSchema(
+            name="find_user_id_by_name_zip",
+            cls=RiskClass.READ,
+            arg_semantic_fields=["first_name", "last_name", "zip"],
+        )
+        agent.schemas["get_order_details"] = ToolEffectSchema(
+            name="get_order_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["order_id"],
+        )
+        wm = WorkingMemory()
+        wm.goal = (
+            "You are Yusuf Rossi in 19122. You received your order #W2378156 "
+            "and wish to exchange the mechanical keyboard and smart thermostat."
+        )
+        wm.absorb_user_message(wm.goal)
+        proposed = ProposedAction(
+            name="get_order_details",
+            args={"order_id": "#W2378156"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._task_frame_stage_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "find_user_id_by_name_zip")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args, {  # type: ignore[union-attr]
+            "first_name": "Yusuf",
+            "last_name": "Rossi",
+            "zip": "19122",
+        })
+
+    def test_v2_known_issue_corpus_tracks_all_latest_result_runs(self) -> None:
+        docs_path = Path(__file__).resolve().parents[1] / "docs" / "known_issues.json"
+        data = json.loads(docs_path.read_text())
+        runs = {row["run"] for row in data["source_runs"]}
+        issue_ids = {row["id"] for row in data["issues"]}
+
+        self.assertIn("metrics (56)", runs)
+        self.assertIn("metrics (57)", runs)
+        self.assertIn("cargo_v2_phase_precommit_spine", issue_ids)
+        self.assertIn("soft_goal_field_router", issue_ids)
+
+    def test_v2_corpus_cached_airline_profile_routes_to_search_not_refetch(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        proposed = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "mia_li_3668"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._obligation_guided_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_direct_flight")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["origin"], "JFK")  # type: ignore[union-attr]
+
+    def test_v2_corpus_booking_reservation_scan_routes_to_flight_search(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        proposed = ProposedAction(
+            name="get_reservation_details",
+            args={"reservation_id": "NO6JO3"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._obligation_guided_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_direct_flight")  # type: ignore[union-attr]
+
+    def test_v2_corpus_calculate_cost_routes_to_grounded_booking_summary(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        self._record_mia_booking_search_results(agent, wm)
+        proposed = ProposedAction(
+            name="calculate",
+            args={"expression": "total_cost + taxes_and_fees"},
+            declared_class=RiskClass.WRITE,
+        )
+
+        replacement = agent._obligation_guided_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertIn("The fare is $255", replacement.user_text)  # type: ignore[union-attr]
+        self.assertIn("credit_card_4421486", replacement.user_text)  # type: ignore[union-attr]
+
+    def test_v2_corpus_generic_ask_after_booking_evidence_uses_summary(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        self._record_mia_booking_search_results(agent, wm)
+        proposed = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="Can you provide more details?",
+        )
+
+        replacement = agent._obligation_guided_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertIn("HAT136", replacement.user_text)  # type: ignore[union-attr]
+        self.assertIn("Should I book", replacement.user_text)  # type: ignore[union-attr]
+
+    def test_v2_corpus_direct_viable_beats_onestop_when_direct_preferred(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        args = {"origin": "JFK", "destination": "SEA", "date": "2024-05-20"}
+        direct_obs = [{
+            "flight_number": "HAT555",
+            "origin": "JFK",
+            "destination": "SEA",
+            "scheduled_departure_time_est": "12:00:00",
+            "status": "available",
+            "available_seats": {"economy": 2},
+            "prices": {"economy": 300},
+        }]
+        one_obs = [[
+            {
+                "flight_number": "HAT136",
+                "origin": "JFK",
+                "destination": "ATL",
+                "scheduled_departure_time_est": "19:00:00",
+                "status": "available",
+                "available_seats": {"economy": 14},
+                "prices": {"economy": 152},
+                "date": "2024-05-20",
+            },
+            {
+                "flight_number": "HAT039",
+                "origin": "ATL",
+                "destination": "SEA",
+                "scheduled_departure_time_est": "22:00:00",
+                "status": "available",
+                "available_seats": {"economy": 10},
+                "prices": {"economy": 103},
+                "date": "2024-05-20",
+            },
+        ]]
+        agent._kernel().record_action_candidates(wm, "search_direct_flight", args, direct_obs)
+        agent._kernel().record_action_candidates(wm, "search_onestop_flight", args, one_obs)
+
+        itinerary = agent._select_airline_itinerary(wm)
+
+        self.assertEqual([f["flight_number"] for f in itinerary], ["HAT555"])
+
+    def test_v2_corpus_malformed_reservation_lookup_scans_profile_ids(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_olivia_reservation_trace_state(agent)
+        proposed = ProposedAction(
+            name="get_reservation_details",
+            args={"user_id": "olivia_gonzalez_2305"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._advance_reservation_retrieval(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "get_reservation_details")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args, {"reservation_id": "Z7GOZK"})  # type: ignore[union-attr]
+
+    def test_v2_corpus_ambiguous_region_search_scans_reservations_first(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_olivia_reservation_trace_state(agent)
+        proposed = ProposedAction(
+            name="search_direct_flight",
+            args={"origin": "Texas", "destination": "Newark", "date": "2024-05-15"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._advance_reservation_retrieval(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "get_reservation_details")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["reservation_id"], "Z7GOZK")  # type: ignore[union-attr]
+
+    def test_v2_corpus_retail_placeholder_email_with_name_zip_uses_name_zip(self) -> None:
+        agent = self._make_retail_agent()
+        wm = WorkingMemory()
+        wm.goal = "You are Yusuf Rossi in 19122 and need to exchange order #W2378156."
+        wm.absorb_user_message(wm.goal)
+        proposed = ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": "user@example.com"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._auth_override(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "find_user_id_by_name_zip")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["zip"], "19122")  # type: ignore[union-attr]
+
+    def test_v2_corpus_retail_generic_ask_with_credentials_authenticates(self) -> None:
+        agent = self._make_retail_agent()
+        wm = WorkingMemory()
+        wm.goal = "I am Yusuf Rossi in 19122. Please exchange order #W2378156."
+        wm.absorb_user_message(wm.goal)
+        proposed = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="How can I assist you today?",
+        )
+
+        replacement = agent._task_frame_stage_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "find_user_id_by_name_zip")  # type: ignore[union-attr]
+
+    def test_v2_corpus_retail_cached_profile_fetches_order_not_profile_loop(self) -> None:
+        agent = self._make_retail_agent()
+        agent.schemas["get_order_details"] = ToolEffectSchema(
+            name="get_order_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["order_id"],
+        )
+        wm = WorkingMemory()
+        wm.goal = "Exchange item in order #W2378156."
+        wm.absorb_user_message(wm.goal)
+        wm.auth_user_id = "yusuf_rossi_9620"
+        proposed = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "yusuf_rossi_9620"},
+            declared_class=RiskClass.READ,
+        )
+
+        replacement = agent._grounded_progress_or_commit_action(proposed, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "get_order_details")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["order_id"], "#W2378156")  # type: ignore[union-attr]
+
+    def test_v2_corpus_precommit_blocks_nested_id_none_but_allows_semantic_none(self) -> None:
+        verifier = PreCommitVerifier()
+        wm = WorkingMemory()
+        schema = ToolEffectSchema(
+            name="book_reservation",
+            cls=RiskClass.WRITE,
+            required_params=["user_id", "insurance"],
+        )
+        semantic_none = ProposedAction(
+            name="book_reservation",
+            args={"user_id": "mia_li_3668", "insurance": "none"},
+            declared_class=RiskClass.WRITE,
+        )
+        id_none = ProposedAction(
+            name="book_reservation",
+            args={"user_id": "mia_li_3668", "payment_methods": [{"payment_id": "none"}], "insurance": "no"},
+            declared_class=RiskClass.WRITE,
+        )
+
+        self.assertTrue(verifier.verify(semantic_none, schema, wm, TauAirlineAdapter()).ok)
+        self.assertFalse(verifier.verify(id_none, schema, wm, TauAirlineAdapter()).ok)
+
+    def test_v2_corpus_precommit_blocks_nested_latest_placeholder(self) -> None:
+        verifier = PreCommitVerifier()
+        action = ProposedAction(
+            name="book_reservation",
+            args={"flights": [{"flight_number": "latest_search_result"}], "insurance": "no"},
+            declared_class=RiskClass.WRITE,
+        )
+
+        verdict = verifier.verify(
+            action,
+            ToolEffectSchema(name="book_reservation", cls=RiskClass.WRITE),
+            WorkingMemory(),
+            TauAirlineAdapter(),
+        )
+
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, "placeholder_argument")
+
+    def test_v2_corpus_goal_field_downweights_repeated_profile_against_search(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        profile = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "mia_li_3668"},
+            declared_class=RiskClass.READ,
+        )
+        search = ProposedAction(
+            name="search_direct_flight",
+            args={"origin": "JFK", "destination": "SEA", "date": "2024-05-20"},
+            declared_class=RiskClass.READ,
+        )
+        wm.goal_field.record_friction(profile.signature(), 4.0, "cached_profile_replay")
+
+        decision = SoftGoalFieldRouter().choose(
+            wm,
+            [
+                GoalActionCandidate(profile, source="cached_profile", progress=0.1),
+                GoalActionCandidate(search, source="grounded_search", progress=1.2, uncertainty_reduction=0.8),
+            ],
+            agent.adapter,
+        )
+
+        self.assertEqual(decision.selected.action.name, "search_direct_flight")
 
 
 # ---------------------------------------------------------------------------

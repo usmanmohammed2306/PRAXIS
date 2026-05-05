@@ -9,7 +9,7 @@ and **ACEBench Agent**:
 | 1 | **Vanilla TC** (`baseline`) | Native function-calling, minimal system prompt. |
 | 2 | **Act** (`act`)             | Yao et al. 2022 ablation: action-only, no reasoning prose. |
 | 3 | **ReAct** (`react`)         | Yao et al. 2022: one-line `Thought:` before each Action. |
-| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; a Soft Goal-Field Router keeps a compact active goal, task frame, momentum/friction scores, and tiny live hypotheses, then selects among model and deterministic candidate actions before the existing risk gates check grounding, task-state validity, semantic completeness, proof-carrying commit certificates, and pre-conditions. Calibrated self-consistency plus counterfactual rollout are still reserved for high-risk actions. |
+| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; a phase-aware CARGO v2 spine keeps account work in AUTHENTICATE/DISCOVER/CONFIRM/COMMIT/WRAP, while the Soft Goal-Field Router ranks model and deterministic candidates before deterministic gates check grounding, task-state validity, semantic completeness, pre-commit safety, proof-carrying commit certificates, and pre-conditions. Calibrated self-consistency plus counterfactual rollout are still reserved for high-risk actions. |
 
 All four conditions share the **same in-process loop, model,
 temperature, max-steps, and truncation budget**. The only varying axis is
@@ -513,24 +513,25 @@ detection; self-consistency vote (mock client with `n>1`); counterfactual
 rollout (mock client); post-condition error detection; proposer JSON parsing;
 repair policy decisions; READ-permissive / WRITE-strict validation; airline
 obligation-guided search progression; task-frame isolation; no-auth catalog
-routing; soft goal-field momentum/friction routing; proof-carrying commit
-certificates; post-write terminal response; and full agent loop behavior on
-mock environments.
+routing; soft goal-field momentum/friction routing; CARGO v2 phase/pre-commit
+spine checks; deterministic airline itinerary/payment/passenger booking
+candidates; proof-carrying commit certificates; post-write terminal response;
+and full agent loop behavior on mock environments.
 
-Latest local verification in this workspace: `282` tests passed, compileall
+Latest local verification in this workspace: `308` tests passed, compileall
 passed, `git diff --check` passed, `python3 -m pip check` passed, and
 `bash run_project.sh --dry-run` resolved the benchmark configuration.
 Synthetic smoke passed. Classic tau-bench and ACEBench dependencies are
 present, but live tau-bench / ACEBench smoke tests still require either
 `OPENAI_API_KEY` or an OpenAI-compatible `OPENAI_BASE_URL`; without one, the
 smoke helper reports them as blocked and leaves exact rerun commands in
-`outputs/smoke/smoke_summary_goal_field.json`.
+`outputs/smoke/smoke_summary_v2_broad_corpus.json`.
 
-Current limitation: the Soft Goal-Field Router improves continuity and loop
-suppression, but it does not yet synthesize every airline booking/update write
-from non-empty search results. The next bottleneck is an adapter-owned
-itinerary/payment/passenger selector that can produce complete airline write
-candidates for the router to score.
+The detailed redesign note is in
+[`docs/cargo_v2_redesign_plan.md`](docs/cargo_v2_redesign_plan.md). Current
+limitation: the new deterministic booking builder covers the common airline
+new-booking path, but modify/cancel/update flows still need equivalent
+adapter-owned write builders.
 
 ## What CARGO is — and isn't
 
