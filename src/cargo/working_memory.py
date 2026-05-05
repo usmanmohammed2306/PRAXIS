@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional
 
-from .core import TaskState
+from .core import GoalField, TaskState
 
 
 # A short rolling window of recent action signatures (for repeat detection).
@@ -143,6 +143,10 @@ class WorkingMemory:
     # Last proof-carrying commit certificate checked by the kernel.  Stored as
     # a plain dict so diagnostics stay JSON-serializable.
     last_commit_certificate: Dict[str, Any] = field(default_factory=dict)
+    # Soft goal field used by the router.  This compact state tracks momentum,
+    # friction, active task frame, and tiny live hypotheses without turning
+    # CARGO into a planner or tree search.
+    goal_field: GoalField = field(default_factory=GoalField)
 
     # ------------------------------------------------------------------
     # Updates
@@ -575,6 +579,11 @@ class WorkingMemory:
                 f"{latest.get('slot')} kept {latest.get('active')} "
                 f"over observed {latest.get('observed')}"
             )
+        if self.goal_field:
+            self.goal_field.sync_from_memory(self)
+            rendered_field = self.goal_field.render_compact(max_chars=320)
+            if rendered_field:
+                parts.append("goal_field: " + rendered_field)
         parts += [
             "user_facts:",
             *(f"  {f[:90]}" for f in trim(self.user_facts, 5)),

@@ -5,7 +5,18 @@ import json
 import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from ..core import BaseCargoAdapter, CommitCertificate, Obligation, Preference, TaskState, normalize_key
+from ..core import (
+    BaseCargoAdapter,
+    CommitCertificate,
+    GoalActionCandidate,
+    GoalField,
+    GoalHypothesis,
+    Obligation,
+    Preference,
+    TaskState,
+    normalize_key,
+)
+from ..risk_class import RiskClass
 from ..schemas import GateResult, ProposedAction, ToolEffectSchema
 
 
@@ -300,6 +311,102 @@ class TauAirlineAdapter(BaseCargoAdapter):
         if action.name.startswith("update_reservation_") or action.name == "cancel_reservation":
             return self._reservation_write_certificate(action, schema, wm)
         return super().build_commit_certificate(action, schema, wm)
+
+    def goal_stage(self, wm) -> str:
+        if getattr(wm, "task_completed", False):
+            return "complete"
+        if getattr(wm.task_state, "terminal_status", ""):
+            return "terminal"
+        slots = getattr(wm, "semantic_slots", {}) or {}
+        user_id = getattr(wm, "auth_user_id", "") or (getattr(wm, "typed_evidence_for", lambda _k: [])("user_id") or [""])[-1]
+        intents = slots.get("intents") or slots.get("intent") or []
+        if not isinstance(intents, list):
+            intents = [intents]
+        intent_text = " ".join(str(v).lower() for v in intents)
+        if not user_id and re.search(r"\b(book|reserve|purchase|change|modify|update|cancel)\b", _goal_text(wm)):
+            return "identity"
+        if user_id and user_id not in getattr(wm, "user_profiles", {}):
+            return "profile"
+        if "book_flight" in intent_text:
+            if not (slots.get("origin") and slots.get("destination") and slots.get("date")):
+                return "bind_route"
+            direct = wm.task_state.candidate_set_for(
+                "search_direct_flight",
+                {
+                    "origin": self.canonicalize_airport(slots.get("origin"), field="origin"),
+                    "destination": self.canonicalize_airport(slots.get("destination"), field="destination"),
+                    "date": str(slots.get("date")),
+                },
+            )
+            one = wm.task_state.candidate_set_for(
+                "search_onestop_flight",
+                {
+                    "origin": self.canonicalize_airport(slots.get("origin"), field="origin"),
+                    "destination": self.canonicalize_airport(slots.get("destination"), field="destination"),
+                    "date": str(slots.get("date")),
+                },
+            )
+            if not direct:
+                return "search_direct"
+            if direct.exhausted and not one:
+                return "search_onestop"
+            return "candidate_selection"
+        if "modify_flight" in intent_text or getattr(wm, "reservation_details", {}):
+            return "reservation_scan" if not getattr(wm, "reservation_details", {}) else "reservation_selection"
+        return super().goal_stage(wm)
+
+    def update_goal_field(
+        self,
+        field: GoalField,
+        wm,
+        *,
+        event: str,
+        action_name: str = "",
+        obs: Any = None,
+    ) -> None:
+        super().update_goal_field(field, wm, event=event, action_name=action_name, obs=obs)
+        slots = getattr(wm, "semantic_slots", {}) or {}
+        intents = slots.get("intents") or slots.get("intent") or []
+        if not isinstance(intents, list):
+            intents = [intents]
+        for intent in intents[-3:]:
+            if intent:
+                field.add_hypothesis(GoalHypothesis(
+                    hypothesis_id=normalize_key(str(intent)),
+                    label=str(intent),
+                    confidence=0.75,
+                    anchors={
+                        "origin": slots.get("origin"),
+                        "destination": slots.get("destination"),
+                        "date": slots.get("date"),
+                    },
+                    last_evidence_turn=field.turn,
+                ))
+        if event == "tool" and action_name in {"search_direct_flight", "search_onestop_flight"}:
+            if obs is not None and str(obs).strip() not in {"", "[]"} and "[]" not in str(obs).strip()[:4]:
+                field.record_progress("flight_candidates_available", 0.8)
+        if event in {"gate_failure", "execute"} and action_name == "get_user_details":
+            field.record_friction("cached_profile_loop", 0.6, "profile_phase_complete")
+
+    def score_goal_action(self, candidate: GoalActionCandidate, wm) -> float:
+        action = candidate.action
+        score = 0.0
+        slots = getattr(wm, "semantic_slots", {}) or {}
+        if action.name == "get_user_details":
+            uid = str(action.args.get("user_id") or "").strip()
+            if uid and uid in getattr(wm, "user_profiles", {}):
+                score -= 3.0
+        if action.name.startswith("search_") and slots.get("origin") and slots.get("destination") and slots.get("date"):
+            score += 0.9
+        if action.name == "get_reservation_details":
+            score += 0.55
+        if action.name in {"book_reservation", "cancel_reservation"} or action.name.startswith("update_reservation_"):
+            score += 1.0
+        if action.declared_class == RiskClass.ASK_USER and (slots.get("origin") or getattr(wm, "reservation_details", {})):
+            score -= 1.4
+        if action.declared_class == RiskClass.FINAL and getattr(wm.task_state, "terminal_status", ""):
+            score += 1.4
+        return score
 
     def _book_certificate(
         self,
@@ -619,6 +726,10 @@ def _seen_payment_ids(wm) -> set[str]:
     text = getattr(wm, "all_evidence", lambda: "")()
     seen.update(re.findall(r"\b(?:credit_card|gift_card|certificate)_[0-9A-Za-z]+\b", text))
     return seen
+
+
+def _goal_text(wm) -> str:
+    return (str(getattr(wm, "goal", "") or "") + " " + " ".join(getattr(wm, "user_facts", []) or [])).lower()
 
 
 __all__ = ["TauAirlineAdapter"]

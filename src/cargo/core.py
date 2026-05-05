@@ -116,6 +116,205 @@ class CandidateSelection:
 
 
 @dataclass
+class GoalHypothesis:
+    """A compact live branch in the current task frame.
+
+    This is intentionally small.  It is not a plan tree; it is the tiny set of
+    plausible task interpretations the router can keep warm while evidence is
+    still arriving.
+    """
+
+    hypothesis_id: str
+    label: str
+    confidence: float = 0.5
+    anchors: Dict[str, Any] = field(default_factory=dict)
+    friction: float = 0.0
+    last_evidence_turn: int = 0
+    status: str = "live"  # live | downweighted | quarantined
+
+    def score(self) -> float:
+        return max(0.0, float(self.confidence) - float(self.friction))
+
+
+@dataclass
+class GoalField:
+    """Soft task-continuity state used by the goal-field router."""
+
+    active_goal: str = ""
+    active_stage: str = "start"
+    confirmed_facts: Dict[str, Any] = field(default_factory=dict)
+    unresolved_slots: Set[str] = field(default_factory=set)
+    candidate_actions: Dict[str, float] = field(default_factory=dict)
+    hard_constraints: List[str] = field(default_factory=list)
+    soft_preferences: List[str] = field(default_factory=list)
+    recent_failures: Dict[str, int] = field(default_factory=dict)
+    friction: Dict[str, float] = field(default_factory=dict)
+    momentum: float = 0.0
+    progress_events: List[str] = field(default_factory=list)
+    hypotheses: List[GoalHypothesis] = field(default_factory=list)
+    active_task_frame: Dict[str, Any] = field(default_factory=dict)
+    recent_recenter_reason: str = ""
+    last_selected_signature: str = ""
+    last_decision: Dict[str, Any] = field(default_factory=dict)
+    turn: int = 0
+
+    def sync_from_memory(self, wm: "WorkingMemory") -> None:
+        if not self.active_goal:
+            self.active_goal = str(getattr(wm, "goal", "") or "")[:220]
+        state = getattr(wm, "task_state", None)
+        if state is not None:
+            self.unresolved_slots = set(getattr(state, "open_slots", set()) or set())
+            self.unresolved_slots.update(getattr(state, "unresolved_obligations", set()) or set())
+            facts: Dict[str, Any] = {}
+            for key, fact in list((getattr(state, "db_confirmed_facts", {}) or {}).items())[-10:]:
+                facts[str(key)] = getattr(fact, "value", fact)
+            self.confirmed_facts = facts
+            self.hard_constraints = [
+                f"{c.slot}{c.op}{normalize_value(c.value)}"
+                for c in list(getattr(state, "constraints", []) or [])
+                if getattr(c, "hard", False)
+            ][:8]
+            self.soft_preferences = [
+                f"{p.slot}={normalize_value(p.value)}"
+                for p in list(getattr(state, "preferences", []) or [])
+            ][:8]
+        frame: Dict[str, Any] = {}
+        for key, value in (getattr(wm, "semantic_slots", {}) or {}).items():
+            if key in (getattr(wm, "user_bound_slots", {}) or {}) or key in {
+                "intents", "intent", "origin", "destination", "date", "cabin",
+                "baggage_count", "travel_insurance", "payment_preferences",
+            }:
+                frame[str(key)] = value
+        self.active_task_frame = frame
+        self._ensure_hypotheses(wm)
+        self._trim()
+
+    def record_progress(self, label: str, amount: float = 0.4) -> None:
+        self.momentum = min(12.0, max(0.0, self.momentum + float(amount)))
+        clean = str(label or "progress")[:80]
+        self.progress_events.append(clean)
+        if len(self.progress_events) > 8:
+            self.progress_events = self.progress_events[-8:]
+
+    def record_friction(self, signature: str, amount: float = 1.0, reason: str = "") -> None:
+        sig = str(signature or reason or "unknown")[:180]
+        if not sig:
+            return
+        self.friction[sig] = min(12.0, self.friction.get(sig, 0.0) + float(amount))
+        self.recent_failures[sig] = self.recent_failures.get(sig, 0) + 1
+        self.momentum = max(0.0, self.momentum - (0.2 * float(amount)))
+        if reason:
+            self.recent_recenter_reason = str(reason)[:120]
+        self._trim()
+
+    def recenter(self, reason: str, *, preserve_goal: bool = True) -> None:
+        self.recent_recenter_reason = str(reason or "recentered")[:120]
+        for hyp in self.hypotheses:
+            if hyp.status == "live":
+                hyp.status = "downweighted"
+                hyp.friction += 0.5
+        if preserve_goal:
+            self.record_progress("recenter_preserved_goal", 0.2)
+        self._trim()
+
+    def add_hypothesis(self, hypothesis: GoalHypothesis) -> None:
+        if not hypothesis.hypothesis_id:
+            hypothesis.hypothesis_id = normalize_key(hypothesis.label) or f"hyp_{len(self.hypotheses)}"
+        for cur in self.hypotheses:
+            if cur.hypothesis_id == hypothesis.hypothesis_id:
+                cur.confidence = max(cur.confidence, hypothesis.confidence)
+                cur.anchors.update(hypothesis.anchors)
+                cur.last_evidence_turn = max(cur.last_evidence_turn, hypothesis.last_evidence_turn)
+                if cur.status == "quarantined" and hypothesis.status == "live":
+                    cur.status = "downweighted"
+                self._trim()
+                return
+        self.hypotheses.append(hypothesis)
+        self._trim()
+
+    def render_compact(self, max_chars: int = 360) -> str:
+        parts: List[str] = []
+        parts.append(f"stage={self.active_stage}")
+        parts.append(f"momentum={self.momentum:.1f}")
+        if self.unresolved_slots:
+            parts.append("open=" + ",".join(sorted(self.unresolved_slots))[:90])
+        live = sorted(self.hypotheses, key=lambda h: h.score(), reverse=True)[:3]
+        if live:
+            parts.append(
+                "hyp="
+                + ";".join(
+                    f"{h.label[:28]}:{h.score():.1f}/{h.status[0]}"
+                    for h in live
+                )
+            )
+        top_friction = sorted(self.friction.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        if top_friction:
+            parts.append(
+                "friction="
+                + ";".join(f"{k.split('(')[0][:28]}:{v:.1f}" for k, v in top_friction)
+            )
+        if self.recent_recenter_reason:
+            parts.append(f"recenter={self.recent_recenter_reason[:80]}")
+        return " | ".join(p for p in parts if p)[:max_chars]
+
+    def _ensure_hypotheses(self, wm: "WorkingMemory") -> None:
+        intents = (getattr(wm, "semantic_slots", {}) or {}).get("intents") or []
+        if not isinstance(intents, list):
+            intents = [intents]
+        for intent in intents[-3:]:
+            label = str(intent or "").strip()
+            if not label:
+                continue
+            self.add_hypothesis(GoalHypothesis(
+                hypothesis_id=normalize_key(label),
+                label=label,
+                confidence=0.7,
+                anchors={"source": "semantic_slots"},
+                last_evidence_turn=self.turn,
+            ))
+
+    def _trim(self) -> None:
+        self.hypotheses = sorted(
+            self.hypotheses,
+            key=lambda h: (h.status == "live", h.score(), h.last_evidence_turn),
+            reverse=True,
+        )[:3]
+        if len(self.friction) > 24:
+            keep = dict(sorted(self.friction.items(), key=lambda kv: kv[1], reverse=True)[:24])
+            self.friction = keep
+        if len(self.recent_failures) > 24:
+            keep_keys = set(self.friction.keys())
+            self.recent_failures = {
+                k: v for k, v in self.recent_failures.items()
+                if k in keep_keys
+            }
+
+
+@dataclass
+class GoalActionCandidate:
+    """A proposed next action plus soft progress metadata."""
+
+    action: ProposedAction
+    source: str = "model"
+    progress: float = 0.0
+    uncertainty_reduction: float = 0.0
+    completion: float = 0.0
+    frame_match: float = 0.0
+    rationale: str = ""
+    score: float = 0.0
+
+    def signature(self) -> str:
+        return self.action.signature()
+
+
+@dataclass
+class GoalFieldDecision:
+    selected: GoalActionCandidate
+    alternatives: List[GoalActionCandidate] = field(default_factory=list)
+    reason: str = ""
+
+
+@dataclass
 class ProofObligation:
     """Machine-checkable proof item for a proposed task transition."""
 
@@ -500,6 +699,23 @@ class CargoDomainAdapter(Protocol):
     ) -> CommitCertificate:
         ...
 
+    def goal_stage(self, wm: "WorkingMemory") -> str:
+        ...
+
+    def update_goal_field(
+        self,
+        field: GoalField,
+        wm: "WorkingMemory",
+        *,
+        event: str,
+        action_name: str = "",
+        obs: Any = None,
+    ) -> None:
+        ...
+
+    def score_goal_action(self, candidate: GoalActionCandidate, wm: "WorkingMemory") -> float:
+        ...
+
 
 class BaseCargoAdapter:
     """Domain-neutral adapter default used by tests and unknown benchmarks."""
@@ -620,6 +836,40 @@ class BaseCargoAdapter:
                 arg_keys=sorted(action.args.keys()),
             )
         return cert.finalize()
+
+    def goal_stage(self, wm: "WorkingMemory") -> str:
+        state = getattr(wm, "task_state", None)
+        if getattr(wm, "task_completed", False):
+            return "complete"
+        if state is not None and getattr(state, "terminal_status", ""):
+            return "terminal"
+        if state is not None and getattr(state, "unresolved_obligations", set()):
+            return "obligations_open"
+        if getattr(wm, "semantic_slots", None):
+            return "grounding"
+        return "start"
+
+    def update_goal_field(
+        self,
+        field: GoalField,
+        wm: "WorkingMemory",
+        *,
+        event: str,
+        action_name: str = "",
+        obs: Any = None,
+    ) -> None:
+        if event == "user":
+            field.record_progress("user_goal_evidence", 0.2)
+        elif event == "tool":
+            if _obs_is_error_or_empty(obs):
+                field.record_friction(action_signature_key(action_name, {}), 0.7, "tool_no_progress")
+            else:
+                field.record_progress(f"tool:{action_name}", 0.4)
+        elif event == "candidate_set":
+            field.record_progress(f"candidates:{action_name}", 0.5)
+
+    def score_goal_action(self, candidate: GoalActionCandidate, wm: "WorkingMemory") -> float:
+        return 0.0
 
     def validate_candidate(self, candidate: CandidateObject, state: TaskState) -> GateResult:
         if not candidate.available:
@@ -770,6 +1020,249 @@ class DecisionEngine:
 
     def __init__(self) -> None:
         self.constraints = ConstraintPriorityEngine()
+        self.goal_router = SoftGoalFieldRouter()
+
+
+class SoftGoalFieldRouter:
+    """Compact soft router for progress-biased action selection.
+
+    The router does not execute tools, prove commits, or search a tree.  It
+    scores a small candidate set and lets the normal CARGO gates remain the
+    hard safety boundary.
+    """
+
+    _GENERIC_ASK_RE = re.compile(
+        r"\b(how can i assist|what would you like|anything else|provide more detail|"
+        r"specific request|what else do you need)\b",
+        re.I,
+    )
+
+    def observe_user_message(
+        self,
+        wm: "WorkingMemory",
+        text: str,
+        adapter: CargoDomainAdapter,
+    ) -> None:
+        field = self._field(wm)
+        field.turn += 1
+        if text and not field.active_goal:
+            field.active_goal = str(text)[:220]
+        field.sync_from_memory(wm)
+        field.active_stage = self._adapter_stage(adapter, wm)
+        self._adapter_update(adapter, field, wm, event="user", obs=text)
+
+    def observe_tool_result(
+        self,
+        wm: "WorkingMemory",
+        action_name: str,
+        obs: Any,
+        adapter: CargoDomainAdapter,
+    ) -> None:
+        field = self._field(wm)
+        field.turn += 1
+        if _obs_is_error_or_empty(obs):
+            field.record_friction(
+                action_signature_key(action_name, {}),
+                0.9,
+                f"{action_name}_returned_no_progress",
+            )
+        else:
+            amount = 0.5
+            name = str(action_name or "")
+            if name.startswith(("get_", "find_", "list_", "search_")):
+                amount = 0.7
+            if name.startswith(("exchange_", "return_", "modify_", "book_", "update_", "cancel_")):
+                amount = 1.5
+            field.record_progress(f"tool:{name}", amount)
+        field.sync_from_memory(wm)
+        field.active_stage = self._adapter_stage(adapter, wm)
+        self._adapter_update(adapter, field, wm, event="tool", action_name=action_name, obs=obs)
+
+    def observe_candidate_set(
+        self,
+        wm: "WorkingMemory",
+        candidate_set: CandidateSet,
+        adapter: CargoDomainAdapter,
+    ) -> None:
+        field = self._field(wm)
+        sig = candidate_set.set_id
+        if candidate_set.empty or candidate_set.exhausted:
+            field.record_friction(sig, 1.2, "empty_candidate_set")
+        else:
+            field.record_progress(f"candidate_set:{candidate_set.source_tool}", 0.9)
+        field.sync_from_memory(wm)
+        self._adapter_update(
+            adapter,
+            field,
+            wm,
+            event="candidate_set",
+            action_name=candidate_set.source_tool,
+            obs={"empty": candidate_set.empty, "count": len(candidate_set.candidates)},
+        )
+
+    def record_gate_failure(
+        self,
+        wm: "WorkingMemory",
+        action: ProposedAction,
+        gate: GateResult,
+        adapter: CargoDomainAdapter,
+    ) -> None:
+        field = self._field(wm)
+        sig = action.signature()
+        reason = getattr(gate, "reason", "") or "gate_failure"
+        field.record_friction(sig, 1.0, reason)
+        if reason in {
+            "repeated_action_signature",
+            "user_profile_already_cached",
+            "ask_user_repeats_same_question",
+        }:
+            field.recenter(reason)
+        field.sync_from_memory(wm)
+        self._adapter_update(adapter, field, wm, event="gate_failure", action_name=action.name, obs=reason)
+
+    def record_executed_action(
+        self,
+        wm: "WorkingMemory",
+        action: ProposedAction,
+        adapter: CargoDomainAdapter,
+    ) -> None:
+        field = self._field(wm)
+        sig = action.signature()
+        field.last_selected_signature = sig
+        if action.declared_class == RiskClass.READ:
+            field.record_progress(f"execute_read:{action.name}", 0.2)
+        elif action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE):
+            field.record_progress(f"execute_write:{action.name}", 1.2)
+        elif action.declared_class == RiskClass.FINAL:
+            field.record_progress("execute_final", 0.6)
+        elif action.declared_class == RiskClass.ASK_USER:
+            if self._generic_ask(action):
+                field.record_friction(sig, 0.5, "generic_ask_user")
+            else:
+                field.record_progress("ask_user_precise", 0.1)
+        field.sync_from_memory(wm)
+        self._adapter_update(adapter, field, wm, event="execute", action_name=action.name)
+
+    def choose(
+        self,
+        wm: "WorkingMemory",
+        candidates: Iterable[GoalActionCandidate],
+        adapter: CargoDomainAdapter,
+    ) -> GoalFieldDecision:
+        field = self._field(wm)
+        field.sync_from_memory(wm)
+        field.active_stage = self._adapter_stage(adapter, wm)
+        scored: List[GoalActionCandidate] = []
+        for idx, candidate in enumerate(candidates):
+            if candidate is None or candidate.action is None:
+                continue
+            candidate.score = self._score_candidate(candidate, wm, adapter, idx)
+            scored.append(candidate)
+        if not scored:
+            raise ValueError("SoftGoalFieldRouter.choose requires at least one candidate")
+        scored.sort(key=lambda c: (c.score, -len(c.signature()), c.source), reverse=True)
+        selected = scored[0]
+        field.candidate_actions = {c.signature(): round(c.score, 3) for c in scored[:6]}
+        field.last_decision = {
+            "selected": selected.signature(),
+            "source": selected.source,
+            "score": round(selected.score, 3),
+            "alternatives": [
+                {"signature": c.signature(), "source": c.source, "score": round(c.score, 3)}
+                for c in scored[1:4]
+            ],
+        }
+        return GoalFieldDecision(
+            selected=selected,
+            alternatives=scored[1:],
+            reason=f"selected {selected.source} score={selected.score:.2f}",
+        )
+
+    def _score_candidate(
+        self,
+        candidate: GoalActionCandidate,
+        wm: "WorkingMemory",
+        adapter: CargoDomainAdapter,
+        index: int,
+    ) -> float:
+        field = self._field(wm)
+        action = candidate.action
+        sig = action.signature()
+        score = (
+            float(candidate.progress)
+            + float(candidate.uncertainty_reduction)
+            + float(candidate.completion)
+            + float(candidate.frame_match)
+            + min(2.0, field.momentum * 0.08)
+        )
+        if action.declared_class == RiskClass.READ:
+            score += 0.35
+        elif action.declared_class == RiskClass.ASK_USER:
+            score -= 0.15
+            if self._generic_ask(action):
+                score -= 2.4
+        elif action.declared_class == RiskClass.FINAL:
+            score -= 0.2
+            if getattr(wm.task_state, "terminal_status", "") or action.bypass_gates:
+                score += 0.6
+        elif action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE):
+            score += 0.55
+        if sig in getattr(wm, "recent_signatures", []):
+            score -= 2.0
+        if getattr(wm, "failed_without_new_evidence", lambda _s: False)(sig):
+            score -= 2.5
+        score -= min(4.0, field.friction.get(sig, 0.0))
+        if action.name == "get_user_details":
+            uid = str(action.args.get("user_id") or "").strip()
+            if uid and uid in getattr(wm, "user_profiles", {}):
+                score -= 3.0
+        if action.name.startswith("search_"):
+            candidate_set = wm.task_state.candidate_set_for(action.name, action.args)
+            if candidate_set and candidate_set.exhausted:
+                score -= 2.0
+        if action.declared_class == RiskClass.ASK_USER and getattr(wm, "semantic_slots", None):
+            if getattr(wm.task_state, "open_slots", set()) or getattr(wm.task_state, "unresolved_obligations", set()):
+                score -= 0.6
+        try:
+            score += float(adapter.score_goal_action(candidate, wm))
+        except Exception:
+            pass
+        # Stable tiny tie-breaker: preserve source insertion order.
+        score -= index * 0.001
+        return score
+
+    @classmethod
+    def _generic_ask(cls, action: ProposedAction) -> bool:
+        text = f"{action.user_text or ''} {action.raw_thought or ''}"
+        return bool(cls._GENERIC_ASK_RE.search(text))
+
+    @staticmethod
+    def _field(wm: "WorkingMemory") -> GoalField:
+        field = getattr(wm, "goal_field", None)
+        if isinstance(field, GoalField):
+            return field
+        field = GoalField(active_goal=str(getattr(wm, "goal", "") or "")[:220])
+        setattr(wm, "goal_field", field)
+        return field
+
+    @staticmethod
+    def _adapter_stage(adapter: CargoDomainAdapter, wm: "WorkingMemory") -> str:
+        try:
+            return str(adapter.goal_stage(wm) or "start")
+        except Exception:
+            return "start"
+
+    @staticmethod
+    def _adapter_update(
+        adapter: CargoDomainAdapter,
+        field: GoalField,
+        wm: "WorkingMemory",
+        **kwargs: Any,
+    ) -> None:
+        try:
+            adapter.update_goal_field(field, wm, **kwargs)
+        except Exception:
+            return
 
 
 class GenericCargoKernel:
@@ -787,6 +1280,7 @@ class GenericCargoKernel:
         for key, value, confirmed in self.adapter.bind_user_message(text, wm.task_state):
             wm.bind_semantic_slot(key, value, confirmed=confirmed)
         self.adapter.update_obligations(wm.task_state, wm)
+        self.decision_engine.goal_router.observe_user_message(wm, text, self.adapter)
 
     def observe_tool_result(self, wm: "WorkingMemory", action_name: str, obs: Any) -> None:
         self._ensure_state_meta(wm)
@@ -799,6 +1293,7 @@ class GenericCargoKernel:
             if nkey in semantic_fields or nkey in {"date", "intent", "confirmation"}:
                 wm.bind_semantic_slot(nkey, value, confirmed=confirmed)
         self.adapter.update_obligations(wm.task_state, wm)
+        self.decision_engine.goal_router.observe_tool_result(wm, action_name, obs, self.adapter)
 
     def record_action_candidates(
         self,
@@ -807,7 +1302,10 @@ class GenericCargoKernel:
         action_args: Mapping[str, Any],
         obs: Any,
     ) -> Optional[CandidateSet]:
-        return self._record_generic_candidate_set(wm.task_state, action_name, action_args, obs)
+        candidate_set = self._record_generic_candidate_set(wm.task_state, action_name, action_args, obs)
+        if candidate_set is not None:
+            self.decision_engine.goal_router.observe_candidate_set(wm, candidate_set, self.adapter)
+        return candidate_set
 
     def validate_action(
         self,
@@ -1060,6 +1558,19 @@ def _coerce_struct(obs: Any) -> Any:
     return obs
 
 
+def _obs_is_error_or_empty(obs: Any) -> bool:
+    struct = _coerce_struct(obs)
+    if struct in (None, "", [], {}):
+        return True
+    if isinstance(struct, Mapping):
+        text = " ".join(str(v).lower() for v in struct.values())
+        return bool(struct.get("error") or struct.get("status") == "error" or "not found" in text)
+    if isinstance(struct, list):
+        return len(struct) == 0
+    text = str(struct or "").strip().lower()
+    return not text or text.startswith("error") or '"error"' in text or "not found" in text
+
+
 def _iter_scalar_items(obj: Any, prefix: str = "") -> Iterable[Tuple[str, Any]]:
     if isinstance(obj, Mapping):
         for key, value in obj.items():
@@ -1121,10 +1632,15 @@ __all__ = [
     "ConstraintPriorityEngine",
     "DecisionEngine",
     "FallbackRule",
+    "GoalActionCandidate",
+    "GoalField",
+    "GoalFieldDecision",
+    "GoalHypothesis",
     "GenericCargoKernel",
     "Obligation",
     "Preference",
     "StateFact",
+    "SoftGoalFieldRouter",
     "TaskState",
     "extract_generic_facts",
     "normalize_key",

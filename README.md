@@ -9,7 +9,7 @@ and **ACEBench Agent**:
 | 1 | **Vanilla TC** (`baseline`) | Native function-calling, minimal system prompt. |
 | 2 | **Act** (`act`)             | Yao et al. 2022 ablation: action-only, no reasoning prose. |
 | 3 | **ReAct** (`react`)         | Yao et al. 2022: one-line `Thought:` before each Action. |
-| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; a deterministic decision engine updates state, stores candidate sets, applies hard constraints before preferences, schedules the next pipeline step, and then risk gates check grounding, task-state validity, semantic completeness, proof-carrying commit certificates, and pre-conditions. Calibrated self-consistency plus counterfactual rollout are still reserved for high-risk actions. |
+| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; a Soft Goal-Field Router keeps a compact active goal, task frame, momentum/friction scores, and tiny live hypotheses, then selects among model and deterministic candidate actions before the existing risk gates check grounding, task-state validity, semantic completeness, proof-carrying commit certificates, and pre-conditions. Calibrated self-consistency plus counterfactual rollout are still reserved for high-risk actions. |
 
 All four conditions share the **same in-process loop, model,
 temperature, max-steps, and truncation budget**. The only varying axis is
@@ -48,9 +48,10 @@ unchanged.
             │                declared_post, informational_intent,     │
             │                user_text}}                              │
             │                                                         │
-            │  (3)  Risk Router  (deterministic, O(1))                │
-            │       READ  → retrieval-permissive fast path            │
-            │       WRITE / IRREV / FINAL → commitment-strict gate    │
+            │  (3)  Soft Goal-Field Router (deterministic, compact)  │
+            │       active goal + task frame + hypotheses             │
+            │       momentum for progress, friction for loops         │
+            │       choose from model + deterministic candidates      │
             │                                                         │
             │  (4)  Calibrated Gate                                   │
             │       (4-) repeat-loop check (cheap; runs always)       │
@@ -82,15 +83,15 @@ unchanged.
             └─────────────────────────────────────────────────────────┘
 ```
 
-## CARGO-v4: Decision-Centric Risk-Gated State Controller
+## CARGO-v4: Soft Goal-Field Risk-Gated State Controller
 
 CARGO remains a lightweight, training-free controller. The previous
-state/obligation hardening becomes v4 by adding a deterministic decision
-layer. It still does not add
+state/obligation hardening becomes v4 by adding a compact Soft Goal-Field
+Router. It still does not add
 fine-tuning, a separate judge, benchmark answer retrieval, or a tree-search
-planner. It changes the controller architecture so CARGO no longer asks the
-LLM to perform deterministic candidate selection when structured tool data is
-available. The control law is:
+planner. It changes the controller architecture so the LLM no longer has to
+re-derive the whole task every turn or decide alone whether a repeated branch
+is still useful. The control law is:
 
 ```
 observe
@@ -98,7 +99,8 @@ observe
 → update_incremental_state
 → update_obligation_graph
 → update_candidate_sets
-→ decision_engine_choose_next_step
+→ update_soft_goal_field
+→ router_choose_progress_candidate
 → validate_by_action_class
 → verify_commit_certificate_for_write_or_final
 → execute_or_repair
@@ -106,23 +108,31 @@ observe
 → terminate_when_goal_closed
 ```
 
-The latest controller hardening adds a **proof-carrying transactional
-transition layer** on top of the active task-frame stage machine. The model
-may propose and summarize a transition, but any `WRITE`, `IRREVERSIBLE`, or
-terminal `FINAL` now carries a `CommitCertificate` checked by the generic
-kernel before execution. The certificate is a list of machine-checkable
-`ProofObligation`s: active-goal consistency, required arguments, identity or
-order anchoring, task-frame consistency, selected candidates, full requested
-operation coverage, payment grounding, and terminal readiness where the
-adapter can prove those facts. The core owns the neutral certificate format;
-the adapters own the domain evidence.
+The latest controller hardening adds a **soft goal-field routing layer** on
+top of the active task-frame stage machine. The field tracks the current goal,
+confirmed facts, unresolved slots, current stage, recent failures, live
+hypotheses, progress momentum, friction penalties, and the active task frame.
+The model still proposes and summarizes, but CARGO also collects deterministic
+candidate actions from the stage machine, obligation guide, catalog/order
+retrievers, reservation progression, and write canonicalizers. The router
+chooses the next action by progress toward completion and uncertainty
+reduction, while downweighting repeated non-progress.
 
-This matters for tau-bench because the remaining failures were often not
-ungrounded tool calls. They were grounded but unproven transitions: partial
-retail mutations, reservation/profile facts trying to steer the active
-airline goal, or loop exits that were not tied to a proven terminal blocker.
-The proof layer keeps READ permissive while making commitment explicitly
-transactional.
+This matters for tau-bench because the latest failures were task-continuity
+failures: retail could recover after a wrong ZIP but still lose mixed-goal
+continuity, while airline could retrieve useful profile/search/reservation
+evidence and then fall into repeated generic `ASK_USER` or cached-profile
+loops. The goal field gives CARGO a small amount of persistence without a rigid
+plan: later evidence can recenter a bad hypothesis, but repeated branches
+accumulate friction and stop dominating.
+
+Proof-carrying commit certificates remain in the gate stack as strict
+WRITE/FINAL safety checks, but they are not the planner. Any `WRITE`,
+`IRREVERSIBLE`, or terminal `FINAL` still carries a `CommitCertificate`
+checked by the generic kernel before execution. The certificate proves
+active-goal consistency, required arguments, identity/order anchoring,
+selected candidates, full requested-operation coverage, payment grounding, and
+terminal readiness where the adapter can prove those facts.
 
 The active task-frame stage machine remains in place.
 User-bound task facts define the current goal frame; tool/cache observations
@@ -150,8 +160,9 @@ CARGO-v4 is split into a generic core plus pluggable adapters:
 - `src/cargo/core.py` defines the domain-neutral kernel: typed task state,
   layered facts, open slots, constraints, preferences, fallback rules,
   candidate sets, candidate objects, obligations, failed signatures, executed
-  writes, semantic validation hooks, completeness hooks, proof obligations,
-  commit certificates, terminal state, and the deterministic `DecisionEngine`.
+  writes, semantic validation hooks, completeness hooks, goal fields,
+  momentum/friction scoring, proof obligations, commit certificates, terminal
+  state, and the deterministic `DecisionEngine`.
 - `src/cargo/adapters/` contains benchmark/domain adapters.  The core does
   not name retail products, flights, reservations, or ACEBench answer
   patterns.  Adapters own tool schema enrichment, ID fields, non-ID semantic
@@ -181,6 +192,16 @@ candidate or next pipeline step. The current decision engine provides:
   filter first, availability/actionability filters next, fallback rules apply
   only after strict candidates are exhausted, and preferences only rank valid
   candidates.
+- **Soft Goal-Field Router**: one compact field per conversation tracks the
+  active goal, task frame, stage, unresolved slots, recent failures, progress
+  momentum, friction, and up to three live hypotheses. Model and deterministic
+  candidates are scored before gates; repeated generic asks, empty searches,
+  stale profile reads, and failed identity branches lose weight without
+  freezing the task.
+- **Recenter-on-evidence behavior**: bad early identity guesses, stale
+  reservation facts, and repeated non-progress branches are downweighted while
+  grounded alternatives such as user-supplied order IDs or active route/date
+  slots remain live.
 - **Candidate-set manager**: READ results are stored with source tool, query
   args, empty/exhausted status, rejected candidates, and selected candidates.
   Empty searches are not repeated without new evidence.
@@ -492,17 +513,24 @@ detection; self-consistency vote (mock client with `n>1`); counterfactual
 rollout (mock client); post-condition error detection; proposer JSON parsing;
 repair policy decisions; READ-permissive / WRITE-strict validation; airline
 obligation-guided search progression; task-frame isolation; no-auth catalog
-routing; proof-carrying commit certificates; post-write terminal response;
-and full agent loop behavior on mock environments.
+routing; soft goal-field momentum/friction routing; proof-carrying commit
+certificates; post-write terminal response; and full agent loop behavior on
+mock environments.
 
-Latest local verification in this workspace: `276` tests passed, compileall
+Latest local verification in this workspace: `282` tests passed, compileall
 passed, `git diff --check` passed, `python3 -m pip check` passed, and
 `bash run_project.sh --dry-run` resolved the benchmark configuration.
 Synthetic smoke passed. Classic tau-bench and ACEBench dependencies are
 present, but live tau-bench / ACEBench smoke tests still require either
 `OPENAI_API_KEY` or an OpenAI-compatible `OPENAI_BASE_URL`; without one, the
 smoke helper reports them as blocked and leaves exact rerun commands in
-`outputs/smoke/smoke_summary_proof.json`.
+`outputs/smoke/smoke_summary_goal_field.json`.
+
+Current limitation: the Soft Goal-Field Router improves continuity and loop
+suppression, but it does not yet synthesize every airline booking/update write
+from non-empty search results. The next bottleneck is an adapter-owned
+itinerary/payment/passenger selector that can produce complete airline write
+candidates for the router to score.
 
 ## What CARGO is — and isn't
 
@@ -521,7 +549,8 @@ retrieval.
 The novelty story is the *composition*: risk-class typing of tools
 (auto-induced) + class-specific calibrated abstention + selective
 self-consistency only on risky actions + deterministic argument grounding +
-generic semantic state/constraint gates + obligation-guided retrieval + named deterministic repair. None of the parts is
+generic semantic state/constraint gates + soft goal-field routing +
+obligation-guided retrieval + named deterministic repair. None of the parts is
 unprecedented; the integration as a coherent training-free architecture
 for parameterized tool-using LLM agents, with **per-class** calibrated
 abstention rather than syntactic guardrails, is what differentiates it
