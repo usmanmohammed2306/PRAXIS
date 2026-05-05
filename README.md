@@ -37,7 +37,8 @@ unchanged.
             │  (1)  Typed Working Memory  (deterministic)             │
             │       slots: goal, layered evidence, open slots,        │
             │              db_confirmed_facts, assumptions,           │
-            │              semantic task slots, phase locks,          │
+            │              active task frame, semantic task slots,     │
+            │              frame-conflict quarantine, phase locks,     │
             │              obligation graph, last_obs,                │
             │              last_error, budget_steps                   │
             │                                                         │
@@ -68,6 +69,10 @@ unchanged.
             │                                                         │
             │  (6)  Execute → obs                                     │
             │  (7)  Post-condition check (advisory)                   │
+
+            │  (8)  WM update (db_facts ← scalar keys in obs)         │
+            │  (9)  Loop until FINAL passes the gate or a successful   │
+            │       write emits its terminal response.                 │
             │  (8)  WM update                                        │
             │       top-level scalar obs may fill missing slots;      │
             │       nested object facts remain evidence unless an     │
@@ -98,6 +103,15 @@ observe
 → verify_state_transition
 → terminate_when_goal_closed
 ```
+
+The latest controller hardening adds an **active task-frame stage machine**.
+User-bound task facts define the current goal frame; tool/cache observations
+remain evidence, but conflicting historical reservations, routes, dates,
+cabins, insurance choices, or payment preferences are quarantined instead of
+silently retargeting the task. This is the single major architectural change
+motivated by the latest tau-bench traces: airline failures were drifting from
+the user's route into unrelated cached reservations, and retail catalog/count
+queries were being pulled into authentication and post-answer loops.
 
 The key rule is **retrieval-permissive, commitment-strict**:
 
@@ -155,6 +169,13 @@ candidate or next pipeline step. The current decision engine provides:
 - **Pipeline scheduler**: obligations move through intent binding,
   prerequisite retrieval, candidate search, candidate selection, secondary
   details, confirmation, write, verification, and termination.
+- **Active task-frame isolation**: cached tool facts can ground arguments and
+  candidates, but they do not overwrite user-bound route/date/cabin/product
+  intent. Adapter code owns domain-specific quarantine rules.
+- **Stage-machine routing**: no-auth product/count goals enter catalogue READs
+  before authentication; airline booking goals search flights instead of
+  scanning unrelated reservations; modify/cancel reservation goals still scan
+  grounded reservation IDs.
 - **Search termination policy**: direct and one-stop airline searches pivot
   once through allowed strategies and then terminate with a truthful blocker
   instead of looping.
@@ -178,6 +199,9 @@ candidate or next pipeline step. The current decision engine provides:
 - **Schema backstop for IDs**: adapter-declared ID fields remain opaque even
   if a synthesized schema is incomplete, so plain words cannot slip into
   fields such as `reservation_id`.
+- **Termination barrier**: after a successful state-changing action, CARGO
+  emits the user-facing `respond` expected by tau-bench and stops if no fresh
+  grounded mutation remains.
 
 The same class-specific validation remains: READ may retrieve grounded IDs
 from user/tool evidence while state is incomplete; WRITE and FINAL still run
@@ -312,6 +336,11 @@ python3 scripts/benchmark_setup.py --bench all --install
 ```
 
 By default the ACEBench helper installs the data/evaluation dependencies and
+skips ACEBench's pinned `vllm==0.6.1.post1` plus conflict-prone shared pins
+such as `openai`, `litellm`, `pydantic`, and `pandas`; `setup_env.sh` owns the
+model serving stack and filters upstream requirements so the CARGO runtime is
+not clobbered. To reproduce upstream ACEBench exactly in an isolated
+environment, run:
 skips upstream pins that would clobber the CARGO/tau-bench runtime:
 `openai==1.64.0`, `python-dotenv==1.0.1`, and `vllm==0.6.1.post1`.
 `setup_env.sh` owns the model-serving stack. To reproduce upstream ACEBench
@@ -437,13 +466,21 @@ obligation-guided search progression; task-frame isolation; no-auth catalog
 routing; post-write terminal response; and full agent loop behavior on mock
 environments.
 
+
+Latest local verification in this workspace: `251` tests passed. Benchmark
+setup found tau-bench and ACEBench under `external/`; tau-bench installed
+successfully after network approval, and ACEBench safe dependencies installed
+while `vllm` stayed skipped. Synthetic smoke passed. Live tau-bench
+retail/airline and ACEBench smoke require either `OPENAI_API_KEY` or an
+=======
 Latest local verification in this workspace: `267` tests passed, compileall
 passed, `git diff --check` passed, and `bash run_project.sh --dry-run`
 resolved the benchmark configuration. Synthetic smoke passed. Classic
 tau-bench and ACEBench dependencies are present, but live tau-bench /
 ACEBench smoke tests still require either `OPENAI_API_KEY` or an
 OpenAI-compatible `OPENAI_BASE_URL`; without one, the smoke helper reports
-them as blocked and leaves exact rerun commands.
+them as blocked and leaves exact rerun commands in
+`outputs/smoke/smoke_summary_latest.json`.
 
 ## What CARGO is — and isn't
 

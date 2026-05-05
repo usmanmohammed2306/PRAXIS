@@ -1,6 +1,7 @@
 # CARGO Known-Issue Ledger
 
 This ledger is the recovery record for the uploaded CARGO runs from
+`metrics (24).json` through `metrics (49).json`, their paired trajectories,
 `metrics (24).json` through `metrics (46).json`, their paired trajectories,
 and the local regression suite.  It is intentionally phrased by failure
 class rather than benchmark task answer, so it remains a test and design
@@ -29,12 +30,15 @@ Machine-readable companion: `docs/known_issues.json`.
 | metrics (38) | retail | 0.0 | 0.0 | 28.4 | 18 | 15 | 1 | 2 | 37 |
 | metrics (39) | airline | 0.0 | 0.0 | 39.2 | 72 | 42 | 8 | 22 | 28 |
 | metrics (40) | retail | 0.0 | 0.0 | 28.2 | 16 | 15 | 0 | 1 | 38 |
-| metrics (41) | ACEBench agent | 1.0 completion | n/a | 2.0 avg steps | n/a | n/a | n/a | n/a | 1.0 avg tool calls |
+| metrics (41) | ACE agent | 1.0 completion | - | 2.0 | 0 | 0 | 0 | 0 | 5 tool calls |
 | metrics (42) | airline | 0.0 | 0.0 | 49.8 | 39 | 22 | 7 | 10 | 61 |
 | metrics (43) | retail | 0.0 | 0.0 | 28.2 | 17 | 14 | 1 | 2 | 37 |
-| metrics (44) | ACEBench agent | 1.0 completion | n/a | 2.0 avg steps | n/a | n/a | n/a | n/a | 1.0 avg tool calls |
+| metrics (44) | ACE agent | 1.0 completion | - | 2.0 | 0 | 0 | 0 | 0 | 5 tool calls |
 | metrics (45) | airline | 0.0 | 0.0 | 47.4 | 46 | 27 | 6 | 13 | 54 |
 | metrics (46) | retail | 0.0 | 0.0 | 33.6 | 27 | 22 | 0 | 5 | 42 |
+| metrics (47) | airline | 0.0 | 0.0 | 50.2 | 37 | 22 | 5 | 10 | 63 |
+| metrics (48) | retail | 0.0 | 0.0 | 32.6 | 23 | 19 | 0 | 4 | 42 |
+| metrics (49) | ACE agent | 1.0 completion | - | 2.0 | 0 | 0 | 0 | 0 | 5 tool calls |
 
 ## Benchmark Context Used
 
@@ -67,6 +71,13 @@ Machine-readable companion: `docs/known_issues.json`.
   exhaustion, schedules pipeline stages, suppresses exhausted repeated
   searches, blocks premature ASK_USER questions, and terminates after a true
   blocker or successful write.
+- Active task-frame isolation is now explicit: user-bound goal facts are the
+  current frame, while conflicting historical tool/cache facts are evidence
+  only and are quarantined from semantic task slots by adapters.
+- Stage-machine routing now prevents pure catalog/count goals from entering
+  auth, prevents booking goals from scanning unrelated reservations, filters
+  invalid reservation IDs from scan queues, and emits the terminal `respond`
+  after a successful write.
 - Task-frame isolation keeps user-bound goal slots separate from nested
   candidate/reservation/profile facts, so tool observations add evidence
   without silently rewriting the current route/date/cabin/product objective.
@@ -125,6 +136,19 @@ Machine-readable companion: `docs/known_issues.json`.
 | Airline city names used as airport-code search args | metrics (39) searched with user-facing city names such as New York/Seattle, which tau-airline tools expect as three-letter airport codes | The adapter bound semantic route text but did not canonicalize search arguments or allow city/code semantic equivalence | Domain adapters translate ordinary route text into tool-native airport codes while the core still validates against the bound semantic city state; ambiguous regions match DB airport evidence but are not guessed as a search arg | `test_v4_airline_search_uses_airport_codes_but_matches_bound_city_state`, `test_v4_airline_region_word_matches_db_airport_without_canonicalizing_search_to_guess` | Fixed, verified |
 | Adapter-declared IDs can bypass grounding when schema is missing | metrics (39) showed invalid `get_reservation_details(reservation_id='though')` style calls in trajectories | Schema enrichment may be absent for a synthesized proposal, so plain-word ID arguments must have an adapter-level state backstop | Adapter ID fields are opaque identifiers even when the schema is weak; plain words are rejected before READ execution | `test_v4_adapter_id_backstop_rejects_plain_word_when_schema_is_missing` | Fixed, verified |
 | Structured payment IDs missing from typed state | Regression exposed by stricter forced-ID grounding | Cached order/profile payment fields were visible in evidence text but not as typed ID evidence | Payment, card, and certificate IDs are extracted from durable structured caches | `test_h2_complete_canonical_write_passes_completeness_gate` | Fixed, verified |
+| Cached reservation facts overwrite active airline goal | metrics (47) booked/search tasks drifted from New York→Seattle into cached DEN→LAS and other unrelated reservations after profile scan | Tool observations were being promoted into semantic task slots, so the last cached reservation became the active route/date/cabin frame | User-bound task-frame slots are protected; airline adapter quarantines historical route/date/cabin/insurance/payment facts from observations | `test_tool_observation_does_not_overwrite_user_bound_task_frame`, `test_v4_booking_goal_does_not_scan_unrelated_reservations` | Fixed, verified |
+| Booking intent scans unrelated reservations | metrics (47) booking tasks scanned every reservation before searching requested flights | The reservation-advance stage treated every airline booking/flight word as requiring reservation retrieval | Booking goals search flight candidates; only modify/cancel/reservation goals scan grounded reservations | `test_v4_booking_goal_does_not_scan_unrelated_reservations`, `test_v4_airline_search_uses_airport_codes_but_matches_bound_city_state` | Fixed, verified |
+| Invalid reservation scan IDs survive typed state | metrics (47) included invalid `reservation_id='though'` and `reservation_id=None` attempts | Scan queue trusted typed evidence too broadly after earlier recovery steps | Reservation scan accepts only tau-shaped reservation IDs and skips plain words / null sentinels | `test_v4_reservation_scan_skips_plain_words_and_none`, `test_v4_adapter_id_backstop_rejects_plain_word_when_schema_is_missing` | Fixed, verified |
+| Retail no-auth product query enters auth and loops after answer | metrics (48) product-count tasks asked for credentials before catalog reads and continued after the count answer | No explicit stage boundary separated catalog-only goals from account/order goals | Active task-frame stage routes pure catalog/count goals through `list_all_product_types` and `get_product_details`, then treats the computed answer as terminal | `test_v4_task_frame_routes_no_auth_product_query_before_auth`, `test_v4_task_frame_fetches_product_details_after_catalog`, product-count finalizer tests | Fixed, verified |
+| Successful retail write lacks terminal respond | metrics (48) exchange writes executed but trajectories ended without the user-facing final response tau-bench expects | Mutation success marked task complete before emitting `respond` | Successful writes now emit one terminal response and stop when no fresh mutation remains | `test_v4_successful_write_emits_terminal_respond`, `test_f5_completed_mutation_gate_blocks_reexecution` | Fixed, verified |
+
+## Remaining Limitations
+
+- Classic tau-bench and ACEBench are present in `external/`; tau-bench
+  installed locally after network approval. ACEBench safe data/eval
+  dependencies installed, while upstream `vllm==0.6.1.post1` and
+  conflict-prone shared pins remain intentionally skipped unless
+  `--include-ace-vllm` is used in an isolated environment. Live smoke still
 | Airline reservation observation overwrote booking goal | metrics (42)/(45) booking tasks bound New York→Seattle May 20, then profile/reservation reads shifted searches to unrelated stored trips such as DEN→LAS May 27 | Tool observation fields were promoted into semantic task slots without preserving user-slot provenance | User-bound task-frame slots keep provenance; tool object fields are evidence, not automatic goal updates | `test_v4_airline_reservation_obs_does_not_overwrite_booking_anchor`, `test_tool_observation_does_not_overwrite_user_bound_date` | Fixed, verified |
 | New booking scanned existing reservations before itinerary search | metrics (42)/(45) new-booking tasks retrieved reservation details after profile instead of searching the requested route/date | Reservation-scan advancement did not distinguish new booking intent from modification/cancel intent | Booking intent suppresses reservation scans and keeps the pipeline on grounded flight search | `test_v4_booking_task_does_not_scan_reservations_before_search` | Fixed, verified |
 | Pure product-count task asked for identity | metrics (46) included catalog/count requests that burned turns on auth-like asks despite no account/order operation | The no-auth override caught placeholder lookup tools but not model-proposed `respond`/ASK_USER actions | Pure catalog/count goals route to `list_all_product_types` or grounded `get_product_details` before identity collection | `test_v4_no_auth_product_query_routes_to_catalog_read` | Fixed, verified |
@@ -147,6 +171,14 @@ Machine-readable companion: `docs/known_issues.json`.
 
 ## Verification
 
+- `python3 -m unittest tests.test_cargo`: 251 local regression tests passed.
+- `python3 -m compileall src tests`: passed.
+- `git diff --check`: passed.
+- `bash run_project.sh --dry-run`: passed configuration resolution without
+  launching a model server or benchmark run.
+- `python3 scripts/benchmark_setup.py --bench all --install --json-out outputs/smoke/benchmark_setup_latest.json`: tau-bench install and ACEBench safe-dependency install completed after network approval.
+- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_latest.json`: synthetic checks passed offline; tau retail/airline and ACE live smoke were honestly marked blocked because no `OPENAI_API_KEY` or `OPENAI_BASE_URL` was present.
+- `python3 scripts/parse_smoke_results.py --smoke-summary outputs/smoke/smoke_summary_latest.json --json-out outputs/smoke/smoke_compact_latest.json`: passed.
 - `python3 -m unittest tests.test_cargo -v`: 267 local regression tests passed.
 - `python3 -m compileall src tests scripts`: passed.
 - `python3 scripts/benchmark_setup.py --bench all --install`: passed with

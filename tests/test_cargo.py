@@ -368,6 +368,29 @@ class TestWorkingMemory(unittest.TestCase):
 
         self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
 
+    def test_tool_observation_does_not_overwrite_user_bound_task_frame(self) -> None:
+        wm = WorkingMemory()
+        text = "Book an economy flight from New York to Seattle on May 20th."
+        wm.absorb_user_message(text)
+        kernel = GenericCargoKernel(TauAirlineAdapter())
+        kernel.observe_user_message(wm, text)
+
+        obs = {
+            "reservation_id": "HKEG34",
+            "origin": "DEN",
+            "destination": "LAS",
+            "cabin": "business",
+            "flights": [{"date": "2024-05-27"}],
+            "insurance": "yes",
+        }
+        wm.absorb_observation(obs)
+        kernel.observe_tool_result(wm, "get_reservation_details", obs)
+
+        self.assertEqual(wm.semantic_slots["origin"], "New York")
+        self.assertEqual(wm.semantic_slots["destination"], "Seattle")
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
+        self.assertEqual(wm.semantic_slots["cabin"], "economy")
+        self.assertIn("HKEG34", wm.typed_evidence_for("reservation_id"))
     def test_tool_observation_does_not_overwrite_user_bound_date(self) -> None:
         wm = WorkingMemory()
         wm.absorb_user_message("Book the flight on May 20th.")
@@ -4657,6 +4680,11 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
                 cls=RiskClass.READ,
                 arg_semantic_fields=["origin", "destination", "date"],
             ),
+            "get_reservation_details": ToolEffectSchema(
+                name="get_reservation_details",
+                cls=RiskClass.READ,
+                arg_id_fields=["reservation_id"],
+            ),
             "respond": ToolEffectSchema(name="respond", cls=RiskClass.FINAL),
         }
         return agent
@@ -4938,6 +4966,142 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
             wm,
         )
         self.assertTrue(gate.ok, gate.reason)
+
+    def test_v4_booking_goal_does_not_scan_unrelated_reservations(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "Book a flight from New York to Seattle on May 20th. "
+            "My user id is alex_smith_42."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.absorb_observation({"reservations": ["NO6JO3", "HKEG34"]})
+        repeated = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "alex_smith_42"},
+            declared_class=RiskClass.READ,
+        )
+
+        self.assertIsNone(agent._advance_reservation_retrieval(repeated, wm))
+
+    def test_v4_reservation_scan_skips_plain_words_and_none(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        wm.goal = "change my return flight reservation"
+        wm.typed_values["reservation_id"] = ["though", "None", "Z7GOZK"]
+        repeated = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "olivia_gonzalez_2305"},
+            declared_class=RiskClass.READ,
+        )
+
+        result = agent._advance_reservation_retrieval(repeated, wm)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.args["reservation_id"], "Z7GOZK")  # type: ignore[union-attr]
+
+    def test_v4_task_frame_routes_no_auth_product_query_before_auth(self) -> None:
+        agent = self._make_retail_agent()
+        agent.schemas.update({
+            "list_all_product_types": ToolEffectSchema(
+                name="list_all_product_types",
+                cls=RiskClass.READ,
+            ),
+            "get_product_details": ToolEffectSchema(
+                name="get_product_details",
+                cls=RiskClass.READ,
+                arg_id_fields=["product_id"],
+            ),
+        })
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are currently available?"
+        wm.absorb_user_message(wm.goal)
+        ask_auth = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="Please provide your user ID.",
+        )
+
+        replacement = agent._task_frame_stage_action(ask_auth, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "list_all_product_types")  # type: ignore[union-attr]
+
+    def test_v4_task_frame_fetches_product_details_after_catalog(self) -> None:
+        agent = self._make_retail_agent()
+        agent.schemas["get_product_details"] = ToolEffectSchema(
+            name="get_product_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["product_id"],
+        )
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are currently available?"
+        wm.product_types = {"T-Shirt": "1656367028"}
+        ask_auth = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="What is your user ID?",
+        )
+
+        replacement = agent._task_frame_stage_action(ask_auth, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "get_product_details")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["product_id"], "1656367028")  # type: ignore[union-attr]
+
+    def test_v4_successful_write_emits_terminal_respond(self) -> None:
+        import src.cargo.cargo_agent as cargo_agent_module
+        from src.cargo.cargo_agent import CargoAgent
+
+        class _SolveResult:
+            def __init__(self, **kwargs: Any) -> None:
+                self.__dict__.update(kwargs)
+
+        old_action = cargo_agent_module.Action
+        old_solve_result = cargo_agent_module.SolveResult
+        cargo_agent_module.Action = _Action
+        cargo_agent_module.SolveResult = _SolveResult
+        try:
+            agent = CargoAgent.__new__(CargoAgent)
+            agent.client = MockClient([
+                _proposer_json(
+                    name="cancel_order",
+                    args={},
+                    declared_class="WRITE",
+                    thought="commit grounded cancellation",
+                ),
+                [_proposer_json(name="cancel_order", args={}, declared_class="WRITE")] * 3,
+                json.dumps({"predicted_obs": "{}", "goal_still_reachable": True}),
+            ])
+            agent.model = "test"
+            agent.temperature = 0.0
+            agent.wiki = ""
+            agent.adapter = SyntheticGenericAdapter()
+            agent.kernel = GenericCargoKernel(agent.adapter)
+            agent.schemas = {
+                "cancel_order": ToolEffectSchema(name="cancel_order", cls=RiskClass.WRITE)
+            }
+            agent.calibration = default_calibration()
+
+            env = MockEnv(
+                "Cancel the order now.",
+                [
+                    lambda action: _StepResp('{"status":"ok"}', reward=0.0, done=False),
+                    lambda action: _StepResp("", reward=1.0, done=True),
+                ],
+            )
+
+            result = agent.solve(env, max_num_steps=5)
+
+            self.assertEqual([a.name for a in env.actions_executed], ["cancel_order", "respond"])
+            self.assertEqual(result.reward, 1.0)
+            self.assertEqual(result.info["cargo_stats"]["actions_executed"], 2)
+        finally:
+            cargo_agent_module.Action = old_action
+            cargo_agent_module.SolveResult = old_solve_result
 
     def test_v4_airline_region_word_matches_db_airport_without_canonicalizing_search_to_guess(self) -> None:
         adapter = TauAirlineAdapter()

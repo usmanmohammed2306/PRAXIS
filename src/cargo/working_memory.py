@@ -42,6 +42,11 @@ class WorkingMemory:
     # DB-confirmed slots outrank later user claims.
     semantic_slots: Dict[str, Any] = field(default_factory=dict)
     db_confirmed_slots: Dict[str, bool] = field(default_factory=dict)
+    # User-bound slots define the active task frame.  Tool observations remain
+    # evidence, but conflicting cached objects must not silently retarget the
+    # current goal.
+    user_bound_slots: Dict[str, bool] = field(default_factory=dict)
+    semantic_conflicts: List[Dict[str, Any]] = field(default_factory=list)
     # Auth-loop guard: how many times we've already asked the user for identity
     # credentials.  The override stops asking after 2 attempts to avoid an
     # infinite ASK_USER bounce.
@@ -69,6 +74,11 @@ class WorkingMemory:
     # controller checks this before each proposer call so no more tools run
     # after the task is complete.
     task_completed: bool = False
+    # Set after the controller emits the terminal user-facing confirmation
+    # following a successful write.  tau-bench counts the write and the final
+    # response; stopping immediately after mutation leaves otherwise-correct
+    # trajectories unfinished.
+    post_write_responded: bool = False
     # Set once we've already emitted a "give up on auth" FINAL.  Prevents the
     # exact same FINAL from being emitted twice in a row.
     auth_giveup_emitted: bool = False
@@ -201,6 +211,7 @@ class WorkingMemory:
             kpath = f"{prefix}.{k}" if prefix else str(k)
             if isinstance(v, (str, int, float)) and v not in (None, ""):
                 self._add_typed_value(kpath, v)
+                if not prefix:
                 # Tool observations often contain nested object facts such as
                 # reservation.flights[0].date.  Those are evidence about an
                 # observed candidate, not necessarily the user's active task
@@ -265,9 +276,21 @@ class WorkingMemory:
                 self.db_confirmed_slots[key] = True
                 return True
             return False
+        if cur not in (None, "") and confirmed and self.user_bound_slots.get(key):
+            self.semantic_conflicts.append({
+                "slot": key,
+                "active": cur,
+                "observed": val,
+                "reason": "tool_observation_conflicts_with_active_task_frame",
+            })
+            if len(self.semantic_conflicts) > 16:
+                self.semantic_conflicts = self.semantic_conflicts[-16:]
+            return False
         self.semantic_slots[key] = val
         if confirmed:
             self.db_confirmed_slots[key] = True
+        else:
+            self.user_bound_slots[key] = True
         return True
 
     def _add_semantic_list_value(self, key: str, value: Any, *, confirmed: bool) -> bool:
@@ -547,6 +570,13 @@ class WorkingMemory:
             parts.append(
                 "open_obligations: "
                 + ", ".join(sorted(self.task_state.unresolved_obligations))[:180]
+            )
+        if self.semantic_conflicts:
+            latest = self.semantic_conflicts[-1]
+            parts.append(
+                "task_frame_conflict: "
+                f"{latest.get('slot')} kept {latest.get('active')} "
+                f"over observed {latest.get('observed')}"
             )
         parts += [
             "user_facts:",
