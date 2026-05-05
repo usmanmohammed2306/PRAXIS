@@ -1,8 +1,7 @@
 # CARGO Known-Issue Ledger
 
 This ledger is the recovery record for the uploaded CARGO runs from
-`metrics (24).json` through `metrics (49).json`, their paired trajectories,
-`metrics (24).json` through `metrics (46).json`, their paired trajectories,
+`metrics (24).json` through `metrics (52).json`, their paired trajectories,
 and the local regression suite.  It is intentionally phrased by failure
 class rather than benchmark task answer, so it remains a test and design
 artifact rather than an answer key.
@@ -39,6 +38,9 @@ Machine-readable companion: `docs/known_issues.json`.
 | metrics (47) | airline | 0.0 | 0.0 | 50.2 | 37 | 22 | 5 | 10 | 63 |
 | metrics (48) | retail | 0.0 | 0.0 | 32.6 | 23 | 19 | 0 | 4 | 42 |
 | metrics (49) | ACE agent | 1.0 completion | - | 2.0 | 0 | 0 | 0 | 0 | 5 tool calls |
+| metrics (50) | ACE agent | 1.0 completion | - | 2.0 | 0 | 0 | 0 | 0 | 5 tool calls |
+| metrics (51) | airline | 0.0 | 0.0 | 40.2 | 66 | 43 | 2 | 21 | 34 |
+| metrics (52) | retail | 0.0 | 0.0 | 27.2 | 18 | 13 | 0 | 5 | 35 |
 
 ## Benchmark Context Used
 
@@ -57,15 +59,16 @@ Machine-readable companion: `docs/known_issues.json`.
 
 - Generic core: `src/cargo/core.py` owns layered task state, fact precedence,
   open slots, constraints, preferences, fallback rules, candidate sets,
-  obligations, semantic validation hooks, completeness hooks, diagnostics, and
-  the deterministic decision engine.
+  obligations, semantic validation hooks, completeness hooks, proof
+  obligations, commit certificates, diagnostics, and the deterministic
+  decision engine.
 - Adapters: `src/cargo/adapters/` owns benchmark/domain knowledge.  Current
   adapters are `tau_retail`, `tau_airline`, `acebench`, and
   `synthetic_generic`.
 - CARGO-v4 keeps action-class-specific validation and adds deterministic
   decision before commitment. READ is retrieval-permissive and may build
   incomplete state; WRITE/IRREVERSIBLE/FINAL are commitment-strict and require
-  semantic completeness.
+  semantic completeness plus a proof-carrying commit certificate.
 - The decision engine stores candidate sets from READ actions, applies hard
   constraints before preferences, applies fallbacks only after strict
   exhaustion, schedules pipeline stages, suppresses exhausted repeated
@@ -86,6 +89,11 @@ Machine-readable companion: `docs/known_issues.json`.
   remain auth-strict.
 - Successful WRITE/IRREVERSIBLE actions emit a post-write `respond` before
   terminal completion, unless another distinct grounded mutation is pending.
+- Proof-carrying commits now require adapter-verifiable obligations before
+  mutation or terminal commitment. The core owns the neutral certificate type;
+  tau-retail and tau-airline adapters own domain evidence for selected
+  candidates, active task-frame consistency, identity/order anchoring, payment
+  grounding, and full requested-operation coverage.
 - Obligation guidance converts repeated or generic ASK/FINAL proposals into
   the next grounded READ when user/tool evidence already identifies an open
   information need.
@@ -141,18 +149,11 @@ Machine-readable companion: `docs/known_issues.json`.
 | Invalid reservation scan IDs survive typed state | metrics (47) included invalid `reservation_id='though'` and `reservation_id=None` attempts | Scan queue trusted typed evidence too broadly after earlier recovery steps | Reservation scan accepts only tau-shaped reservation IDs and skips plain words / null sentinels | `test_v4_reservation_scan_skips_plain_words_and_none`, `test_v4_adapter_id_backstop_rejects_plain_word_when_schema_is_missing` | Fixed, verified |
 | Retail no-auth product query enters auth and loops after answer | metrics (48) product-count tasks asked for credentials before catalog reads and continued after the count answer | No explicit stage boundary separated catalog-only goals from account/order goals | Active task-frame stage routes pure catalog/count goals through `list_all_product_types` and `get_product_details`, then treats the computed answer as terminal | `test_v4_task_frame_routes_no_auth_product_query_before_auth`, `test_v4_task_frame_fetches_product_details_after_catalog`, product-count finalizer tests | Fixed, verified |
 | Successful retail write lacks terminal respond | metrics (48) exchange writes executed but trajectories ended without the user-facing final response tau-bench expects | Mutation success marked task complete before emitting `respond` | Successful writes now emit one terminal response and stop when no fresh mutation remains | `test_v4_successful_write_emits_terminal_respond`, `test_f5_completed_mutation_gate_blocks_reexecution` | Fixed, verified |
-
-## Remaining Limitations
-
-- Classic tau-bench and ACEBench are present in `external/`; tau-bench
-  installed locally after network approval. ACEBench safe data/eval
-  dependencies installed, while upstream `vllm==0.6.1.post1` and
-  conflict-prone shared pins remain intentionally skipped unless
-  `--include-ace-vllm` is used in an isolated environment. Live smoke still
 | Airline reservation observation overwrote booking goal | metrics (42)/(45) booking tasks bound New York→Seattle May 20, then profile/reservation reads shifted searches to unrelated stored trips such as DEN→LAS May 27 | Tool observation fields were promoted into semantic task slots without preserving user-slot provenance | User-bound task-frame slots keep provenance; tool object fields are evidence, not automatic goal updates | `test_v4_airline_reservation_obs_does_not_overwrite_booking_anchor`, `test_tool_observation_does_not_overwrite_user_bound_date` | Fixed, verified |
 | New booking scanned existing reservations before itinerary search | metrics (42)/(45) new-booking tasks retrieved reservation details after profile instead of searching the requested route/date | Reservation-scan advancement did not distinguish new booking intent from modification/cancel intent | Booking intent suppresses reservation scans and keeps the pipeline on grounded flight search | `test_v4_booking_task_does_not_scan_reservations_before_search` | Fixed, verified |
 | Pure product-count task asked for identity | metrics (46) included catalog/count requests that burned turns on auth-like asks despite no account/order operation | The no-auth override caught placeholder lookup tools but not model-proposed `respond`/ASK_USER actions | Pure catalog/count goals route to `list_all_product_types` or grounded `get_product_details` before identity collection | `test_v4_no_auth_product_query_routes_to_catalog_read` | Fixed, verified |
 | Successful write did not give simulator a terminal response | metrics (43)/(46) retail traces executed useful writes but did not always produce the post-write `respond` needed for tau-bench STOP/reward | The solve loop marked the task complete and broke before the post-write response path | Terminal completion is deferred until after a deterministic post-write `respond`, unless another distinct grounded mutation remains | `test_solve_emits_auto_respond_after_write`, `test_solve_post_write_responded_flag_set` | Fixed, verified |
+| Grounded write lacks explicit transition proof | metrics (51)/(52) showed cleaner operational traces but remaining 0-success runs still depended on implicit LLM/stage decisions for commitment, candidate coverage, and terminal readiness | The gate stack could reject bad actions but did not require a positive proof certificate that a proposed transition closes the active task frame | WRITE/IRREVERSIBLE/FINAL actions must carry adapter-verifiable proof obligations before commit | `test_v4_retail_commit_certificate_blocks_partial_exchange`, `test_v4_retail_commit_certificate_accepts_complete_exchange`, `test_v4_write_gate_requires_commit_certificate` | Fixed, verified |
 
 ## Remaining Limitations
 
@@ -165,21 +166,14 @@ Machine-readable companion: `docs/known_issues.json`.
   needs a model endpoint/API key.
 - Airline full booking selection is guarded for slot completeness, state
   consistency, obligation-guided search progression, empty-search exhaustion,
-  and premature payment asks. A complete deterministic cheapest-itinerary
-  selector after non-empty search results remains the next extension. CARGO
-  remains a lightweight risk-gated controller, not a full tree-search planner.
+  premature payment asks, and commit certificates. A complete deterministic
+  cheapest/fastest itinerary selector after non-empty search results remains
+  the next extension. CARGO remains a lightweight risk-gated controller, not a
+  full tree-search planner.
 
 ## Verification
 
-- `python3 -m unittest tests.test_cargo`: 251 local regression tests passed.
-- `python3 -m compileall src tests`: passed.
-- `git diff --check`: passed.
-- `bash run_project.sh --dry-run`: passed configuration resolution without
-  launching a model server or benchmark run.
-- `python3 scripts/benchmark_setup.py --bench all --install --json-out outputs/smoke/benchmark_setup_latest.json`: tau-bench install and ACEBench safe-dependency install completed after network approval.
-- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_latest.json`: synthetic checks passed offline; tau retail/airline and ACE live smoke were honestly marked blocked because no `OPENAI_API_KEY` or `OPENAI_BASE_URL` was present.
-- `python3 scripts/parse_smoke_results.py --smoke-summary outputs/smoke/smoke_summary_latest.json --json-out outputs/smoke/smoke_compact_latest.json`: passed.
-- `python3 -m unittest tests.test_cargo -v`: 267 local regression tests passed.
+- `python3 -m unittest tests.test_cargo`: 276 local regression tests passed.
 - `python3 -m compileall src tests scripts`: passed.
 - `python3 scripts/benchmark_setup.py --bench all --install`: passed with
   tau-bench installed and ACEBench conflicting pins skipped by default.
@@ -187,6 +181,7 @@ Machine-readable companion: `docs/known_issues.json`.
 - `git diff --check`: passed.
 - `bash run_project.sh --dry-run`: passed configuration resolution without
   launching a model server or benchmark run.
-- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_latest.json`:
+- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_proof.json`:
   synthetic checks passed; tau retail/airline and ACE live smoke are blocked
   unless `OPENAI_API_KEY` or `OPENAI_BASE_URL` is present.
+- `python3 scripts/parse_smoke_results.py --smoke-summary outputs/smoke/smoke_summary_proof.json --json-out outputs/smoke/smoke_compact_proof.json`: passed.

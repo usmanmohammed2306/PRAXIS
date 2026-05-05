@@ -4844,6 +4844,181 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         self.assertEqual(action.args["item_ids"], ["1151293680", "8174673829"])  # type: ignore[union-attr]
         self.assertEqual(action.args["new_item_ids"], ["7706410293", "7747408585"])  # type: ignore[union-attr]
 
+    def test_v4_retail_commit_certificate_blocks_partial_exchange(self) -> None:
+        agent = self._make_retail_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "Exchange order #W2378156: the mechanical keyboard should be "
+            "clicky full-size RGB, and no backlight is okay if RGB is not "
+            "available. Also exchange the smart thermostat for one compatible "
+            "with Google Home."
+        )
+        wm.auth_user_id = "yusuf_rossi_9620"
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "user_id": "yusuf_rossi_9620",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "credit_card_9513926"}],
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "1656367028",
+                    "item_id": "1151293680",
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+                },
+                {
+                    "name": "Smart Thermostat",
+                    "product_id": "4896585277",
+                    "item_id": "8174673829",
+                    "options": {"compatibility": "Apple HomeKit", "color": "black"},
+                },
+            ],
+        }
+        wm.product_details["1656367028"] = self._keyboard_details()
+        wm.product_details["4896585277"] = self._thermostat_details()
+        partial = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={
+                "order_id": "#W2378156",
+                "item_ids": ["8174673829"],
+                "new_item_ids": ["7747408585"],
+                "payment_method_id": "credit_card_9513926",
+            },
+            declared_class=RiskClass.WRITE,
+            bypass_gates=True,
+        )
+
+        result = agent._kernel().validate_commit_certificate(
+            partial,
+            agent.schemas["exchange_delivered_order_items"],
+            wm,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.gate, "commit_certificate")
+        self.assertEqual(result.reason, "write_is_partial_for_active_goal")
+        obligations = {
+            item["name"]: item
+            for item in result.diagnostics["certificate"]["obligations"]
+        }
+        missing = obligations["all_requested_items_included"]["evidence"]["missing_item_ids"]
+        self.assertEqual(missing, ["1151293680"])
+
+    def test_v4_retail_commit_certificate_accepts_complete_exchange(self) -> None:
+        agent = self._make_retail_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "Exchange order #W2378156: the mechanical keyboard should be "
+            "clicky full-size RGB, and no backlight is okay if RGB is not "
+            "available. Also exchange the smart thermostat for one compatible "
+            "with Google Home."
+        )
+        wm.auth_user_id = "yusuf_rossi_9620"
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "user_id": "yusuf_rossi_9620",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "credit_card_9513926"}],
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "1656367028",
+                    "item_id": "1151293680",
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+                },
+                {
+                    "name": "Smart Thermostat",
+                    "product_id": "4896585277",
+                    "item_id": "8174673829",
+                    "options": {"compatibility": "Apple HomeKit", "color": "black"},
+                },
+            ],
+        }
+        wm.product_details["1656367028"] = self._keyboard_details()
+        wm.product_details["4896585277"] = self._thermostat_details()
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={
+                "order_id": "#W2378156",
+                "item_ids": ["1151293680", "8174673829"],
+                "new_item_ids": ["7706410293", "7747408585"],
+                "payment_method_id": "credit_card_9513926",
+            },
+            declared_class=RiskClass.WRITE,
+            bypass_gates=True,
+        )
+
+        failing, diag = agent._run_gates(
+            action,
+            agent.schemas["exchange_delivered_order_items"],
+            wm,
+            [],
+            CargoStats(),
+        )
+
+        self.assertIsNone(failing, failing.reason if failing else "")
+        self.assertIn("commit_certificate", diag["gates_run"])
+        self.assertTrue(wm.last_commit_certificate["ok"])
+        self.assertEqual(
+            wm.last_commit_certificate["selected_candidate_ids"],
+            ["7706410293", "7747408585"],
+        )
+
+    def test_v4_write_gate_requires_commit_certificate(self) -> None:
+        agent = self._make_retail_agent()
+        wm = WorkingMemory()
+        wm.goal = (
+            "Exchange the mechanical keyboard for a clicky full-size RGB one, "
+            "and no backlight is okay if RGB is not available. Also exchange "
+            "the smart thermostat for one compatible with Google Home."
+        )
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "user_id": "yusuf_rossi_9620",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "credit_card_9513926"}],
+            "items": [
+                {
+                    "name": "Mechanical Keyboard",
+                    "product_id": "1656367028",
+                    "item_id": "1151293680",
+                    "options": {"switch type": "linear", "backlight": "RGB", "size": "full size"},
+                },
+                {
+                    "name": "Smart Thermostat",
+                    "product_id": "4896585277",
+                    "item_id": "8174673829",
+                    "options": {"compatibility": "Apple HomeKit", "color": "black"},
+                },
+            ],
+        }
+        wm.product_details["1656367028"] = self._keyboard_details()
+        wm.product_details["4896585277"] = self._thermostat_details()
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={
+                "order_id": "#W2378156",
+                "item_ids": ["1151293680", "8174673829"],
+                "new_item_ids": ["7706410293", "7747408585"],
+                "payment_method_id": "credit_card_9513926",
+            },
+            declared_class=RiskClass.WRITE,
+            bypass_gates=True,
+        )
+
+        failing, diag = agent._run_gates(
+            action,
+            agent.schemas["exchange_delivered_order_items"],
+            wm,
+            [],
+            CargoStats(),
+        )
+
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "commit_certificate")
+        self.assertIn("commit_certificate", diag["gates_failed"])
+        self.assertEqual(failing.reason, "write_lacks_identity_or_user_supplied_order_anchor")
+
     def test_v4_retail_exact_keyboard_unavailable_commits_thermostat_only_when_requested(self) -> None:
         agent = self._make_retail_agent()
         wm = WorkingMemory()

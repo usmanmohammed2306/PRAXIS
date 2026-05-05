@@ -116,6 +116,73 @@ class CandidateSelection:
 
 
 @dataclass
+class ProofObligation:
+    """Machine-checkable proof item for a proposed task transition."""
+
+    name: str
+    ok: bool
+    reason: str = ""
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "ok": self.ok,
+            "reason": self.reason,
+            "evidence": dict(self.evidence),
+        }
+
+
+@dataclass
+class CommitCertificate:
+    """Proof-carrying certificate for WRITE/IRREVERSIBLE/FINAL actions.
+
+    The core owns the neutral container and verifier.  Adapters own the
+    domain-specific obligations that prove selected candidates and task-frame
+    transitions are correct.
+    """
+
+    action_name: str
+    action_signature: str = ""
+    certificate_type: str = "generic"
+    obligations: List[ProofObligation] = field(default_factory=list)
+    selected_candidate_ids: List[str] = field(default_factory=list)
+    rejected_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    ok: bool = True
+    reason: str = ""
+
+    def require(self, name: str, ok: bool, reason: str = "", **evidence: Any) -> bool:
+        obligation = ProofObligation(
+            name=str(name),
+            ok=bool(ok),
+            reason="ok" if ok else str(reason or "failed"),
+            evidence=dict(evidence),
+        )
+        self.obligations.append(obligation)
+        self.finalize()
+        return obligation.ok
+
+    def finalize(self) -> "CommitCertificate":
+        failed = [o for o in self.obligations if not o.ok]
+        self.ok = not failed
+        self.reason = failed[0].reason if failed else "ok"
+        return self
+
+    def to_dict(self) -> Dict[str, Any]:
+        self.finalize()
+        return {
+            "action_name": self.action_name,
+            "action_signature": self.action_signature,
+            "certificate_type": self.certificate_type,
+            "ok": self.ok,
+            "reason": self.reason,
+            "selected_candidate_ids": list(self.selected_candidate_ids),
+            "rejected_candidates": list(self.rejected_candidates),
+            "obligations": [o.to_dict() for o in self.obligations],
+        }
+
+
+@dataclass
 class Obligation:
     """Domain-neutral unit of task closure.
 
@@ -425,6 +492,14 @@ class CargoDomainAdapter(Protocol):
     def validate_final_completeness(self, action: ProposedAction, wm: "WorkingMemory") -> Optional[GateResult]:
         ...
 
+    def build_commit_certificate(
+        self,
+        action: ProposedAction,
+        schema: ToolEffectSchema,
+        wm: "WorkingMemory",
+    ) -> CommitCertificate:
+        ...
+
 
 class BaseCargoAdapter:
     """Domain-neutral adapter default used by tests and unknown benchmarks."""
@@ -502,6 +577,49 @@ class BaseCargoAdapter:
                 obligations=sorted(wm.task_state.unresolved_obligations),
             )
         return None
+
+    def build_commit_certificate(
+        self,
+        action: ProposedAction,
+        schema: ToolEffectSchema,
+        wm: "WorkingMemory",
+    ) -> CommitCertificate:
+        cert = CommitCertificate(
+            action_name=action.name,
+            action_signature=action.signature(),
+            certificate_type=f"{self.name}.generic_commit",
+        )
+        cert.require(
+            "commitment_action_class",
+            action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE, RiskClass.FINAL),
+            "action_class_does_not_require_commit_certificate",
+            declared_class=action.declared_class.value,
+        )
+        missing = [
+            name for name in (schema.required_params or [])
+            if action.args.get(name) in (None, "", [])
+        ]
+        cert.require(
+            "required_args_present",
+            not missing,
+            "certificate_missing_required_args",
+            missing=missing,
+        )
+        if action.declared_class == RiskClass.FINAL:
+            cert.require(
+                "final_has_user_visible_resolution",
+                bool(action.user_text or wm.task_state.terminal_status or action.name),
+                "final_without_user_visible_resolution",
+                terminal_status=wm.task_state.terminal_status,
+            )
+        else:
+            cert.require(
+                "write_signature_present",
+                bool(action.name),
+                "write_without_tool_name",
+                arg_keys=sorted(action.args.keys()),
+            )
+        return cert.finalize()
 
     def validate_candidate(self, candidate: CandidateObject, state: TaskState) -> GateResult:
         if not candidate.available:
@@ -715,6 +833,29 @@ class GenericCargoKernel:
 
     def validate_final_completeness(self, action: ProposedAction, wm: "WorkingMemory") -> Optional[GateResult]:
         return self.adapter.validate_final_completeness(action, wm)
+
+    def validate_commit_certificate(
+        self,
+        action: ProposedAction,
+        schema: ToolEffectSchema,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        self._ensure_state_meta(wm)
+        cert = self.adapter.build_commit_certificate(action, schema, wm).finalize()
+        try:
+            wm.last_commit_certificate = cert.to_dict()
+        except Exception:
+            pass
+        if not cert.ok:
+            return GateResult.failing(
+                "commit_certificate",
+                cert.reason or "commit_certificate_failed",
+                certificate=cert.to_dict(),
+            )
+        return GateResult.passing(
+            "commit_certificate",
+            certificate=cert.to_dict(),
+        )
 
     def _ensure_state_meta(self, wm: "WorkingMemory") -> None:
         state = wm.task_state

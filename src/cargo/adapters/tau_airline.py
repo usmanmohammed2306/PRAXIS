@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from ..core import BaseCargoAdapter, Obligation, Preference, TaskState, normalize_key
+from ..core import BaseCargoAdapter, CommitCertificate, Obligation, Preference, TaskState, normalize_key
 from ..schemas import GateResult, ProposedAction, ToolEffectSchema
 
 
@@ -289,6 +289,133 @@ class TauAirlineAdapter(BaseCargoAdapter):
             )
         return super().validate_final_completeness(action, wm)
 
+    def build_commit_certificate(
+        self,
+        action: ProposedAction,
+        schema: ToolEffectSchema,
+        wm,
+    ) -> CommitCertificate:
+        if action.name == "book_reservation":
+            return self._book_certificate(action, schema, wm)
+        if action.name.startswith("update_reservation_") or action.name == "cancel_reservation":
+            return self._reservation_write_certificate(action, schema, wm)
+        return super().build_commit_certificate(action, schema, wm)
+
+    def _book_certificate(
+        self,
+        action: ProposedAction,
+        schema: ToolEffectSchema,
+        wm,
+    ) -> CommitCertificate:
+        cert = super().build_commit_certificate(action, schema, wm)
+        cert.certificate_type = f"{self.name}.book_commit"
+        args = action.args or {}
+        user_id = str(args.get("user_id") or getattr(wm, "auth_user_id", "") or "").strip()
+        grounded_user_ids = set(getattr(wm, "typed_evidence_for", lambda _k: [])("user_id"))
+        grounded_user_ids.update(getattr(wm, "user_profiles", {}).keys())
+        if getattr(wm, "auth_user_id", ""):
+            grounded_user_ids.add(str(getattr(wm, "auth_user_id")))
+        cert.require(
+            "identity_grounded",
+            bool(user_id and user_id in grounded_user_ids),
+            "booking_user_id_not_grounded",
+            user_id=user_id,
+        )
+        for slot in ("origin", "destination", "date", "cabin"):
+            expected = (getattr(wm, "semantic_slots", {}) or {}).get(slot)
+            proposed = args.get(slot)
+            if slot == "cabin":
+                proposed = proposed or args.get("cabin_class")
+            if expected in (None, "", []):
+                continue
+            cert.require(
+                f"active_goal_{slot}_consistent",
+                _airline_slot_matches(self, slot, proposed, expected),
+                f"booking_{slot}_conflicts_with_active_goal",
+                expected=expected,
+                proposed=proposed,
+            )
+        flights = _flight_entries(args)
+        flight_numbers = [str(f.get("flight_number") or "").strip() for f in flights if str(f.get("flight_number") or "").strip()]
+        cert.selected_candidate_ids.extend(flight_numbers)
+        seen_flights = _seen_flight_numbers(wm)
+        cert.require(
+            "selected_flights_grounded",
+            bool(flight_numbers) and all(num in seen_flights for num in flight_numbers),
+            "selected_flight_not_in_evidence",
+            flight_numbers=flight_numbers,
+            seen_flights=sorted(seen_flights),
+        )
+        payment_ids = _payment_ids_from_book_args(args)
+        seen_payments = _seen_payment_ids(wm)
+        cert.require(
+            "payment_methods_grounded",
+            bool(payment_ids) and all(pid in seen_payments for pid in payment_ids),
+            "booking_payment_method_not_grounded",
+            payment_ids=payment_ids,
+            seen_payment_ids=sorted(seen_payments),
+        )
+        cert.require(
+            "passengers_complete",
+            bool(args.get("passengers")),
+            "booking_passengers_missing",
+            passengers=args.get("passengers"),
+        )
+        return cert.finalize()
+
+    def _reservation_write_certificate(
+        self,
+        action: ProposedAction,
+        schema: ToolEffectSchema,
+        wm,
+    ) -> CommitCertificate:
+        cert = super().build_commit_certificate(action, schema, wm)
+        cert.certificate_type = f"{self.name}.reservation_commit"
+        args = action.args or {}
+        reservation_id = str(args.get("reservation_id") or args.get("reservation_number") or "").strip()
+        reservation = (getattr(wm, "reservation_details", {}) or {}).get(reservation_id)
+        grounded_ids = set(getattr(wm, "typed_evidence_for", lambda _k: [])("reservation_id"))
+        cert.require(
+            "reservation_grounded",
+            bool(reservation_id and (reservation_id in grounded_ids or isinstance(reservation, dict))),
+            "reservation_id_not_grounded",
+            reservation_id=reservation_id,
+        )
+        if isinstance(reservation, dict):
+            auth_user_id = str(getattr(wm, "auth_user_id", "") or "").strip()
+            reservation_user_id = str(reservation.get("user_id") or "").strip()
+            cert.require(
+                "reservation_identity_consistent",
+                not auth_user_id or not reservation_user_id or auth_user_id == reservation_user_id,
+                "reservation_user_conflicts_with_confirmed_identity",
+                auth_user_id=auth_user_id,
+                reservation_user_id=reservation_user_id,
+            )
+        if action.name == "update_reservation_flights":
+            flights = _flight_entries(args)
+            cert.selected_candidate_ids.extend(
+                str(f.get("flight_number") or "").strip()
+                for f in flights
+                if str(f.get("flight_number") or "").strip()
+            )
+            cert.require(
+                "replacement_itinerary_complete",
+                bool(flights),
+                "replacement_itinerary_missing",
+                flights=flights,
+            )
+        if action.name in {"update_reservation_flights", "update_reservation_baggages"}:
+            payment_id = str(args.get("payment_id") or args.get("payment_method_id") or "").strip()
+            seen_payments = _seen_payment_ids(wm)
+            cert.require(
+                "payment_method_grounded",
+                bool(payment_id and payment_id in seen_payments),
+                "reservation_payment_method_not_grounded",
+                payment_id=payment_id,
+                seen_payment_ids=sorted(seen_payments),
+            )
+        return cert.finalize()
+
     def canonicalize_airport(self, value: Any, *, field: str = "") -> str:
         return _airport_code(value) or _clean(str(value or ""))
 
@@ -414,6 +541,84 @@ def _flight_candidate_selected(wm) -> bool:
     # Some future adapters may bind selected flight numbers as semantic slots.
     slots = getattr(wm, "semantic_slots", {}) or {}
     return bool(slots.get("selected_flight") or slots.get("selected_itinerary"))
+
+
+def _airline_slot_matches(adapter: TauAirlineAdapter, slot: str, proposed: Any, expected: Any) -> bool:
+    if proposed in (None, "", []):
+        return False
+    if slot in {"origin", "destination"}:
+        return adapter.semantic_values_match(slot, proposed, expected)
+    p = _clean(str(proposed or "")).lower().replace("_", " ")
+    vals = expected if isinstance(expected, list) else [expected]
+    for value in vals:
+        e = _clean(str(value or "")).lower().replace("_", " ")
+        if p == e or (p and e and (p in e or e in p)):
+            return True
+    return False
+
+
+def _flight_entries(args: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    raw = args.get("flights") or args.get("flight_numbers") or args.get("flight_number")
+    if isinstance(raw, list):
+        entries: List[Dict[str, Any]] = []
+        for item in raw:
+            if isinstance(item, Mapping):
+                entries.append(dict(item))
+            elif item not in (None, ""):
+                entries.append({"flight_number": str(item)})
+        return entries
+    if raw in (None, ""):
+        return []
+    return [{"flight_number": str(raw)}]
+
+
+def _seen_flight_numbers(wm) -> set[str]:
+    seen: set[str] = set()
+    for value in getattr(wm, "typed_evidence_for", lambda _k: [])("flight_number"):
+        if str(value).strip():
+            seen.add(str(value).strip())
+    state = getattr(wm, "task_state", None)
+    for candidate in getattr(state, "candidate_objects", {}).values() if state else []:
+        cid = str(getattr(candidate, "candidate_id", "") or "").strip()
+        if cid:
+            seen.add(cid)
+        attrs = getattr(candidate, "attributes", {}) or {}
+        for key in ("flight_number", "id"):
+            val = str(attrs.get(key) or "").strip()
+            if val:
+                seen.add(val)
+    text = getattr(wm, "all_evidence", lambda: "")()
+    seen.update(re.findall(r"\bHAT\d{3}\b", text))
+    for match in re.finditer(r"flight_number[\"'=:\s]+([A-Za-z0-9_/-]+)", text):
+        seen.add(match.group(1).strip("\"'"))
+    return seen
+
+
+def _payment_ids_from_book_args(args: Mapping[str, Any]) -> List[str]:
+    out: List[str] = []
+    raw = args.get("payment_methods") or args.get("payment_method_id") or args.get("payment_id")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, Mapping):
+                val = item.get("payment_id") or item.get("payment_method_id") or item.get("id")
+                if val not in (None, ""):
+                    out.append(str(val).strip())
+            elif item not in (None, ""):
+                out.append(str(item).strip())
+    elif raw not in (None, ""):
+        out.append(str(raw).strip())
+    return [value for value in out if value]
+
+
+def _seen_payment_ids(wm) -> set[str]:
+    seen: set[str] = set()
+    for key in ("payment_method_id", "payment_id", "card_id", "certificate_id"):
+        for value in getattr(wm, "typed_evidence_for", lambda _k: [])(key):
+            if str(value).strip():
+                seen.add(str(value).strip())
+    text = getattr(wm, "all_evidence", lambda: "")()
+    seen.update(re.findall(r"\b(?:credit_card|gift_card|certificate)_[0-9A-Za-z]+\b", text))
+    return seen
 
 
 __all__ = ["TauAirlineAdapter"]

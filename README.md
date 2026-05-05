@@ -9,7 +9,7 @@ and **ACEBench Agent**:
 | 1 | **Vanilla TC** (`baseline`) | Native function-calling, minimal system prompt. |
 | 2 | **Act** (`act`)             | Yao et al. 2022 ablation: action-only, no reasoning prose. |
 | 3 | **ReAct** (`react`)         | Yao et al. 2022: one-line `Thought:` before each Action. |
-| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; a deterministic decision engine updates state, stores candidate sets, applies hard constraints before preferences, schedules the next pipeline step, and then risk gates check grounding, task-state validity, semantic completeness, and pre-conditions. Calibrated self-consistency plus counterfactual rollout are still reserved for high-risk actions. |
+| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; a deterministic decision engine updates state, stores candidate sets, applies hard constraints before preferences, schedules the next pipeline step, and then risk gates check grounding, task-state validity, semantic completeness, proof-carrying commit certificates, and pre-conditions. Calibrated self-consistency plus counterfactual rollout are still reserved for high-risk actions. |
 
 All four conditions share the **same in-process loop, model,
 temperature, max-steps, and truncation budget**. The only varying axis is
@@ -58,9 +58,10 @@ unchanged.
             │       (4b) declared-pre ⊆ user_facts ∪ db_facts         │
             │       (4c) ID-typed args grounded in evidence           │
             │       (4d) completeness / confirmation for writes       │
-            │       (4e) self-consistency: k=3 samples at T=0.7,      │
+            │       (4e) proof-carrying commit certificate            │
+            │       (4f) self-consistency: k=3 samples at T=0.7,      │
             │            agreement ≥ τ_c                              │
-            │       (4f) counterfactual rollout (IRREV/FINAL only)    │
+            │       (4g) counterfactual rollout (IRREV/FINAL only)    │
             │                                                         │
             │  (5)  Repair on ABSTAIN  (deterministic)                │
             │       grounding/precond  → ASK_USER                     │
@@ -99,19 +100,39 @@ observe
 → update_candidate_sets
 → decision_engine_choose_next_step
 → validate_by_action_class
+→ verify_commit_certificate_for_write_or_final
 → execute_or_repair
 → verify_state_transition
 → terminate_when_goal_closed
 ```
 
-The latest controller hardening adds an **active task-frame stage machine**.
+The latest controller hardening adds a **proof-carrying transactional
+transition layer** on top of the active task-frame stage machine. The model
+may propose and summarize a transition, but any `WRITE`, `IRREVERSIBLE`, or
+terminal `FINAL` now carries a `CommitCertificate` checked by the generic
+kernel before execution. The certificate is a list of machine-checkable
+`ProofObligation`s: active-goal consistency, required arguments, identity or
+order anchoring, task-frame consistency, selected candidates, full requested
+operation coverage, payment grounding, and terminal readiness where the
+adapter can prove those facts. The core owns the neutral certificate format;
+the adapters own the domain evidence.
+
+This matters for tau-bench because the remaining failures were often not
+ungrounded tool calls. They were grounded but unproven transitions: partial
+retail mutations, reservation/profile facts trying to steer the active
+airline goal, or loop exits that were not tied to a proven terminal blocker.
+The proof layer keeps READ permissive while making commitment explicitly
+transactional.
+
+The active task-frame stage machine remains in place.
 User-bound task facts define the current goal frame; tool/cache observations
 remain evidence, but conflicting historical reservations, routes, dates,
 cabins, insurance choices, or payment preferences are quarantined instead of
-silently retargeting the task. This is the single major architectural change
-motivated by the latest tau-bench traces: airline failures were drifting from
-the user's route into unrelated cached reservations, and retail catalog/count
-queries were being pulled into authentication and post-answer loops.
+silently retargeting the task. The proof layer is the single major
+architectural change motivated by the latest tau-bench traces: the earlier
+stage machine made trajectories cleaner, but commitment still needed an
+explicit certificate that the selected action closed the active task without
+partial writes or stale-frame contamination.
 
 The key rule is **retrieval-permissive, commitment-strict**:
 
@@ -129,13 +150,14 @@ CARGO-v4 is split into a generic core plus pluggable adapters:
 - `src/cargo/core.py` defines the domain-neutral kernel: typed task state,
   layered facts, open slots, constraints, preferences, fallback rules,
   candidate sets, candidate objects, obligations, failed signatures, executed
-  writes, semantic validation hooks, completeness hooks, terminal state, and
-  the deterministic `DecisionEngine`.
+  writes, semantic validation hooks, completeness hooks, proof obligations,
+  commit certificates, terminal state, and the deterministic `DecisionEngine`.
 - `src/cargo/adapters/` contains benchmark/domain adapters.  The core does
   not name retail products, flights, reservations, or ACEBench answer
   patterns.  Adapters own tool schema enrichment, ID fields, non-ID semantic
   fields, user-message binding, observation absorption, policy hooks,
-  semantic validators, and completion criteria.
+  semantic validators, completion criteria, and domain-specific certificate
+  obligations.
 - Current adapters: `tau_retail`, `tau_airline`, `acebench`, and
   `synthetic_generic`.
 
@@ -189,6 +211,13 @@ candidate or next pipeline step. The current decision engine provides:
   semantic user fact, while the airline adapter converts search arguments to
   tool-native airport codes such as `JFK`/`SEA` and validates city/code
   equivalence.
+- **Proof-carrying commits**: the kernel records a `commit_certificate` gate
+  for commitment actions. Retail certificates prove the order is loaded,
+  delivered, anchored to identity or a user-supplied order id, covers every
+  requested item, uses the deterministic replacement candidate, and has a
+  grounded payment method. Airline certificates prove booking identity,
+  active route/cabin consistency, grounded selected flights, passengers, and
+  grounded payment methods before a booking write.
 - **Clean terminal behavior**: successful WRITE/IRREVERSIBLE actions emit a
   deterministic post-write `respond` before terminating, so the benchmark
   user simulator can produce `STOP` and score the final state. Multi-write
@@ -225,9 +254,9 @@ now protects it.
 | Class | Examples | Treatment |
 |---|---|---|
 | `READ` | `get_*`, `list_*`, `find_*`, `search_*`, `lookup_*`, `view_*` | Retrieval-permissive fast path: repeat-loop + ID grounding + ordinary semantic contradiction checks only. |
-| `WRITE` | `update_*`, `modify_*`, `add_*`, `edit_*`, `set_*`, `place_*`, `book_*` | State-validity + confirmation + completeness + pre-cond + arg-grounding + SC. |
-| `IRREVERSIBLE` | `cancel_*`, `delete_*`, `refund_*`, `charge_*`, `send_*`, `transfer_*` | State-validity + confirmation + completeness + pre-cond + arg-grounding + SC + CF rollout. |
-| `FINAL` | `respond` (when committing the user's task) | Final-completeness + pre-cond + SC + CF rollout. |
+| `WRITE` | `update_*`, `modify_*`, `add_*`, `edit_*`, `set_*`, `place_*`, `book_*` | State-validity + confirmation + completeness + commit certificate + pre-cond + arg-grounding + SC. |
+| `IRREVERSIBLE` | `cancel_*`, `delete_*`, `refund_*`, `charge_*`, `send_*`, `transfer_*` | State-validity + confirmation + completeness + commit certificate + pre-cond + arg-grounding + SC + CF rollout. |
+| `FINAL` | `respond` (when committing the user's task) | Final-completeness + commit certificate + pre-cond + SC + CF rollout. |
 | `ASK_USER` | `respond` (when asking a clarifying question) | Pass-through. |
 
 Auto-induction is rule-based (name prefix + parameter shape) by default —
@@ -463,24 +492,17 @@ detection; self-consistency vote (mock client with `n>1`); counterfactual
 rollout (mock client); post-condition error detection; proposer JSON parsing;
 repair policy decisions; READ-permissive / WRITE-strict validation; airline
 obligation-guided search progression; task-frame isolation; no-auth catalog
-routing; post-write terminal response; and full agent loop behavior on mock
-environments.
+routing; proof-carrying commit certificates; post-write terminal response;
+and full agent loop behavior on mock environments.
 
-
-Latest local verification in this workspace: `251` tests passed. Benchmark
-setup found tau-bench and ACEBench under `external/`; tau-bench installed
-successfully after network approval, and ACEBench safe dependencies installed
-while `vllm` stayed skipped. Synthetic smoke passed. Live tau-bench
-retail/airline and ACEBench smoke require either `OPENAI_API_KEY` or an
-=======
-Latest local verification in this workspace: `267` tests passed, compileall
-passed, `git diff --check` passed, and `bash run_project.sh --dry-run`
-resolved the benchmark configuration. Synthetic smoke passed. Classic
-tau-bench and ACEBench dependencies are present, but live tau-bench /
-ACEBench smoke tests still require either `OPENAI_API_KEY` or an
-OpenAI-compatible `OPENAI_BASE_URL`; without one, the smoke helper reports
-them as blocked and leaves exact rerun commands in
-`outputs/smoke/smoke_summary_latest.json`.
+Latest local verification in this workspace: `276` tests passed, compileall
+passed, `git diff --check` passed, `python3 -m pip check` passed, and
+`bash run_project.sh --dry-run` resolved the benchmark configuration.
+Synthetic smoke passed. Classic tau-bench and ACEBench dependencies are
+present, but live tau-bench / ACEBench smoke tests still require either
+`OPENAI_API_KEY` or an OpenAI-compatible `OPENAI_BASE_URL`; without one, the
+smoke helper reports them as blocked and leaves exact rerun commands in
+`outputs/smoke/smoke_summary_proof.json`.
 
 ## What CARGO is — and isn't
 

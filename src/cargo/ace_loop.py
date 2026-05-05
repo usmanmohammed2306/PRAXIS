@@ -122,6 +122,13 @@ def _run_gates(
         if not completeness.ok:
             diag["gates_failed"].append("completeness")
             return completeness, diag
+    if action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE, RiskClass.FINAL):
+        cert = kernel.validate_commit_certificate(action, schema, wm)
+        diag["gates_run"].append("commit_certificate")
+        stats.record_gate(cert)
+        if not cert.ok:
+            diag["gates_failed"].append("commit_certificate")
+            return cert, diag
     if not getattr(action, "bypass_gates", False):
         k = calibration.sc_k.get(action.declared_class, 0)
         threshold = calibration.sc_thresholds.get(action.declared_class, 0.0)

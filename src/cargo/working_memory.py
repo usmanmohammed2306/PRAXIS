@@ -74,11 +74,6 @@ class WorkingMemory:
     # controller checks this before each proposer call so no more tools run
     # after the task is complete.
     task_completed: bool = False
-    # Set after the controller emits the terminal user-facing confirmation
-    # following a successful write.  tau-bench counts the write and the final
-    # response; stopping immediately after mutation leaves otherwise-correct
-    # trajectories unfinished.
-    post_write_responded: bool = False
     # Set once we've already emitted a "give up on auth" FINAL.  Prevents the
     # exact same FINAL from being emitted twice in a row.
     auth_giveup_emitted: bool = False
@@ -145,6 +140,9 @@ class WorkingMemory:
     last_confirmed_auth_user_id: str = ""
     # Set once we've triggered auth-loop escape via ASK_USER
     auth_cycle_triggered: bool = False
+    # Last proof-carrying commit certificate checked by the kernel.  Stored as
+    # a plain dict so diagnostics stay JSON-serializable.
+    last_commit_certificate: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Updates
