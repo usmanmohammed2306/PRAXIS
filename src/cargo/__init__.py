@@ -19,6 +19,15 @@ from __future__ import annotations
 
 from .ace_loop import run_cargo
 from .calibration import CalibrationConfig, default_calibration, fit_thresholds
+from .core import (
+    BaseCargoAdapter,
+    CandidateObject,
+    Constraint,
+    FallbackRule,
+    GenericCargoKernel,
+    Preference,
+    TaskState,
+)
 from .proposer import (
     SYSTEM_PROMPT,
     parse_proposer_response,
@@ -33,12 +42,19 @@ from .working_memory import WorkingMemory
 
 __all__ = [
     "CalibrationConfig",
+    "BaseCargoAdapter",
+    "CandidateObject",
+    "Constraint",
+    "FallbackRule",
     "GateResult",
+    "GenericCargoKernel",
     "ProposedAction",
+    "Preference",
     "RiskClass",
     "StepDiagnostics",
     "SYSTEM_PROMPT",
     "ToolEffectSchema",
+    "TaskState",
     "WorkingMemory",
     "default_calibration",
     "fit_thresholds",

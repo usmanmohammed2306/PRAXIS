@@ -27,7 +27,9 @@ except Exception:  # noqa: BLE001
     _HAS_TAU = False
 
 from . import repair
+from .adapters import select_adapter
 from .calibration import default_calibration
+from .core import BaseCargoAdapter, GenericCargoKernel
 from .gates import (
     check_arg_grounding,
     check_counterfactual,
@@ -322,6 +324,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
             model=self.model,
             temperature=0.0,
         )
+        self.adapter = select_adapter(env_hint=env_hint, tools_info=self.tools_info, wiki=self.wiki)
+        self.kernel = GenericCargoKernel(self.adapter)
+        self.schemas = self.kernel.enrich_schemas(self.schemas)
         self.calibration = default_calibration()
 
     # ------------------------------------------------------------------
@@ -392,6 +397,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
     # ------------------------------------------------------------------
     # Gate orchestration
     # ------------------------------------------------------------------
+    def _kernel(self) -> GenericCargoKernel:
+        kernel = getattr(self, "kernel", None)
+        if kernel is None:
+            adapter = getattr(self, "adapter", None) or BaseCargoAdapter()
+            kernel = GenericCargoKernel(adapter)
+            self.adapter = adapter
+            self.kernel = kernel
+        return kernel
+
     def _run_gates(
         self,
         action: ProposedAction,
@@ -414,6 +428,13 @@ class CargoAgent(Agent):  # type: ignore[misc]
         if not rl.ok:
             diag["gates_failed"].append("repeat_loop")
             return rl, diag
+
+        state_gate = self._check_state_action_validity(action, wm)
+        diag["gates_run"].append("state_validity")
+        stats.record_gate(state_gate)
+        if not state_gate.ok:
+            diag["gates_failed"].append("state_validity")
+            return state_gate, diag
 
         if action.declared_class == RiskClass.FINAL:
             final_gate = self._check_final_completeness(action, wm)
@@ -533,6 +554,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
 
         wm = WorkingMemory(goal=initial_user, budget_steps=max_num_steps)
         wm.absorb_user_message(initial_user)
+        self._kernel().observe_user_message(wm, initial_user)
 
         # ``messages`` is the *trajectory* surface tau-bench / scorers see.
         # We render it in the same OpenAI-chat shape the baselines use so
@@ -628,6 +650,27 @@ class CargoAgent(Agent):  # type: ignore[misc]
                         },
                     })
                     action = uid_action
+
+            # Airline-style reservation advance: once a user profile has
+            # grounded reservation IDs, do not retry get_user_details forever.
+            # Scan reservation details one at a time so later policy/commit
+            # decisions are based on DB-confirmed reservation state.
+            if action is not None:
+                res_action = self._advance_reservation_retrieval(action, wm)
+                if res_action is not None:
+                    raw_text = json.dumps({
+                        "thought": res_action.raw_thought,
+                        "action": {
+                            "name": res_action.name,
+                            "args": res_action.args,
+                            "declared_class": res_action.declared_class.value,
+                            "declared_pre": res_action.declared_pre,
+                            "declared_post": res_action.declared_post,
+                            "informational_intent": res_action.informational_intent,
+                            "user_text": res_action.user_text,
+                        },
+                    })
+                    action = res_action
 
             # Product-ID override: if the proposer passes a product *type name*
             # (e.g. "T-Shirt") where a numeric product_id is required, resolve it
@@ -776,6 +819,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     if user_reply:
                         messages.append({"role": "user", "content": user_reply})
                         wm.absorb_user_message(user_reply)
+                        self._kernel().observe_user_message(wm, user_reply)
                     reward = _float(getattr(env_resp, "reward", reward), reward)
                     info = getattr(env_resp, "info", info) or info
                     done = bool(getattr(env_resp, "done", False))
@@ -806,6 +850,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 if user_reply:
                     messages.append({"role": "user", "content": user_reply})
                     wm.absorb_user_message(user_reply)
+                    self._kernel().observe_user_message(wm, user_reply)
                 reward = _float(getattr(env_resp, "reward", reward), reward)
                 info = getattr(env_resp, "info", info) or info
                 done = bool(getattr(env_resp, "done", False))
@@ -865,6 +910,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 if user_reply:
                     messages.append({"role": "user", "content": user_reply})
                     wm.absorb_user_message(user_reply)
+                    self._kernel().observe_user_message(wm, user_reply)
                 reward = _float(getattr(env_resp, "reward", reward), reward)
                 info = getattr(env_resp, "info", info) or info
                 done = bool(getattr(env_resp, "done", False))
@@ -939,6 +985,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 })
                 if user_reply:
                     wm.absorb_user_message(user_reply)
+                    self._kernel().observe_user_message(wm, user_reply)
                 reward = _float(getattr(env_resp, "reward", reward), reward)
                 info = getattr(env_resp, "info", info) or info
                 done = bool(getattr(env_resp, "done", False))
@@ -948,8 +995,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 step_record["executed"] = True
                 stats.record_step(step_record)
                 if action.declared_class == RiskClass.FINAL:
-                    wm.task_completed = True
-                    break
+                    if done or not user_reply:
+                        wm.task_completed = True
+                        break
+                    critique = ""
+                    retries_used = 0
+                    continue
                 if done:
                     break
                 continue
@@ -986,6 +1037,11 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 })
                 wm.last_error = str(env_exc)[:80]  # tip 8: minimal failure record
                 wm.absorb_observation({"status": "error", "error": str(env_exc)[:80]})
+                self._kernel().observe_tool_result(
+                    wm,
+                    action.name,
+                    {"status": "error", "error": str(env_exc)[:80]},
+                )
                 wm.record_failed_signature(action.signature())
                 step_record["env_error"] = str(env_exc)[:80]
                 stats.record_step(step_record)
@@ -1008,6 +1064,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 wm.last_error = tool_obs[:80]
             wm.absorb_observation(tool_obs if not isinstance(env_resp, type(None))
                                   else "")
+            self._kernel().observe_tool_result(wm, action.name, tool_obs)
 
             # Track failed name+ZIP lookups so _auth_override doesn't retry the
             # same invalid ZIP on the next step.
@@ -1063,6 +1120,18 @@ class CargoAgent(Agent):  # type: ignore[misc]
                             wm.auth_email = candidate
                 except Exception:
                     pass
+            if action.name == "get_user_details" and tool_obs:
+                try:
+                    ud = json.loads(tool_obs) if tool_obs.lstrip().startswith("{") else None
+                    if isinstance(ud, dict):
+                        uid = str(action.args.get("user_id") or ud.get("user_id") or "").strip()
+                        if uid and self._is_user_id_token(uid):
+                            wm.user_profiles[uid] = ud
+                            if not wm.auth_user_id:
+                                wm.auth_user_id = uid
+                                wm.lock_phase("auth")
+                except Exception:
+                    pass
 
             # Cache product details for short-circuiting count queries.  When
             # the model fetches a product successfully and the user query is
@@ -1104,6 +1173,20 @@ class CargoAgent(Agent):  # type: ignore[misc]
                                   action.args.get("order_id") or "")
                         if oid:
                             wm.order_details[oid] = od
+                except Exception:
+                    pass
+            if action.name == "get_reservation_details" and tool_obs:
+                try:
+                    rd = json.loads(tool_obs) if tool_obs.lstrip().startswith("{") else None
+                    if isinstance(rd, dict):
+                        rid = str(
+                            rd.get("reservation_id")
+                            or rd.get("reservation_number")
+                            or action.args.get("reservation_id")
+                            or ""
+                        ).strip()
+                        if rid:
+                            wm.reservation_details[rid] = rd
                 except Exception:
                     pass
             # Successful retail mutations also return an order-shaped object.
@@ -2010,6 +2093,61 @@ class CargoAgent(Agent):  # type: ignore[misc]
             raw_response=action.raw_response,
         )
 
+    def _advance_reservation_retrieval(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        """Advance from grounded user profile to reservation retrieval.
+
+        Airline profile lookups return a list of reservation IDs.  If the
+        proposer repeats get_user_details or emits a generic respond after the
+        profile is cached, scan those reservation IDs instead of retrying the
+        completed auth/profile phase.
+        """
+        if not self._has_tool("get_reservation_details"):
+            return None
+        if not self._reservation_task_needs_scan(wm):
+            return None
+        repeated_profile = action.name == "get_user_details"
+        generic_respond = (
+            action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
+            or action.name.lower() in (RESPOND_TOOL_NAME, "respond", "final", "answer")
+        )
+        if not (repeated_profile or generic_respond):
+            return None
+        reservation_ids = wm.typed_evidence_for("reservation_id")
+        if not reservation_ids:
+            return None
+        for rid in reservation_ids:
+            if rid in wm.reservation_details:
+                continue
+            candidate = ProposedAction(
+                name="get_reservation_details",
+                args={"reservation_id": rid},
+                declared_class=RiskClass.READ,
+                declared_pre=["reservation id grounded"],
+                declared_post=["reservation details retrieved"],
+                informational_intent="fetch reservation details",
+                raw_thought=(
+                    f"Grounded progress: profile is cached; fetch reservation {rid}."
+                ),
+                user_text="",
+                raw_response="",
+            )
+            fresh = self._fresh_action_or_none(candidate, wm)
+            if fresh is not None:
+                return fresh
+        return None
+
+    @staticmethod
+    def _reservation_task_needs_scan(wm: "WorkingMemory") -> bool:
+        text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        return bool(re.search(
+            r"\b(reservation|booking|flight|ticket|trip|cancel|change|modify|upgrade|baggage|bags?)\b",
+            text,
+        ))
+
     # ------------------------------------------------------------------
     # Generic grounded-argument resolver
     # ------------------------------------------------------------------
@@ -2673,6 +2811,41 @@ class CargoAgent(Agent):  # type: ignore[misc]
     # ------------------------------------------------------------------
     # Grounded task progress / commit layer
     # ------------------------------------------------------------------
+    def _check_state_action_validity(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        """Validate that an action is appropriate for current task state."""
+        name = action.name.lower()
+        if wm.phase_locked("auth") and name.startswith("find_user_id_"):
+            return GateResult.failing(
+                "state_validity",
+                "auth_phase_already_complete",
+                action=action.name,
+            )
+        if name == "get_user_details":
+            uid = str(action.args.get("user_id") or "").strip()
+            if uid and uid in wm.user_profiles:
+                return GateResult.failing(
+                    "state_validity",
+                    "user_profile_already_cached",
+                    user_id=uid,
+                )
+
+        return self._kernel().validate_action(action, self._schema_for(action), wm)
+
+    @staticmethod
+    def _semantic_values_match(proposed: Any, expected: Any) -> bool:
+        def norm(v: Any) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", str(v or "").lower()).strip()
+        p = norm(proposed)
+        if isinstance(expected, list):
+            vals = [norm(v) for v in expected]
+        else:
+            vals = [norm(expected)]
+        return any(p == v or (p and v and (p in v or v in p)) for v in vals)
+
     def _check_write_confirmation(
         self,
         action: ProposedAction,
@@ -2695,6 +2868,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             "modify": ("modify", "change", "update", "adjust"),
             "cancel": ("cancel",),
             "update": ("update", "change", "modify", "set"),
+            "book": ("book", "reserve", "purchase"),
         }
         for group, verbs in verb_groups.items():
             if group in name and any(re.search(rf"\b{re.escape(v)}\b", text) for v in verbs):
@@ -2747,6 +2921,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
         exchanges/returns/modifies, decoy variant choices, and premature writes
         where some requested item is still unresolved.
         """
+        adapter_gate = self._kernel().validate_write_completeness(action, wm)
+        if adapter_gate is not None:
+            return adapter_gate
         if action.name not in {
             "exchange_delivered_order_items",
             "return_delivered_order_items",
@@ -2783,6 +2960,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
         """Prevent terminal answers while account-side work is still open."""
         if action.declared_class != RiskClass.FINAL:
             return GateResult.passing("final_completeness")
+        adapter_gate = self._kernel().validate_final_completeness(action, wm)
+        if adapter_gate is not None and not adapter_gate.ok:
+            return adapter_gate
         if not self._is_account_order_goal(wm):
             return GateResult.passing("final_completeness")
         if wm.phase_locked("mutation") or wm.task_completed or wm.auth_abandoned:
@@ -2967,6 +3147,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 raw_response="",
             ), wm)
 
+        missing_constraints = self._missing_replacement_constraints_action(wm)
+        if missing_constraints is not None:
+            return missing_constraints
+
         return self._grounded_retail_commit_action(wm)
 
     def _grounded_retail_commit_action(self, wm: "WorkingMemory") -> Optional[ProposedAction]:
@@ -3086,6 +3270,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 details = wm.product_details.get(pid)
                 if not details:
                     return None
+                if not self._has_replacement_constraints(details, item, all_user):
+                    continue
                 new_id = self._select_variant_id(details, item, all_user, mode="exchange")
                 if not new_id:
                     continue
@@ -3150,6 +3336,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 details = wm.product_details.get(pid)
                 if not details:
                     return None
+                if not self._has_replacement_constraints(details, item, all_user):
+                    continue
                 new_id = self._select_variant_id(details, item, all_user, mode="modify")
                 if not new_id:
                     continue
@@ -3250,6 +3438,65 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 if value not in bucket:
                     bucket.append(value)
         return prefs
+
+    def _has_replacement_constraints(
+        self,
+        details: Dict[str, Any],
+        old_item: Dict[str, Any],
+        goal: str,
+    ) -> bool:
+        prefs = self._option_preferences(details, goal)
+        old_options = old_item.get("options") or {}
+        for key in self._same_option_keys(old_options, goal):
+            if key not in prefs and old_options.get(key) not in (None, ""):
+                prefs[key] = [str(old_options.get(key))]
+        return bool(prefs)
+
+    def _missing_replacement_constraints_action(
+        self,
+        wm: "WorkingMemory",
+    ) -> Optional[ProposedAction]:
+        goal = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        if not re.search(r"\b(exchange|exchang|modify|change|update)\b", goal):
+            return None
+        missing: List[str] = []
+        incomplete = False
+        for order in wm.order_details.values():
+            if not isinstance(order, dict):
+                continue
+            for item in order.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "")
+                pid = str(item.get("product_id") or "")
+                if not pid or not self._product_name_matches_user(name.lower(), goal):
+                    continue
+                details = wm.product_details.get(pid)
+                if not details:
+                    incomplete = True
+                    continue
+                if not self._has_replacement_constraints(details, item, goal):
+                    missing.append(name)
+        if incomplete or not missing:
+            return None
+        names = ", ".join(self._dedupe_strings(missing))
+        return self._fresh_action_or_none(ProposedAction(
+            name=RESPOND_TOOL_NAME,
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            declared_pre=["replacement constraints missing"],
+            declared_post=["user provides target options"],
+            informational_intent="ask replacement options",
+            raw_thought=(
+                "Completeness gate: replacement target options are missing."
+            ),
+            user_text=(
+                f"What replacement options should I use for {names}? "
+                "Please specify the desired option changes before I make the exchange."
+            ),
+            raw_response="",
+            bypass_gates=True,
+        ), wm)
 
     @staticmethod
     def _explicit_option_preferences(goal: str) -> Dict[str, List[str]]:
@@ -3433,7 +3680,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return self.schemas[action.name]
         # Synthesise a minimal schema using the declared class.
         from .schemas import ToolEffectSchema
-        return ToolEffectSchema(
+        schema = ToolEffectSchema(
             name=action.name,
             cls=action.declared_class,
             irreversible=is_irreversible_or_final(action.declared_class),
@@ -3444,6 +3691,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             required_params=[],
             description="(unknown tool — synthesised schema)",
         )
+        return self._kernel().adapter.enrich_schema(schema)
 
     def _respond(self, env, content: str):
         """Issue a ``respond`` action to the env. Returns the env response,

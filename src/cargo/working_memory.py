@@ -14,6 +14,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional
 
+from .core import TaskState
+
 
 # A short rolling window of recent action signatures (for repeat detection).
 _RECENT_WINDOW = 5
@@ -33,6 +35,13 @@ class WorkingMemory:
     failed_signatures: Dict[str, int] = field(default_factory=dict)
     evidence_version: int = 0
     typed_values: Dict[str, List[str]] = field(default_factory=dict)
+    task_state: TaskState = field(default_factory=TaskState)
+    # CARGO-v2 semantic task state.  ``typed_values`` stores opaque IDs;
+    # semantic_slots stores ordinary task facts such as dates, routes, cabin,
+    # baggage count, insurance choice, payment preferences, and operations.
+    # DB-confirmed slots outrank later user claims.
+    semantic_slots: Dict[str, Any] = field(default_factory=dict)
+    db_confirmed_slots: Dict[str, bool] = field(default_factory=dict)
     # Auth-loop guard: how many times we've already asked the user for identity
     # credentials.  The override stops asking after 2 attempts to avoid an
     # infinite ASK_USER bounce.
@@ -90,6 +99,10 @@ class WorkingMemory:
     # loop when ``get_order_details`` returns.  Used by downstream tooling
     # to look up items in the order without re-fetching.
     order_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Durable profile / reservation caches for airline-style domains.  These
+    # prevent state loss after large observations evict prompt-facing db_facts.
+    user_profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    reservation_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Track the last respond/FINAL message we emitted so the controller can
     # detect a "same FINAL on every step" infinite loop and break out.
     last_final_text: str = ""
@@ -133,6 +146,8 @@ class WorkingMemory:
             self._add_typed_value(key, value)
             if self.typed_values.get(_normalize_typed_key(key), []) != before:
                 changed = True
+        if self._bind_user_semantics(clean):
+            changed = True
         if changed:
             self.evidence_version += 1
 
@@ -158,6 +173,7 @@ class WorkingMemory:
             kpath = f"{prefix}.{k}" if prefix else str(k)
             if isinstance(v, (str, int, float)) and v not in (None, ""):
                 self._add_typed_value(kpath, v)
+                self._add_semantic_slot(kpath, v, confirmed=True)
                 self._add_db_fact(f"{kpath}={v}")
                 # Also store the value alone (helps arg-grounding substring).
                 if isinstance(v, str) and v.strip():
@@ -170,7 +186,68 @@ class WorkingMemory:
                         self._absorb_dict(item, prefix=f"{kpath}[{i}]")
                     elif isinstance(item, (str, int, float)) and item not in (None, ""):
                         self._add_typed_value(kpath, item)
+                        self._add_semantic_slot(kpath, item, confirmed=True)
                         self._add_db_fact(f"{kpath}[{i}]={item}")
+
+    def _bind_user_semantics(self, text: str) -> bool:
+        changed = False
+        for key, value in _extract_semantic_slots(text):
+            if self._add_semantic_slot(key, value, confirmed=False):
+                changed = True
+        return changed
+
+    def bind_semantic_slot(self, key: str, value: Any, *, confirmed: bool = False) -> bool:
+        """Public adapter hook for semantic task-state updates."""
+        changed = self._add_semantic_slot(key, value, confirmed=confirmed, allow_new=True)
+        if changed:
+            self.evidence_version += 1
+        return changed
+
+    def _add_semantic_slot(
+        self,
+        key_path: str,
+        value: Any,
+        *,
+        confirmed: bool,
+        allow_new: bool = False,
+    ) -> bool:
+        key = _normalize_semantic_key(key_path, allow_new=allow_new)
+        if not key:
+            return False
+        if key == "intent":
+            return self._add_semantic_list_value("intents", value, confirmed=confirmed)
+        if key == "payment_preference":
+            return self._add_semantic_list_value("payment_preferences", value, confirmed=confirmed)
+        val = str(value).strip() if not isinstance(value, (int, float)) else value
+        if val in (None, ""):
+            return False
+        if self.db_confirmed_slots.get(key) and not confirmed:
+            return False
+        cur = self.semantic_slots.get(key)
+        if cur == val:
+            if confirmed and not self.db_confirmed_slots.get(key):
+                self.db_confirmed_slots[key] = True
+                return True
+            return False
+        self.semantic_slots[key] = val
+        if confirmed:
+            self.db_confirmed_slots[key] = True
+        return True
+
+    def _add_semantic_list_value(self, key: str, value: Any, *, confirmed: bool) -> bool:
+        val = str(value).strip()
+        if not val:
+            return False
+        cur = self.semantic_slots.setdefault(key, [])
+        if not isinstance(cur, list):
+            cur = [str(cur)]
+            self.semantic_slots[key] = cur
+        if val in cur:
+            return False
+        cur.append(val)
+        if confirmed:
+            self.db_confirmed_slots[key] = True
+        return True
 
     def _add_db_fact(self, fact: str) -> None:
         if not fact:
@@ -269,8 +346,18 @@ class WorkingMemory:
             extras.append(self.auth_user_id)
         if self.auth_email:
             extras.append(self.auth_email)
+        for key, value in self.semantic_slots.items():
+            if isinstance(value, list):
+                extras.extend(str(v) for v in value)
+            else:
+                extras.append(f"{key}={value}")
+                extras.append(str(value))
         for order in self.order_details.values():
             extras.extend(_flatten_scalar_facts(order))
+        for profile in self.user_profiles.values():
+            extras.extend(_flatten_scalar_facts(profile))
+        for reservation in self.reservation_details.values():
+            extras.extend(_flatten_scalar_facts(reservation))
         for details in self.product_details.values():
             extras.extend(_flatten_scalar_facts(details))
         if extras:
@@ -319,6 +406,15 @@ class WorkingMemory:
             for details in self.order_details.values():
                 if isinstance(details, dict):
                     add(details.get("order_id"))
+        elif key == "reservation_id":
+            for profile in self.user_profiles.values():
+                if isinstance(profile, dict):
+                    for rid in profile.get("reservations") or []:
+                        add(rid)
+            for details in self.reservation_details.values():
+                if isinstance(details, dict):
+                    add(details.get("reservation_id"))
+                    add(details.get("reservation_number"))
         return vals
 
     def render_compact(self, max_chars: int = 800) -> str:
@@ -360,6 +456,20 @@ class WorkingMemory:
             parts.append("task_completed: true")
         if self.order_details:
             parts.append(f"orders_cached: {len(self.order_details)}")
+        if self.user_profiles:
+            parts.append(f"user_profiles_cached: {len(self.user_profiles)}")
+        if self.reservation_details:
+            parts.append(f"reservations_cached: {len(self.reservation_details)}")
+        if self.semantic_slots:
+            rendered = []
+            for key in sorted(self.semantic_slots.keys()):
+                val = self.semantic_slots[key]
+                if isinstance(val, list):
+                    val_s = ",".join(str(v) for v in val[-4:])
+                else:
+                    val_s = str(val)
+                rendered.append(f"{key}={val_s}")
+            parts.append("task_slots: " + "; ".join(rendered)[:220])
         parts += [
             "user_facts:",
             *(f"  {f[:90]}" for f in trim(self.user_facts, 5)),
@@ -420,6 +530,9 @@ def _typed_keys_for_path(key_path: str, value: str) -> List[str]:
     # order IDs even though the key is plural and not an argument name.
     if key == "orders" and _ORDER_ID_LOOSE_RE.fullmatch(value):
         out.append("order_id")
+    # tau airline stores a user's reservation list under "reservations".
+    if key in ("reservations", "reservation_numbers") and _RESERVATION_ID_RE.fullmatch(value):
+        out.append("reservation_id")
     if key in ("payment_methods", "payment_history") and value:
         out.append("payment_method_id")
     # Preserve alternate order-id spellings for grounding after normalization.
@@ -432,6 +545,96 @@ def _typed_keys_for_path(key_path: str, value: str) -> List[str]:
         if item not in dedup:
             dedup.append(item)
     return dedup
+
+
+def _normalize_semantic_key(key_path: str, *, allow_new: bool = False) -> str:
+    key = str(key_path or "").strip().lower()
+    key = re.sub(r"\[\d+\]", "", key)
+    key = key.split(".")[-1]
+    key = key.replace("-", "_")
+    aliases = {
+        "departure_date": "date",
+        "arrival_date": "date",
+        "scheduled_departure_date": "date",
+        "scheduled_arrival_date": "date",
+        "intent": "intent",
+        "confirmation": "confirmation",
+    }
+    key = aliases.get(key, key)
+    if allow_new:
+        return key if re.fullmatch(r"[a-z][a-z0-9_]{0,60}", key) else ""
+    semantic_keys = {
+        "date", "intent", "confirmation",
+    }
+    return key if key in semantic_keys else ""
+
+
+_MONTHS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+def _extract_semantic_slots(text: str) -> List[tuple]:
+    """Extract only benchmark-neutral slots.
+
+    Domain-specific bindings (retail options, airline route/cabin/baggage,
+    ACEBench candidate constraints) are adapter-owned.  Keeping this helper
+    generic prevents the CARGO core from becoming a retail or airline rule
+    engine.
+    """
+    s = str(text or "")
+    if not s:
+        return []
+    out: List[tuple] = []
+    seen: set = set()
+
+    def push(key: str, value: Any) -> None:
+        if value in (None, ""):
+            return
+        pair = (key, str(value))
+        if pair in seen:
+            return
+        seen.add(pair)
+        out.append((key, value))
+
+    low = s.lower()
+    if re.search(r"\b(book|reserve|purchase)\b", low):
+        push("intent", "book")
+    if re.search(r"\b(cancel)\b", low):
+        push("intent", "cancel")
+    if re.search(r"\b(change|modify|upgrade|downgrade|update)\b", low):
+        push("intent", "modify")
+    if re.search(r"\b(exchange|swap|replace)\b", low):
+        push("intent", "exchange")
+    if re.search(r"\b(return|refund)\b", low):
+        push("intent", "return")
+    if re.search(r"\b(confirm|confirmed|yes|go ahead|proceed)\b", low):
+        push("confirmation", "yes")
+
+    for m in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", s):
+        push("date", m.group(0))
+    for m in re.finditer(
+        r"\b("
+        + "|".join(sorted(_MONTHS, key=len, reverse=True))
+        + r")\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?\b",
+        low,
+    ):
+        year = int(m.group(3) or 2024)
+        month = _MONTHS[m.group(1)]
+        day = int(m.group(2))
+        if 1 <= day <= 31:
+            push("date", f"{year:04d}-{month:02d}-{day:02d}")
+    return out
 
 
 def _typed_keys_for_token(token: str) -> List[str]:

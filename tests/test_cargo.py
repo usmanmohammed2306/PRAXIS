@@ -36,6 +36,9 @@ if str(ROOT) not in sys.path:
 
 from src.cargo import (  # noqa: E402
     GateResult,
+    CandidateObject,
+    Constraint,
+    GenericCargoKernel,
     ProposedAction,
     RiskClass,
     SYSTEM_PROMPT,
@@ -50,6 +53,7 @@ from src.cargo import (  # noqa: E402
     reset_cache,
     run_cargo,
 )
+from src.cargo.adapters import ACEBenchAdapter, SyntheticGenericAdapter, TauAirlineAdapter, TauRetailAdapter  # noqa: E402
 from src.cargo import repair as repair_module  # noqa: E402
 from src.cargo.gates import (  # noqa: E402
     check_arg_grounding,
@@ -337,6 +341,30 @@ class TestWorkingMemory(unittest.TestCase):
         self.assertIn("O1234", wm.user_facts)
         self.assertIn("alex_smith_42", wm.user_facts)
 
+    def test_absorb_user_message_binds_airline_semantic_slots(self) -> None:
+        wm = WorkingMemory()
+        text = (
+            "Book an economy flight from New York to Seattle on May 20th, "
+            "with three checked bags, no insurance, and use my credit card."
+        )
+        wm.absorb_user_message(text)
+        GenericCargoKernel(TauAirlineAdapter()).observe_user_message(wm, text)
+
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
+        self.assertEqual(wm.semantic_slots["origin"], "New York")
+        self.assertEqual(wm.semantic_slots["destination"], "Seattle")
+        self.assertEqual(wm.semantic_slots["cabin"], "economy")
+        self.assertEqual(wm.semantic_slots["baggage_count"], 3)
+        self.assertEqual(wm.semantic_slots["travel_insurance"], "no")
+        self.assertIn("credit_card", wm.semantic_slots["payment_preferences"])
+
+    def test_db_confirmed_semantic_slot_outranks_later_user_claim(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_observation({"date": "2024-05-20"})
+        wm.absorb_user_message("Actually make that 2024-05-21.")
+
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
+
     def test_absorb_observation_dict_promotes_scalars(self) -> None:
         wm = WorkingMemory()
         wm.absorb_observation({"order_id": "O999", "status": "pending"})
@@ -365,6 +393,97 @@ class TestWorkingMemory(unittest.TestCase):
             wm._add_db_fact(f"fact_{i}={'x' * 80}")
         text = wm.render_compact(max_chars=600)
         self.assertLessEqual(len(text), 600)
+
+
+# ---------------------------------------------------------------------------
+# Tests: generic CARGO-v2 core + adapters
+# ---------------------------------------------------------------------------
+class TestCargoV2Adapters(unittest.TestCase):
+    def test_generic_kernel_records_conflict_without_overwriting_confirmed_fact(self) -> None:
+        wm = WorkingMemory()
+        wm.task_state.bind_fact("date", "2024-05-20", source="tool", confirmed=True)
+        changed = wm.task_state.bind_fact("date", "2024-05-21", source="user")
+
+        self.assertFalse(changed)
+        self.assertEqual(wm.task_state.fact_value("date"), "2024-05-20")
+        self.assertEqual(wm.task_state.conflicts[-1]["reason"], "confirmed_fact_outranks_weaker_claim")
+
+    def test_adapter_declares_non_id_fields_for_grounding(self) -> None:
+        schema = ToolEffectSchema(
+            name="search_direct_flight",
+            cls=RiskClass.READ,
+            arg_id_fields=[],
+            arg_semantic_fields=[],
+            param_properties={
+                "origin": {"type": "string"},
+                "destination": {"type": "string"},
+                "date": {"type": "string"},
+            },
+            required_params=["origin", "destination", "date"],
+        )
+        enriched = TauAirlineAdapter().enrich_schema(schema)
+        self.assertIn("origin", enriched.arg_semantic_fields)
+        self.assertIn("destination", enriched.arg_semantic_fields)
+        self.assertNotIn("origin", enriched.arg_id_fields)
+
+    def test_tau_retail_adapter_keeps_hard_constraints_separate_from_preferences(self) -> None:
+        wm = WorkingMemory()
+        kernel = GenericCargoKernel(TauRetailAdapter())
+        kernel.observe_user_message(
+            wm,
+            "Exchange it for a clicky full-size keyboard with RGB; if unavailable no backlight.",
+        )
+
+        hard = {(c.slot, c.op, c.value) for c in wm.task_state.constraints if c.hard}
+        prefs = {(p.slot, p.value) for p in wm.task_state.preferences}
+        fallbacks = {(f.slot, f.to_value) for f in wm.task_state.fallback_rules}
+        self.assertIn(("switch_type", "eq", "clicky"), hard)
+        self.assertIn(("size", "eq", "full size"), hard)
+        self.assertIn(("backlight", "rgb"), prefs)
+        self.assertIn(("backlight", "no backlight"), fallbacks)
+
+    def test_acebench_adapter_rejects_local_pass_global_fail_decoy(self) -> None:
+        wm = WorkingMemory()
+        wm.task_state.add_constraint(Constraint(slot="difficulty", op="<=", value=4, hard=True))
+        wm.task_state.add_candidate(CandidateObject(
+            candidate_id="decoy",
+            object_type="slot_candidate",
+            attributes={"difficulty": 3, "global_valid": False},
+        ))
+        action = ProposedAction(
+            name="set_slot",
+            args={"slot_id": "slot_a", "candidate_id": "decoy"},
+            declared_class=RiskClass.WRITE,
+        )
+        schema = ToolEffectSchema(
+            name="set_slot",
+            cls=RiskClass.WRITE,
+            arg_id_fields=["slot_id", "candidate_id"],
+        )
+
+        result = ACEBenchAdapter().validate_action(action, schema, wm)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "candidate_violates_global_constraints")
+
+    def test_synthetic_adapter_accepts_candidate_satisfying_all_constraints(self) -> None:
+        wm = WorkingMemory()
+        wm.task_state.add_constraint(Constraint(slot="difficulty", op="<=", value=4, hard=True))
+        wm.task_state.add_candidate(CandidateObject(
+            candidate_id="truth",
+            object_type="slot_candidate",
+            attributes={"difficulty": 2, "global_valid": True},
+        ))
+        action = ProposedAction(
+            name="set_slot",
+            args={"slot_id": "slot_a", "candidate_id": "truth"},
+            declared_class=RiskClass.WRITE,
+        )
+        schema = ToolEffectSchema(name="set_slot", cls=RiskClass.WRITE)
+
+        result = SyntheticGenericAdapter().validate_action(action, schema, wm)
+
+        self.assertTrue(result.ok, result.reason)
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +627,28 @@ class TestArgGroundingGate(unittest.TestCase):
         result = check_arg_grounding(action, schema, wm)
         self.assertFalse(result.ok)
         self.assertIn("new_item_ids[0]=made_up_item", result.reason)
+
+    def test_iso_date_argument_is_not_treated_as_opaque_id(self) -> None:
+        wm = WorkingMemory()
+        schema = ToolEffectSchema(
+            name="search_direct_flight",
+            cls=RiskClass.READ,
+            arg_id_fields=[],
+            required_params=["origin", "destination", "date"],
+        )
+        action = ProposedAction(
+            name="search_direct_flight",
+            args={
+                "origin": "New York",
+                "destination": "Seattle",
+                "date": "2024-05-20",
+            },
+            declared_class=RiskClass.READ,
+        )
+
+        result = check_arg_grounding(action, schema, wm)
+
+        self.assertTrue(result.ok, result.reason)
 
 
 class TestRepeatLoopGate(unittest.TestCase):
@@ -1962,6 +2103,13 @@ class TestTrajectory19Regressions(unittest.TestCase):
 
         self.assertIn("Z7GOZK", wm.typed_evidence_for("reservation_id"))
 
+    def test_profile_reservation_list_is_bound_to_typed_state(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_observation({"reservations": ["Z7GOZK", "K67C4W"]})
+
+        self.assertIn("Z7GOZK", wm.typed_evidence_for("reservation_id"))
+        self.assertIn("K67C4W", wm.typed_evidence_for("reservation_id"))
+
     def test_grounded_placeholder_resolver_uses_user_provided_id(self) -> None:
         agent = self._make_agent()
         wm = WorkingMemory()
@@ -2010,6 +2158,26 @@ class TestTrajectory19Regressions(unittest.TestCase):
         gate = check_arg_grounding(resolved, schema, wm)  # type: ignore[arg-type]
 
         self.assertTrue(gate.ok, gate.reason)
+
+    def test_airline_profile_repetition_advances_to_reservation_scan(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "change my return flight reservation"
+        wm.user_profiles["olivia_gonzalez_2305"] = {
+            "reservations": ["Z7GOZK", "K67C4W"],
+        }
+        wm.absorb_observation({"reservations": ["Z7GOZK", "K67C4W"]})
+        repeated = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "olivia_gonzalez_2305"},
+            declared_class=RiskClass.READ,
+        )
+
+        result = agent._advance_reservation_retrieval(repeated, wm)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "get_reservation_details")  # type: ignore[union-attr]
+        self.assertEqual(result.args["reservation_id"], "Z7GOZK")  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
     # Bug B: "exchange items in my recent order" routed to product flow
@@ -3060,7 +3228,14 @@ class TestTrajectory24Regressions(unittest.TestCase):
     def _make_agent(self) -> Any:
         from src.cargo.cargo_agent import CargoAgent
         client = MockClient(scripts=[])
-        return CargoAgent.__new__(CargoAgent)
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "test"
+        agent.temperature = 0.0
+        agent.schemas = {}
+        agent.adapter = TauAirlineAdapter()
+        agent.kernel = GenericCargoKernel(agent.adapter)
+        return agent
 
     def _placeholder(self, email: str = "alice@example.com") -> Any:
         from src.cargo.schemas import ProposedAction
@@ -3785,6 +3960,7 @@ class TestTrajectory24Regressions(unittest.TestCase):
                 "payment_method_id": "pm",
             },
             declared_class=RiskClass.WRITE,
+            bypass_gates=True,
         )
         fixed = agent._canonicalize_write_action(bad, wm)
         self.assertIsNotNone(fixed)
@@ -4086,6 +4262,207 @@ class TestTrajectory24Regressions(unittest.TestCase):
         failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
         self.assertIsNone(failing, failing.reason if failing else "")
         self.assertIn("final_completeness", diag["gates_run"])
+
+    def test_h5_final_with_followup_user_reply_does_not_terminate_solve(self) -> None:
+        import src.cargo.cargo_agent as cargo_agent_module
+
+        class _SolveResult:
+            def __init__(self, reward: float, info: Dict[str, Any],
+                         messages: List[Dict[str, Any]], total_cost: float) -> None:
+                self.reward = reward
+                self.info = info
+                self.messages = messages
+                self.total_cost = total_cost
+
+        scripts = [
+            _proposer_json(
+                name="respond",
+                declared_class="FINAL",
+                user_text="There are 10 available options.",
+            ),
+            [_proposer_json(
+                name="respond",
+                declared_class="FINAL",
+                user_text="There are 10 available options.",
+            )] * 3,
+            json.dumps({"predicted_obs": "ok", "goal_still_reachable": True}),
+            _proposer_json(
+                name="get_status",
+                args={"ticket_id": "T1234"},
+                declared_class="READ",
+            ),
+        ]
+        agent = self._make_agent()
+        agent.client = MockClient(scripts=scripts)
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.wiki = ""
+        agent.schemas = {
+            "respond": ToolEffectSchema(name="respond", cls=RiskClass.FINAL),
+            "get_status": ToolEffectSchema(
+                name="get_status",
+                cls=RiskClass.READ,
+                arg_id_fields=["ticket_id"],
+                required_params=["ticket_id"],
+            ),
+        }
+        agent.calibration = default_calibration()
+
+        env = MockEnv(
+            "How many options are available?",
+            [
+                _StepResp("Also check ticket T1234.", reward=0.0, done=False),
+                _StepResp({"ticket_id": "T1234", "status": "ok"}, reward=1.0, done=True),
+            ],
+        )
+        old_action = cargo_agent_module.Action
+        old_solve_result = cargo_agent_module.SolveResult
+        cargo_agent_module.Action = _Action
+        cargo_agent_module.SolveResult = _SolveResult
+        try:
+            result = agent.solve(env, max_num_steps=4)
+        finally:
+            cargo_agent_module.Action = old_action
+            cargo_agent_module.SolveResult = old_solve_result
+
+        self.assertEqual([a.name for a in env.actions_executed], ["respond", "get_status"])
+        self.assertEqual(result.reward, 1.0)
+
+    def test_h6_exchange_without_target_options_asks_instead_of_guessing(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.goal = "exchange the mechanical keyboard in order #W1"
+        wm.order_details["#W1"] = {
+            "order_id": "#W1",
+            "status": "delivered",
+            "payment_history": [{"payment_method_id": "credit_card_1"}],
+            "items": [{
+                "name": "Mechanical Keyboard",
+                "product_id": "keyboard",
+                "item_id": "old_keyboard",
+                "options": {"switch type": "linear", "backlight": "RGB"},
+            }],
+        }
+        wm.product_details["keyboard"] = {
+            "name": "Mechanical Keyboard",
+            "product_id": "keyboard",
+            "variants": {
+                "old_keyboard": {
+                    "item_id": "old_keyboard",
+                    "available": True,
+                    "options": {"switch type": "linear", "backlight": "RGB"},
+                },
+                "new_keyboard": {
+                    "item_id": "new_keyboard",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "none"},
+                },
+            },
+        }
+
+        commit = agent._grounded_retail_commit_action(wm)
+        ask = agent._missing_replacement_constraints_action(wm)
+
+        self.assertIsNone(commit)
+        self.assertIsNotNone(ask)
+        self.assertEqual(ask.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+
+    def test_i1_completed_auth_phase_blocks_auth_tool_reentry(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.auth_user_id = "alex_smith_42"
+        wm.lock_phase("auth")
+        action = ProposedAction(
+            name="find_user_id_by_email",
+            args={"email": "alex.smith@example.com"},
+            declared_class=RiskClass.READ,
+        )
+        schema = ToolEffectSchema(name="find_user_id_by_email", cls=RiskClass.READ)
+
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "state_validity")
+        self.assertIn("state_validity", diag["gates_failed"])
+
+    def test_i2_state_gate_blocks_search_conflicting_with_bound_date(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("Book a flight from New York to Seattle on May 20th.")
+        action = ProposedAction(
+            name="search_direct_flight",
+            args={
+                "origin": "New York",
+                "destination": "Seattle",
+                "date": "2024-05-21",
+            },
+            declared_class=RiskClass.READ,
+        )
+        schema = ToolEffectSchema(name="search_direct_flight", cls=RiskClass.READ)
+
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "state_validity")
+        self.assertIn("action_date_conflicts_with_state", failing.reason)
+
+    def test_i3_booking_write_requires_complete_slots(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message("Please book an economy flight for alex_smith_42.")
+        action = ProposedAction(
+            name="book_reservation",
+            args={"user_id": "alex_smith_42"},
+            declared_class=RiskClass.WRITE,
+        )
+        schema = ToolEffectSchema(
+            name="book_reservation",
+            cls=RiskClass.WRITE,
+            arg_id_fields=["user_id"],
+            required_params=["user_id"],
+        )
+
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "completeness")
+        self.assertIn("booking_missing_required_slots", failing.reason)
+        self.assertIn("completeness", diag["gates_failed"])
+
+    def test_i4_booking_write_passes_slot_completeness_when_filled(self) -> None:
+        agent = self._make_agent()
+        wm = WorkingMemory()
+        wm.absorb_user_message(
+            "Please book an economy flight for alex_smith_42 using my credit card."
+        )
+        action = ProposedAction(
+            name="book_reservation",
+            args={
+                "user_id": "alex_smith_42",
+                "flights": [{"flight_number": "TEST_FLIGHT_001"}],
+                "passengers": [{"first_name": "Alex", "last_name": "Smith"}],
+                "payment_method_id": "credit_card_1234",
+                "cabin": "economy",
+            },
+            declared_class=RiskClass.WRITE,
+            bypass_gates=True,
+        )
+        wm.absorb_observation({
+            "user_id": "alex_smith_42",
+            "flight_number": "TEST_FLIGHT_001",
+            "payment_methods": {"credit_card_1234": {"id": "credit_card_1234"}},
+        })
+        schema = ToolEffectSchema(
+            name="book_reservation",
+            cls=RiskClass.WRITE,
+            arg_id_fields=["user_id", "payment_method_id"],
+            required_params=["user_id"],
+        )
+
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+
+        self.assertIsNone(failing, failing.reason if failing else "")
+        self.assertIn("completeness", diag["gates_run"])
 
 
 # ---------------------------------------------------------------------------

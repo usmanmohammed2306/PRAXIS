@@ -9,7 +9,7 @@ and **ACEBench Agent**:
 | 1 | **Vanilla TC** (`baseline`) | Native function-calling, minimal system prompt. |
 | 2 | **Act** (`act`)             | Yao et al. 2022 ablation: action-only, no reasoning prose. |
 | 3 | **ReAct** (`react`)         | Yao et al. 2022: one-line `Thought:` before each Action. |
-| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; deterministic gates check argument grounding and pre-conditions, and a calibrated self-consistency vote (+ counterfactual rollout for IRREVERSIBLE / FINAL) decides whether to commit, retry, ask, or finalize. Mutations execute only after every gate passes. |
+| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; deterministic gates check argument grounding, task-state validity, semantic completeness, and pre-conditions, and a calibrated self-consistency vote (+ counterfactual rollout for IRREVERSIBLE / FINAL) decides whether to commit, retry, ask, or finalize. Mutations execute only after every gate passes. |
 
 All four conditions share the **same in-process loop, model,
 temperature, max-steps, and truncation budget**. The only varying axis is
@@ -37,6 +37,7 @@ unchanged.
             │  (1)  Typed Working Memory  (deterministic)             │
             │       slots: goal, user_revealed_facts,                 │
             │              db_confirmed_facts, assumptions,           │
+            │              semantic task slots, phase locks,          │
             │              pending_obligations, last_obs,             │
             │              last_error, budget_steps                   │
             │                                                         │
@@ -52,11 +53,13 @@ unchanged.
             │                                                         │
             │  (4)  Calibrated Gate                                   │
             │       (4-) repeat-loop check (cheap; runs always)       │
-            │       (4a) declared-pre ⊆ user_facts ∪ db_facts         │
-            │       (4b) ID-typed args grounded in evidence (regex)   │
-            │       (4c) self-consistency: k=3 samples at T=0.7,      │
+            │       (4a) state-validity check vs semantic WM          │
+            │       (4b) declared-pre ⊆ user_facts ∪ db_facts         │
+            │       (4c) ID-typed args grounded in evidence           │
+            │       (4d) completeness / confirmation for writes       │
+            │       (4e) self-consistency: k=3 samples at T=0.7,      │
             │            agreement ≥ τ_c                              │
-            │       (4d) counterfactual rollout (IRREV/FINAL only)    │
+            │       (4f) counterfactual rollout (IRREV/FINAL only)    │
             │                                                         │
             │  (5)  Repair on ABSTAIN  (deterministic)                │
             │       grounding/precond  → ASK_USER                     │
@@ -70,14 +73,62 @@ unchanged.
             └─────────────────────────────────────────────────────────┘
 ```
 
+## CARGO-v2: Generic Semantic State-Constraint Risk Gating
+
+CARGO remains a lightweight, training-free controller.  The v2 hardening
+does not add fine-tuning, a separate judge, benchmark answer retrieval, or a
+tree-search planner.  It extends the original gate stack so the verifier asks
+two questions before acting:
+
+1. Is the action grounded and well-formed?
+2. Is the action correct, complete, policy-compliant, and appropriate for the
+   current semantic task state?
+
+CARGO-v2 is split into a generic core plus pluggable adapters:
+
+- `src/cargo/core.py` defines the domain-neutral kernel: typed task state,
+  facts, constraints, preferences, fallback rules, candidate objects,
+  obligations, failed signatures, executed writes, semantic validation hooks,
+  completeness hooks, and terminal state.
+- `src/cargo/adapters/` contains benchmark/domain adapters.  The core does
+  not name retail products, flights, reservations, or ACEBench answer
+  patterns.  Adapters own tool schema enrichment, ID fields, non-ID semantic
+  fields, user-message binding, observation absorption, policy hooks,
+  semantic validators, and completion criteria.
+- Current adapters: `tau_retail`, `tau_airline`, `acebench`, and
+  `synthetic_generic`.
+
+The deterministic working memory now separates:
+
+- opaque typed IDs such as `user_id`, `order_id`, `item_id`, `product_id`,
+  `payment_method_id`, `reservation_id`, and `flight_number`
+- semantic task slots such as date, route, cabin, trip type, baggage count,
+  insurance choice, payment preferences, intent, and product-option
+  constraints
+- durable DB-confirmed caches such as orders, products, profiles, and
+  reservations
+
+The gate stack uses that state to block completed-phase re-entry, repeated
+dead-end actions without new evidence, semantic mismatches between action
+arguments and state, partial writes, missing booking slots, and replacement
+candidate choices that violate hard constraints.  Preferences only rank
+candidates after every hard filter has passed; fallbacks apply only when the
+strict constraint set is exhausted and the user allowed the fallback.
+
+The recovery ledger for uploaded failures is tracked in
+[`docs/known_issue_ledger.md`](docs/known_issue_ledger.md), with a
+machine-readable companion at [`docs/known_issues.json`](docs/known_issues.json).
+It maps each observed failure class to the invariant and regression test that
+now protects it.
+
 ## The five risk classes
 
 | Class | Examples | Treatment |
 |---|---|---|
-| `READ` | `get_*`, `list_*`, `find_*`, `search_*`, `lookup_*`, `view_*` | Fast path. Repeat-loop check only. |
-| `WRITE` | `update_*`, `modify_*`, `add_*`, `edit_*`, `set_*`, `place_*`, `book_*` | Pre-cond + arg-grounding + SC. |
-| `IRREVERSIBLE` | `cancel_*`, `delete_*`, `refund_*`, `charge_*`, `send_*`, `transfer_*` | Pre-cond + arg-grounding + SC + CF rollout. |
-| `FINAL` | `respond` (when committing the user's task) | Pre-cond + SC + CF rollout. |
+| `READ` | `get_*`, `list_*`, `find_*`, `search_*`, `lookup_*`, `view_*` | Fast path with repeat-loop, state-validity, and ID grounding. |
+| `WRITE` | `update_*`, `modify_*`, `add_*`, `edit_*`, `set_*`, `place_*`, `book_*` | State-validity + confirmation + completeness + pre-cond + arg-grounding + SC. |
+| `IRREVERSIBLE` | `cancel_*`, `delete_*`, `refund_*`, `charge_*`, `send_*`, `transfer_*` | State-validity + confirmation + completeness + pre-cond + arg-grounding + SC + CF rollout. |
+| `FINAL` | `respond` (when committing the user's task) | Final-completeness + pre-cond + SC + CF rollout. |
 | `ASK_USER` | `respond` (when asking a clarifying question) | Pass-through. |
 
 Auto-induction is rule-based (name prefix + parameter shape) by default —
@@ -140,6 +191,13 @@ model across every condition.
   the **twelve** evaluations (4 controllers × 3 benchmarks), shuts vLLM
   down, and writes the summary.
 
+No other `.sh` files are added.  Benchmark setup and smoke automation live
+as Python helpers:
+
+- `python3 scripts/benchmark_setup.py --bench all --install`
+- `python3 scripts/run_smoke.py --target all`
+- `python3 scripts/parse_smoke_results.py`
+
 ## Quickstart
 
 ```bash
@@ -168,6 +226,37 @@ bash run_project.sh --tau-only retail --controllers react,cargo --skip-acebench
 # Fine overrides (take precedence over the profile):
 bash run_project.sh --gpus 0,1 --tau-tasks 20 --tau-trials 2 --max-concurrency 16
 ```
+
+### Benchmark Setup And Smoke Tests
+
+Classic tau-bench and ACEBench are cloned into `external/`:
+
+```bash
+python3 scripts/benchmark_setup.py --bench all --install
+```
+
+By default the ACEBench helper installs the data/evaluation dependencies and
+skips ACEBench's pinned `vllm==0.6.1.post1`; `setup_env.sh` owns the model
+serving stack and filters upstream requirements so the CARGO vLLM build is not
+clobbered.  To reproduce upstream ACEBench exactly in an isolated environment,
+run:
+
+```bash
+python3 scripts/benchmark_setup.py --bench ace --install --include-ace-vllm
+```
+
+Run local smoke checks:
+
+```bash
+python3 scripts/run_smoke.py --target synthetic
+python3 scripts/run_smoke.py --target all
+python3 scripts/parse_smoke_results.py
+```
+
+If no `OPENAI_API_KEY` or `OPENAI_BASE_URL` is present, live tau/ACE smoke
+runs are marked `blocked` with rerun commands instead of being faked.  The
+synthetic smoke remains fully offline and exercises the generic core and
+adapter invariants.
 
 ### Auto-selected defaults
 
@@ -234,13 +323,13 @@ python3 -m unittest tests.test_cargo -v
 ```
 
 The suite checks: rule-based risk classification; tool schema caching;
-working-memory absorption (user text + observation); precondition
-matching (positive and negative); argument-grounding regex coverage;
-repeat-loop detection; self-consistency vote (mock client with `n>1`);
-counterfactual rollout (mock client); post-condition error detection;
-proposer JSON parsing (clean / fenced / malformed / nested); repair
-policy decisions; full agent loop on a mock env that returns scripted
-observations.
+working-memory absorption (user text + observation); typed task-state conflict
+handling; generic adapter schema enrichment; retail hard-constraint vs
+preference separation; ACEBench-style local-pass/global-fail decoy rejection;
+precondition matching; argument-grounding regex coverage; repeat-loop
+detection; self-consistency vote (mock client with `n>1`); counterfactual
+rollout (mock client); post-condition error detection; proposer JSON parsing;
+repair policy decisions; and full agent loop behavior on mock environments.
 
 ## What CARGO is — and isn't
 
@@ -253,13 +342,13 @@ CARGO is **lightweight on purpose**:
   that's ~16 calls vs ReAct's ~12.
 
 It uses **no** tree search, **no** multi-agent debate, **no**
-fine-tuning, **no** external LLM judge, **no** memory / fingerprint
-retrieval (slot reserved for v2).
+fine-tuning, **no** external LLM judge, and **no** memory / fingerprint
+retrieval.
 
 The novelty story is the *composition*: risk-class typing of tools
 (auto-induced) + class-specific calibrated abstention + selective
-self-consistency only on irreversible/final actions + deterministic
-argument-grounding + named deterministic repair. None of the parts is
+self-consistency only on risky actions + deterministic argument grounding +
+generic semantic state/constraint gates + named deterministic repair. None of the parts is
 unprecedented; the integration as a coherent training-free architecture
 for parameterized tool-using LLM agents, with **per-class** calibrated
 abstention rather than syntactic guardrails, is what differentiates it
