@@ -391,6 +391,12 @@ class TestWorkingMemory(unittest.TestCase):
         self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
         self.assertEqual(wm.semantic_slots["cabin"], "economy")
         self.assertIn("HKEG34", wm.typed_evidence_for("reservation_id"))
+    def test_tool_observation_does_not_overwrite_user_bound_date(self) -> None:
+        wm = WorkingMemory()
+        wm.absorb_user_message("Book the flight on May 20th.")
+        wm.absorb_observation({"date": "2024-05-27"})
+
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
 
     def test_absorb_observation_dict_promotes_scalars(self) -> None:
         wm = WorkingMemory()
@@ -5104,6 +5110,91 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
         self.assertTrue(adapter.semantic_values_match("origin", "DFW", "Texas"))
         self.assertTrue(adapter.semantic_values_match("origin", "IAH", "Texas"))
 
+    def test_v4_airline_reservation_obs_does_not_overwrite_booking_anchor(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "Book an economy flight from New York to Seattle on May 20th. "
+            "My user id is mia_li_3668."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+
+        obs = {
+            "reservation_id": "HKEG34",
+            "origin": "DEN",
+            "destination": "LAS",
+            "cabin": "business",
+            "flights": [{"origin": "DEN", "destination": "LAS", "date": "2024-05-27"}],
+        }
+        wm.absorb_observation(obs)
+        agent._kernel().observe_tool_result(wm, "get_reservation_details", obs)
+        ask = ProposedAction(name="respond", args={}, declared_class=RiskClass.ASK_USER)
+
+        replacement = agent._obligation_guided_action(ask, wm)
+
+        self.assertEqual(wm.semantic_slots["origin"], "New York")
+        self.assertEqual(wm.semantic_slots["destination"], "Seattle")
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_direct_flight")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["origin"], "JFK")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["destination"], "SEA")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["date"], "2024-05-20")  # type: ignore[union-attr]
+
+    def test_v4_booking_task_does_not_scan_reservations_before_search(self) -> None:
+        agent = self._make_airline_agent()
+        agent.schemas["get_reservation_details"] = ToolEffectSchema(
+            name="get_reservation_details",
+            cls=RiskClass.READ,
+            arg_id_fields=["reservation_id"],
+        )
+        wm = WorkingMemory()
+        text = (
+            "Book a flight from New York to Seattle on May 20th in economy. "
+            "My user id is mia_li_3668."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.user_profiles["mia_li_3668"] = {"reservations": ["HKEG34"]}
+        wm.typed_values["reservation_id"] = ["HKEG34"]
+        repeated_profile = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "mia_li_3668"},
+            declared_class=RiskClass.READ,
+        )
+
+        scan = agent._advance_reservation_retrieval(repeated_profile, wm)
+        replacement = agent._obligation_guided_action(
+            ProposedAction(name="respond", args={}, declared_class=RiskClass.ASK_USER),
+            wm,
+        )
+
+        self.assertIsNone(scan)
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_direct_flight")  # type: ignore[union-attr]
+
+    def test_v4_no_auth_product_query_routes_to_catalog_read(self) -> None:
+        agent = self._make_retail_agent()
+        agent.schemas["list_all_product_types"] = ToolEffectSchema(
+            name="list_all_product_types",
+            cls=RiskClass.READ,
+        )
+        wm = WorkingMemory()
+        wm.goal = "How many t-shirt options are currently available in the store?"
+        wm.absorb_user_message(wm.goal)
+        ask = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="Could you provide your name and ZIP?",
+        )
+
+        replacement = agent._no_auth_product_query_action(ask, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "list_all_product_types")  # type: ignore[union-attr]
+
     def test_v4_airline_blocks_premature_payment_questions(self) -> None:
         wm = WorkingMemory()
         text = "Book a flight from New York to Seattle on May 20th in economy."
@@ -5174,6 +5265,648 @@ class TestTauBenchIntegrationOptional(unittest.TestCase):
         from src.cargo.cargo_agent import CargoAgent  # noqa: F401
         self.assertTrue(hasattr(CargoAgent, "solve"))
 
+
+# ---------------------------------------------------------------------------
+# Trajectory(43) regressions — post-WRITE auto-respond architecture fix
+# ---------------------------------------------------------------------------
+class TestTrajectory43Regressions(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_cache()
+
+    """Regression tests for the post-WRITE auto-respond architectural fix.
+
+    Root cause analysis from trajectories(22-43): every retail task that
+    reached a successful WRITE got the WRITE args correct (matching gold
+    exactly) yet still scored reward 0.  Tau-bench only calculates reward
+    when the env hits ``done=True``, which for a non-terminate tool can
+    only happen via ``respond`` whose user reply contains ``###STOP###``.
+    Without a follow-up respond after the WRITE, the user simulator never
+    has a chance to emit STOP, so the trajectory ends with reward=0.
+
+    Architectural fix (FIX-A): after a successful WRITE/IRREVERSIBLE tool
+    call, the controller deterministically emits a respond announcing
+    completion.  This invariant must hold across:
+      * model-driven trajectories (proposer naturally proposes a respond
+        next — auto-respond should suppress on the same step)
+      * model-stuck trajectories (proposer proposes another tool / loops
+        — auto-respond is what closes the conversation)
+    """
+
+    def _make_agent(self) -> Any:
+        """Construct a CargoAgent without running its __init__."""
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+        agent = CargoAgent.__new__(CargoAgent)
+        return agent
+
+    # ----- _post_write_summary ----------------------------------------
+    def test_post_write_summary_handles_known_action_prefix(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={"order_id": "#W2378156"},
+            declared_class=RiskClass.WRITE,
+        )
+        msg = CargoAgent._post_write_summary(action, '{"status": "exchange requested"}')
+        # User-visible message uses the human action prefix, not the raw
+        # tool name.  This matters because the user simulator reads the
+        # text and decides whether to STOP.
+        self.assertIn("exchange", msg.lower())
+        self.assertIn("processed successfully", msg.lower())
+        # Status was extracted from the tool obs and surfaced.
+        self.assertIn("exchange requested", msg)
+        self.assertIn("anything else", msg.lower())
+
+    def test_post_write_summary_handles_cancel(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        action = ProposedAction(
+            name="cancel_pending_order",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.IRREVERSIBLE,
+        )
+        msg = CargoAgent._post_write_summary(action, '{"status": "cancelled"}')
+        self.assertIn("cancel", msg.lower())
+        self.assertIn("cancelled", msg)
+
+    def test_post_write_summary_no_status_field(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        action = ProposedAction(
+            name="modify_pending_order_payment",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.WRITE,
+        )
+        msg = CargoAgent._post_write_summary(action, '{"order_id": "#W1"}')
+        # No status field means no status phrase, but the action prefix
+        # ("modify") still gets surfaced cleanly.
+        self.assertIn("modify", msg.lower())
+        self.assertIn("processed successfully", msg.lower())
+
+    def test_post_write_summary_unknown_action_falls_back_safely(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        # Unknown / generic action name without one of the standard
+        # prefixes ("exchange", "cancel", ...) — message should still be
+        # well-formed (not crash, not produce weird underscores).
+        action = ProposedAction(
+            name="apply_promotion",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.WRITE,
+        )
+        msg = CargoAgent._post_write_summary(action, "")
+        # The full humanised name shows when no prefix matched.
+        self.assertIn("apply promotion", msg.lower())
+        self.assertNotIn("_", msg)  # no raw underscores leaked
+        self.assertIn("processed successfully", msg.lower())
+
+    def test_post_write_summary_invalid_json_obs(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+        from src.cargo.risk_class import RiskClass
+        from src.cargo.schemas import ProposedAction
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={"order_id": "#W1"},
+            declared_class=RiskClass.WRITE,
+        )
+        # Non-JSON tool obs (e.g. "Error: order not found") shouldn't
+        # crash the summary builder; just skip the status phrase.
+        msg = CargoAgent._post_write_summary(action, "Error: not allowed")
+        self.assertIn("exchange", msg.lower())
+        self.assertNotIn("Error", msg)
+        self.assertNotIn("'", msg.split("processed successfully")[1] if "processed successfully" in msg else "")
+
+    # ----- WorkingMemory durability -----------------------------------
+    def test_post_write_responded_flag_default(self) -> None:
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        # Default must be False so the controller fires the auto-respond
+        # at most once per trajectory.
+        self.assertFalse(wm.post_write_responded)
+
+    def test_post_write_responded_flag_settable(self) -> None:
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        wm.post_write_responded = True
+        self.assertTrue(wm.post_write_responded)
+
+    # ----- Solve loop integration via MockEnv -------------------------
+    def test_solve_emits_auto_respond_after_write(self) -> None:
+        """End-to-end check: proposer issues a WRITE, env returns done=False,
+        solve loop must follow up with a respond automatically.  This is
+        the exact scenario seen in trajectories(43) T0/T1 where the WRITE
+        args matched gold but the trajectory ended with reward=0 because
+        no follow-up respond ever fired.
+        """
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        # Use realistic tau-bench-format IDs in the initial user message
+        # so arg_grounding can ground the WRITE's args without a prior READ.
+        ORDER_ID = "#W2378156"
+        PAY = "credit_card_9513926"
+        USER_TURN = (
+            f"Modify pending order {ORDER_ID}: change payment method to {PAY}. "
+            "Please proceed."
+        )
+        # Step 0 proposer: emit a WRITE mutation (only the first step
+        # matters for this test).
+        scripts: List[Any] = [
+            _proposer_json(
+                name="modify_pending_order_payment",
+                args={"order_id": ORDER_ID, "payment_method_id": PAY},
+                declared_class="WRITE",
+                thought="commit",
+            ),
+            # SC samples for the WRITE (3 agreeing).
+            [_proposer_json(
+                name="modify_pending_order_payment",
+                args={"order_id": ORDER_ID, "payment_method_id": PAY},
+                declared_class="WRITE",
+            )] * 3,
+            # CF rollout: still reachable.
+            json.dumps({"predicted_obs": "{}", "goal_still_reachable": True}),
+            # If the loop does run another step (it shouldn't, env will
+            # signal done after the auto-respond), this is the next
+            # proposer output.
+            _proposer_json(
+                name="respond", declared_class="FINAL",
+                user_text="All done.",
+            ),
+        ]
+        client = MockClient(scripts=scripts)
+
+        # MockEnv: first env.step(write) returns the order details
+        # (done=False, like a real WRITE).  Second env.step is the
+        # auto-respond — return done=True so the loop exits cleanly with
+        # reward 1.0.
+        write_obs = json.dumps({
+            "order_id": ORDER_ID, "status": "payment modified",
+        })
+        env = MockEnv(
+            initial_user=USER_TURN,
+            step_responses=[
+                _StepResp(observation=write_obs, reward=0.0, done=False),
+                _StepResp(observation="thanks ###STOP###", reward=1.0, done=True),
+            ],
+        )
+
+        agent = CargoAgent.__new__(CargoAgent)
+        # Construct just enough state to call solve() — minimal __init__
+        # bypass.  Fields used by solve() must all be set.
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "retail"
+        agent.calibration = default_calibration()
+        # Schema for the WRITE so gates have something to check.
+        agent.schemas = induce_schemas([_tool(
+            "modify_pending_order_payment",
+            ["order_id", "payment_method_id"],
+        )])
+        agent.domain_policy = ""
+
+        result = agent.solve(env, task_index=0, max_num_steps=10)
+
+        # Verify the auto-respond fired: we expect AT LEAST 2 actions
+        # executed against the env (the WRITE and the auto-respond).
+        executed_names = [a.name for a in env.actions_executed]
+        self.assertIn(
+            "modify_pending_order_payment", executed_names,
+            f"WRITE never executed; env actions={executed_names}",
+        )
+        self.assertIn(
+            "respond", executed_names,
+            f"Auto-respond did NOT fire after WRITE; env actions={executed_names}",
+        )
+        # Order matters: respond must come AFTER the exchange.
+        self.assertLess(
+            executed_names.index("modify_pending_order_payment"),
+            executed_names.index("respond"),
+            f"Auto-respond fired before WRITE; env actions={executed_names}",
+        )
+        # Reward propagated from env_resp2 (the auto-respond) — 1.0 means
+        # the task scored a positive reward via STOP detection.
+        self.assertEqual(result.reward, 1.0)
+
+    def test_solve_post_write_responded_flag_set(self) -> None:
+        """After a successful WRITE + auto-respond, wm.post_write_responded
+        must be True.  This is the durable signal that suppresses the
+        second auto-respond if a later WRITE happens in the same trajectory.
+
+        We can't directly inspect wm from outside solve(), so we instead
+        verify the OBSERVABLE consequence: env.actions_executed contains
+        exactly ONE 'respond' (the auto-respond) plus the WRITE itself.
+        Reward propagates from the user simulator's STOP."""
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        ORDER_ID = "#W2378156"
+        PAY = "credit_card_9513926"
+        USER_TURN = (
+            f"Modify pending order {ORDER_ID}: change payment method to {PAY}."
+        )
+        scripts: List[Any] = [
+            _proposer_json(
+                name="modify_pending_order_payment",
+                args={"order_id": ORDER_ID, "payment_method_id": PAY},
+                declared_class="WRITE",
+            ),
+            [_proposer_json(
+                name="modify_pending_order_payment",
+                args={"order_id": ORDER_ID, "payment_method_id": PAY},
+                declared_class="WRITE",
+            )] * 3,
+            json.dumps({"predicted_obs": "{}", "goal_still_reachable": True}),
+        ]
+        client = MockClient(scripts=scripts)
+
+        env = MockEnv(
+            initial_user=USER_TURN,
+            step_responses=[
+                _StepResp(observation='{"status": "pending (payment modified)"}',
+                          reward=0.0, done=False),
+                # User STOPs after the auto-respond.
+                _StepResp(observation="thanks ###STOP###", reward=1.0, done=True),
+            ],
+        )
+
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "retail"
+        agent.calibration = default_calibration()
+        agent.schemas = induce_schemas([
+            _tool("modify_pending_order_payment",
+                  ["order_id", "payment_method_id"]),
+        ])
+        agent.domain_policy = ""
+
+        result = agent.solve(env, task_index=0, max_num_steps=5)
+
+        respond_count = sum(
+            1 for a in env.actions_executed if a.name == "respond"
+        )
+        # Exactly one auto-respond after the WRITE.  No double-fire.
+        self.assertEqual(
+            respond_count, 1,
+            f"Auto-respond did not fire exactly once; "
+            f"respond count={respond_count}",
+        )
+        self.assertEqual(result.reward, 1.0)
+
+    def test_solve_skips_auto_respond_when_done_already_true(self) -> None:
+        """If the WRITE itself caused the env to signal done=True
+        (e.g. transfer_to_human_agents), the controller must NOT call
+        _respond afterward — that would step a closed env.
+
+        We use a non-IRREVERSIBLE class to keep the gate stack simple
+        (READ doesn't go through SC/CF), and have the env return done=True
+        on the read itself.  In real tau-bench this scenario corresponds
+        to a tool whose execution implicitly closes the conversation
+        (e.g. an admin tool the env decides to terminate after).
+        """
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        # Use a WRITE so the post-WRITE branch is the relevant code path.
+        # The env returns done=True on the WRITE itself (mimicking
+        # transfer_to_human_agents which is in terminate_tools).
+        ORDER_ID = "#W2378156"
+        scripts: List[Any] = [
+            _proposer_json(
+                name="cancel_pending_order",
+                args={"order_id": ORDER_ID, "reason": "no longer needed"},
+                declared_class="WRITE",
+            ),
+            [_proposer_json(
+                name="cancel_pending_order",
+                args={"order_id": ORDER_ID, "reason": "no longer needed"},
+                declared_class="WRITE",
+            )] * 3,
+            json.dumps({"predicted_obs": "{}", "goal_still_reachable": True}),
+        ]
+        client = MockClient(scripts=scripts)
+
+        env = MockEnv(
+            initial_user=f"Cancel my pending order {ORDER_ID} - no longer needed",
+            step_responses=[
+                # Env signals done=True directly from the WRITE.
+                _StepResp(observation='{"status": "cancelled"}',
+                          reward=1.0, done=True),
+            ],
+        )
+
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "retail"
+        agent.calibration = default_calibration()
+        agent.schemas = induce_schemas([
+            _tool("cancel_pending_order", ["order_id", "reason"]),
+        ])
+        agent.domain_policy = ""
+
+        agent.solve(env, task_index=0, max_num_steps=5)
+
+        # No respond after the WRITE — the env was already closed.
+        respond_count = sum(
+            1 for a in env.actions_executed if a.name == "respond"
+        )
+        self.assertEqual(
+            respond_count, 0,
+            f"Auto-respond fired after env signalled done; "
+            f"respond count={respond_count}",
+        )
+        self.assertEqual(
+            env.actions_executed[0].name, "cancel_pending_order",
+            f"WRITE was not the first action; "
+            f"got {env.actions_executed[0].name}",
+        )
+
+
+    # ===================================================================
+    # Tests for FIX-B: Search-exhaustion detection and escape
+    # ===================================================================
+
+    def test_is_search_tool_identifies_search_flights(self) -> None:
+        """_is_search_tool should identify search_direct_flight and search_onestop_flight."""
+        from src.cargo.cargo_agent import CargoAgent
+        self.assertTrue(CargoAgent._is_search_tool("search_direct_flight"))
+        self.assertTrue(CargoAgent._is_search_tool("search_onestop_flight"))
+        self.assertTrue(CargoAgent._is_search_tool("search_items"))
+        self.assertFalse(CargoAgent._is_search_tool("get_order_details"))
+        self.assertFalse(CargoAgent._is_search_tool("list_all_product_types"))
+
+    def test_is_empty_search_result_detects_no_results(self) -> None:
+        """_is_empty_search_result should detect various no-match patterns."""
+        from src.cargo.cargo_agent import CargoAgent
+        # Explicit empty patterns
+        self.assertTrue(CargoAgent._is_empty_search_result(""))
+        self.assertTrue(CargoAgent._is_empty_search_result("[]"))
+        self.assertTrue(CargoAgent._is_empty_search_result('{"results": []}'))
+        self.assertTrue(CargoAgent._is_empty_search_result('{"flights": []}'))
+        # Text patterns
+        self.assertTrue(CargoAgent._is_empty_search_result("No flights found"))
+        self.assertTrue(CargoAgent._is_empty_search_result("not found"))
+        self.assertTrue(CargoAgent._is_empty_search_result("No matching results"))
+        # Error patterns
+        self.assertTrue(CargoAgent._is_empty_search_result("error: invalid parameters"))
+        self.assertTrue(CargoAgent._is_empty_search_result('{"error": "not found"}'))
+        # Should NOT match when results exist
+        self.assertFalse(CargoAgent._is_empty_search_result(
+            '{"flights": [{"id": 1, "departure": "08:00"}]}'
+        ))
+        self.assertFalse(CargoAgent._is_empty_search_result(
+            '[{"id": "F001", "airline": "Airlines"}]'
+        ))
+
+    def test_working_memory_search_exhaustion_fields(self) -> None:
+        """WorkingMemory should track search exhaustion state."""
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        self.assertEqual(wm.consecutive_empty_searches, 0)
+        self.assertEqual(wm.last_search_tool, "")
+        self.assertFalse(wm.search_exhaustion_triggered)
+
+    def test_working_memory_consecutive_empty_searches_increments(self) -> None:
+        """Consecutive empty searches should increment the counter."""
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        wm.consecutive_empty_searches = 0
+        wm.last_search_tool = ""
+        # Simulate detecting first empty search
+        wm.consecutive_empty_searches += 1
+        wm.last_search_tool = "search_direct_flight"
+        self.assertEqual(wm.consecutive_empty_searches, 1)
+        # Simulate second empty search with same tool
+        wm.consecutive_empty_searches += 1
+        self.assertEqual(wm.consecutive_empty_searches, 2)
+        # Reset when a result is found
+        wm.consecutive_empty_searches = 0
+        self.assertEqual(wm.consecutive_empty_searches, 0)
+
+    def test_solve_detects_search_exhaustion_and_escapes(self) -> None:
+        """When search exhaustion is detected (4+ empty searches),
+        the solver should emit an ASK_USER and continue, not burn steps."""
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        # Simulate a trajectory with repeated empty search results.
+        # The proposer keeps proposing search_direct_flight with different args,
+        # but all return empty results.
+        scripts: List[Any] = [
+            # Step 1: initial proposer → search_direct_flight
+            _proposer_json(
+                name="search_direct_flight",
+                args={"from": "NYC", "to": "LAX", "date": "2026-06-01"},
+            ),
+            # Step 2: proposer returns another search (no progress made)
+            _proposer_json(
+                name="search_direct_flight",
+                args={"from": "NYC", "to": "LAX", "date": "2026-06-02"},
+            ),
+            # Step 3: another search attempt (still no progress)
+            _proposer_json(
+                name="search_direct_flight",
+                args={"from": "NYC", "to": "LAX", "date": "2026-06-03"},
+            ),
+            # Step 4: another search attempt (still no progress) →
+            # At this point consecutive_empty_searches=4, escape is triggered.
+            [_proposer_json(
+                name="search_direct_flight",
+                args={"from": "NYC", "to": "LAX", "date": "2026-06-04"},
+            )] * 3,
+            json.dumps({"predicted_obs": "[]", "goal_still_reachable": False}),
+        ]
+        client = MockClient(scripts=scripts)
+
+        env = MockEnv(
+            initial_user="Find a flight from NYC to LAX in June 2026",
+            step_responses=[
+                # All search results are empty
+                _StepResp(observation='[]'),
+                _StepResp(observation='[]'),
+                _StepResp(observation='[]'),
+                _StepResp(observation='[]'),
+                # After escape, user provides more info
+                _StepResp(observation='User provided additional constraints'),
+            ],
+        )
+
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "airline"
+        agent.calibration = default_calibration()
+        agent.schemas = induce_schemas([
+            _tool("search_direct_flight", ["from", "to", "date"]),
+        ])
+        agent.domain_policy = ""
+
+        result = agent.solve(env, task_index=0, max_num_steps=10)
+
+        # Verify that escape was triggered: we should see an ASK_USER respond
+        # after the 4th empty search result, instead of burning more steps.
+        respond_count = sum(
+            1 for a in env.actions_executed if a.name == "respond"
+        )
+        # Should have emitted 1 respond (the ASK_USER escape).
+        # Without the escape, the proposer would keep cycling through
+        # searches until the budget is exhausted.
+        self.assertGreaterEqual(
+            respond_count, 1,
+            f"Search-exhaustion escape should emit at least 1 respond; "
+            f"got {respond_count}",
+        )
+        self.assertLessEqual(
+            len(env.actions_executed), 8,
+            f"Search-exhaustion escape should fire before exhausting budget; "
+            f"got {len(env.actions_executed)} actions",
+        )
+
+    # ===================================================================
+    # Tests for FIX-C: Auth-cycle detection and escape
+    # ===================================================================
+
+    def test_working_memory_auth_cycle_fields(self) -> None:
+        """WorkingMemory should track auth-cycle state."""
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        self.assertEqual(wm.consecutive_auth_attempts, 0)
+        self.assertEqual(wm.last_confirmed_auth_user_id, "")
+        self.assertFalse(wm.auth_cycle_triggered)
+
+    def test_working_memory_auth_attempt_counter_increments(self) -> None:
+        """Consecutive auth attempts without confirmation should increment counter."""
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        # Simulate consecutive auth attempts without progress
+        wm.consecutive_auth_attempts = 1
+        wm.consecutive_auth_attempts = 2
+        wm.consecutive_auth_attempts = 3
+        self.assertEqual(wm.consecutive_auth_attempts, 3)
+        # Confirming auth should reset
+        wm.auth_user_id = "yusuf_rossi_9620"
+        wm.last_confirmed_auth_user_id = wm.auth_user_id
+        wm.consecutive_auth_attempts = 0
+        self.assertEqual(wm.consecutive_auth_attempts, 0)
+
+    def test_solve_detects_auth_cycle_and_escapes(self) -> None:
+        """When auth-tool calls don't make progress toward user_id,
+        the solver should emit an ASK_USER to break the auth loop."""
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        # Simulate a trajectory stuck in auth loop: repeated get_user_details
+        # without confirming auth_user_id, similar to airline T1.
+        scripts: List[Any] = [
+            # Step 1: first get_user_details
+            _proposer_json(
+                name="get_user_details",
+                args={"user_id": "placeholder_1"},
+            ),
+            # Step 2: proposer tries again (confused about auth status)
+            _proposer_json(
+                name="get_user_details",
+                args={"user_id": "placeholder_2"},
+            ),
+            # Step 3: third auth attempt
+            [_proposer_json(
+                name="get_user_details",
+                args={"user_id": "placeholder_3"},
+            )] * 3,
+            json.dumps({"predicted_obs": "{}", "goal_still_reachable": False}),
+        ]
+        client = MockClient(scripts=scripts)
+
+        env = MockEnv(
+            initial_user="Get my user details",
+            step_responses=[
+                # Each get_user_details returns data but doesn't set auth_user_id
+                # (because placeholder IDs don't match real users)
+                _StepResp(observation='{"user_id": "placeholder_1", "email": "x@example.com"}'),
+                _StepResp(observation='{"user_id": "placeholder_2", "email": "y@example.com"}'),
+                _StepResp(observation='{"user_id": "placeholder_3", "email": "z@example.com"}'),
+                # After escape, user provides clarification
+                _StepResp(observation='User clarified their credentials'),
+            ],
+        )
+
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "airline"
+        agent.calibration = default_calibration()
+        agent.schemas = induce_schemas([
+            _tool("get_user_details", ["user_id"]),
+        ])
+        agent.domain_policy = ""
+
+        result = agent.solve(env, task_index=0, max_num_steps=10)
+
+        # Verify auth-cycle escape was triggered
+        respond_count = sum(
+            1 for a in env.actions_executed if a.name == "respond"
+        )
+        # Should emit 1 respond (the auth-cycle escape)
+        self.assertGreaterEqual(
+            respond_count, 1,
+            f"Auth-cycle escape should emit at least 1 respond; "
+            f"got {respond_count}",
+        )
+        self.assertLessEqual(
+            len(env.actions_executed), 8,
+            f"Auth-cycle escape should fire before exhausting budget; "
+            f"got {len(env.actions_executed)} actions",
+        )
 
 if __name__ == "__main__":
     unittest.main()

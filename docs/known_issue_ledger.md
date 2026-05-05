@@ -2,6 +2,7 @@
 
 This ledger is the recovery record for the uploaded CARGO runs from
 `metrics (24).json` through `metrics (49).json`, their paired trajectories,
+`metrics (24).json` through `metrics (46).json`, their paired trajectories,
 and the local regression suite.  It is intentionally phrased by failure
 class rather than benchmark task answer, so it remains a test and design
 artifact rather than an answer key.
@@ -77,6 +78,14 @@ Machine-readable companion: `docs/known_issues.json`.
   auth, prevents booking goals from scanning unrelated reservations, filters
   invalid reservation IDs from scan queues, and emits the terminal `respond`
   after a successful write.
+- Task-frame isolation keeps user-bound goal slots separate from nested
+  candidate/reservation/profile facts, so tool observations add evidence
+  without silently rewriting the current route/date/cabin/product objective.
+- No-auth catalog routing sends pure retail product-count/list requests to
+  catalog READ actions instead of identity collection. Account/order tasks
+  remain auth-strict.
+- Successful WRITE/IRREVERSIBLE actions emit a post-write `respond` before
+  terminal completion, unless another distinct grounded mutation is pending.
 - Obligation guidance converts repeated or generic ASK/FINAL proposals into
   the next grounded READ when user/tool evidence already identifies an open
   information need.
@@ -140,6 +149,19 @@ Machine-readable companion: `docs/known_issues.json`.
   dependencies installed, while upstream `vllm==0.6.1.post1` and
   conflict-prone shared pins remain intentionally skipped unless
   `--include-ace-vllm` is used in an isolated environment. Live smoke still
+| Airline reservation observation overwrote booking goal | metrics (42)/(45) booking tasks bound New York→Seattle May 20, then profile/reservation reads shifted searches to unrelated stored trips such as DEN→LAS May 27 | Tool observation fields were promoted into semantic task slots without preserving user-slot provenance | User-bound task-frame slots keep provenance; tool object fields are evidence, not automatic goal updates | `test_v4_airline_reservation_obs_does_not_overwrite_booking_anchor`, `test_tool_observation_does_not_overwrite_user_bound_date` | Fixed, verified |
+| New booking scanned existing reservations before itinerary search | metrics (42)/(45) new-booking tasks retrieved reservation details after profile instead of searching the requested route/date | Reservation-scan advancement did not distinguish new booking intent from modification/cancel intent | Booking intent suppresses reservation scans and keeps the pipeline on grounded flight search | `test_v4_booking_task_does_not_scan_reservations_before_search` | Fixed, verified |
+| Pure product-count task asked for identity | metrics (46) included catalog/count requests that burned turns on auth-like asks despite no account/order operation | The no-auth override caught placeholder lookup tools but not model-proposed `respond`/ASK_USER actions | Pure catalog/count goals route to `list_all_product_types` or grounded `get_product_details` before identity collection | `test_v4_no_auth_product_query_routes_to_catalog_read` | Fixed, verified |
+| Successful write did not give simulator a terminal response | metrics (43)/(46) retail traces executed useful writes but did not always produce the post-write `respond` needed for tau-bench STOP/reward | The solve loop marked the task complete and broke before the post-write response path | Terminal completion is deferred until after a deterministic post-write `respond`, unless another distinct grounded mutation remains | `test_solve_emits_auto_respond_after_write`, `test_solve_post_write_responded_flag_set` | Fixed, verified |
+
+## Remaining Limitations
+
+- Classic tau-bench and ACEBench were cloned into `external/`; tau-bench was
+  installed locally.  ACEBench data/eval dependencies are installed while
+  upstream pins that conflict with the CARGO/LiteLLM runtime
+  (`openai==1.64.0`, `python-dotenv==1.0.1`, `vllm==0.6.1.post1`) are skipped
+  by default. Use `--include-ace-vllm --include-ace-conflicting-pins` only in
+  an isolated virtualenv for exact upstream reproduction. Live smoke still
   needs a model endpoint/API key.
 - Airline full booking selection is guarded for slot completeness, state
   consistency, obligation-guided search progression, empty-search exhaustion,
@@ -157,3 +179,14 @@ Machine-readable companion: `docs/known_issues.json`.
 - `python3 scripts/benchmark_setup.py --bench all --install --json-out outputs/smoke/benchmark_setup_latest.json`: tau-bench install and ACEBench safe-dependency install completed after network approval.
 - `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_latest.json`: synthetic checks passed offline; tau retail/airline and ACE live smoke were honestly marked blocked because no `OPENAI_API_KEY` or `OPENAI_BASE_URL` was present.
 - `python3 scripts/parse_smoke_results.py --smoke-summary outputs/smoke/smoke_summary_latest.json --json-out outputs/smoke/smoke_compact_latest.json`: passed.
+- `python3 -m unittest tests.test_cargo -v`: 267 local regression tests passed.
+- `python3 -m compileall src tests scripts`: passed.
+- `python3 scripts/benchmark_setup.py --bench all --install`: passed with
+  tau-bench installed and ACEBench conflicting pins skipped by default.
+- `python3 -m pip check`: no broken requirements found.
+- `git diff --check`: passed.
+- `bash run_project.sh --dry-run`: passed configuration resolution without
+  launching a model server or benchmark run.
+- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_latest.json`:
+  synthetic checks passed; tau retail/airline and ACE live smoke are blocked
+  unless `OPENAI_API_KEY` or `OPENAI_BASE_URL` is present.

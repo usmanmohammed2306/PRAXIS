@@ -117,6 +117,34 @@ class WorkingMemory:
     # detect a "same FINAL on every step" infinite loop and break out.
     last_final_text: str = ""
     consecutive_same_final: int = 0
+    # Set once the controller has emitted a deterministic post-WRITE respond
+    # so it doesn't fire twice for the same trajectory (e.g. when the model
+    # itself proposes a follow-up respond on the next step).  Without this
+    # flag, the post-WRITE auto-respond and a subsequent model-emitted
+    # respond would both call env.step(respond), inflating message count
+    # and confusing the user simulator.
+    post_write_responded: bool = False
+    # Track consecutive searches (search_*, search_direct_flight, search_onestop_flight)
+    # that return empty or no-match results. When this exceeds a threshold, the
+    # solve loop triggers an ASK_USER to escape the search-exhaustion loop.
+    # (Observed failure: airline T0 executes 20+ search_* calls without progress.)
+    consecutive_empty_searches: int = 0
+    # Name of the last search tool executed (e.g. "search_direct_flight").
+    # Used to detect when we've switched search tools without finding results.
+    last_search_tool: str = ""
+    # Set once we've already emitted an ASK_USER to escape search exhaustion,
+    # so we don't fire the override twice for the same trajectory.
+    search_exhaustion_triggered: bool = False
+    # Track consecutive auth-tool attempts (find_user_id_*, get_user_details)
+    # that don't progress toward confirmed authentication. When this exceeds
+    # a threshold, indicates a stuck auth loop; should escape with ASK_USER.
+    # (Observed failure: airline T1 alternates between get_user_details and
+    # respond proposals with 12+ abstains.)
+    consecutive_auth_attempts: int = 0
+    # Set once auth_user_id was confirmed, used to reset the auth-attempt counter
+    last_confirmed_auth_user_id: str = ""
+    # Set once we've triggered auth-loop escape via ASK_USER
+    auth_cycle_triggered: bool = False
 
     # ------------------------------------------------------------------
     # Updates
@@ -184,6 +212,15 @@ class WorkingMemory:
             if isinstance(v, (str, int, float)) and v not in (None, ""):
                 self._add_typed_value(kpath, v)
                 if not prefix:
+                # Tool observations often contain nested object facts such as
+                # reservation.flights[0].date.  Those are evidence about an
+                # observed candidate, not necessarily the user's active task
+                # frame.  Only promote top-level scalar observations into
+                # generic semantic slots when missing; do not let a later
+                # observation rewrite a user-bound task frame. Domain adapters
+                # can opt into richer task-frame binding with explicit
+                # provenance.
+                if not prefix and _normalize_semantic_key(kpath) not in self.semantic_slots:
                     self._add_semantic_slot(kpath, v, confirmed=True)
                 self._add_db_fact(f"{kpath}={v}")
                 # Also store the value alone (helps arg-grounding substring).
