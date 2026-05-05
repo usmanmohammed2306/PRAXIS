@@ -1098,6 +1098,86 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 wm.last_search_tool = ""
                 continue
 
+            # ---------------------------------------------------------------
+            # AUTH-CYCLE ESCAPE (FIX-C)
+            # ---------------------------------------------------------------
+            # When the agent repeatedly calls auth-related tools
+            # (find_user_id_by_email, find_user_id_by_name_zip, get_user_details)
+            # without confirming a user_id, or keeps cycling between auth tools
+            # and respond proposals, it is stuck in an auth loop.  After N
+            # consecutive auth attempts without progress toward confirmed auth,
+            # emit an ASK_USER to either accept the current auth state or get
+            # clearer credentials from the user.
+            # (Observed failure: airline T1 alternates between get_user_details
+            # and respond proposals with 12+ abstains.)
+            AUTH_ATTEMPT_THRESHOLD = 3
+            is_auth_tool = action.name in (
+                "find_user_id_by_email",
+                "find_user_id_by_name_zip",
+                "get_user_details",
+            )
+            if is_auth_tool:
+                # Check if we made progress toward confirmed auth
+                if wm.auth_user_id and wm.auth_user_id != wm.last_confirmed_auth_user_id:
+                    # Just confirmed a new user_id; reset counter
+                    wm.consecutive_auth_attempts = 0
+                    wm.last_confirmed_auth_user_id = wm.auth_user_id
+                else:
+                    # No progress on auth; increment counter
+                    wm.consecutive_auth_attempts += 1
+            else:
+                # Non-auth tool: reset counter
+                wm.consecutive_auth_attempts = 0
+
+            if (
+                wm.consecutive_auth_attempts >= AUTH_ATTEMPT_THRESHOLD
+                and not wm.auth_cycle_triggered
+            ):
+                # Emit ASK_USER to break the auth loop
+                auth_ask = (
+                    "I'm having trouble confirming your identity with the information provided. "
+                    "Could you clarify your email or name+ZIP, or would you like to proceed with "
+                    "what I currently have?"
+                )
+                env_resp_auth = self._respond(env, auth_ask)
+                if env_resp_auth is None:
+                    break
+                # Log the respond
+                aux_call_id = f"cargo_{step}_auth_escape"
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": aux_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": RESPOND_TOOL_NAME,
+                            "arguments": json.dumps(
+                                {"content": auth_ask[:RESPOND_MAX_CHARS]}
+                            ),
+                        },
+                    }],
+                })
+                user_reply_auth = _obs_text(env_resp_auth)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": aux_call_id,
+                    "name": RESPOND_TOOL_NAME,
+                    "content": user_reply_auth,
+                })
+                if user_reply_auth:
+                    wm.absorb_user_message(user_reply_auth)
+                reward = _float(getattr(env_resp_auth, "reward", reward), reward)
+                info = getattr(env_resp_auth, "info", info) or info
+                done = bool(getattr(env_resp_auth, "done", False))
+                wm.auth_cycle_triggered = True
+                stats.repair_ask_user += 1
+                if done:
+                    break
+                # Reset counter to allow new auth attempts with fresh user input
+                wm.consecutive_auth_attempts = 0
+                continue
+
             # POST-WRITE AUTO-RESPOND (architectural fix — trajectories 22-43)
             # ---------------------------------------------------------------
             # After a successful WRITE/IRREVERSIBLE action, deterministically

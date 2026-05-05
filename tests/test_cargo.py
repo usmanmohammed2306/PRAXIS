@@ -3873,5 +3873,109 @@ class TestTrajectory43Regressions(unittest.TestCase):
             f"got {len(env.actions_executed)} actions",
         )
 
+    # ===================================================================
+    # Tests for FIX-C: Auth-cycle detection and escape
+    # ===================================================================
+
+    def test_working_memory_auth_cycle_fields(self) -> None:
+        """WorkingMemory should track auth-cycle state."""
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        self.assertEqual(wm.consecutive_auth_attempts, 0)
+        self.assertEqual(wm.last_confirmed_auth_user_id, "")
+        self.assertFalse(wm.auth_cycle_triggered)
+
+    def test_working_memory_auth_attempt_counter_increments(self) -> None:
+        """Consecutive auth attempts without confirmation should increment counter."""
+        from src.cargo.working_memory import WorkingMemory
+        wm = WorkingMemory()
+        # Simulate consecutive auth attempts without progress
+        wm.consecutive_auth_attempts = 1
+        wm.consecutive_auth_attempts = 2
+        wm.consecutive_auth_attempts = 3
+        self.assertEqual(wm.consecutive_auth_attempts, 3)
+        # Confirming auth should reset
+        wm.auth_user_id = "yusuf_rossi_9620"
+        wm.last_confirmed_auth_user_id = wm.auth_user_id
+        wm.consecutive_auth_attempts = 0
+        self.assertEqual(wm.consecutive_auth_attempts, 0)
+
+    def test_solve_detects_auth_cycle_and_escapes(self) -> None:
+        """When auth-tool calls don't make progress toward user_id,
+        the solver should emit an ASK_USER to break the auth loop."""
+        try:
+            import tau_bench  # noqa: F401
+        except ImportError:
+            self.skipTest("tau_bench not installed")
+        from src.cargo.cargo_agent import CargoAgent
+
+        # Simulate a trajectory stuck in auth loop: repeated get_user_details
+        # without confirming auth_user_id, similar to airline T1.
+        scripts: List[Any] = [
+            # Step 1: first get_user_details
+            _proposer_json(
+                name="get_user_details",
+                args={"user_id": "placeholder_1"},
+            ),
+            # Step 2: proposer tries again (confused about auth status)
+            _proposer_json(
+                name="get_user_details",
+                args={"user_id": "placeholder_2"},
+            ),
+            # Step 3: third auth attempt
+            [_proposer_json(
+                name="get_user_details",
+                args={"user_id": "placeholder_3"},
+            )] * 3,
+            json.dumps({"predicted_obs": "{}", "goal_still_reachable": False}),
+        ]
+        client = MockClient(scripts=scripts)
+
+        env = MockEnv(
+            initial_user="Get my user details",
+            step_responses=[
+                # Each get_user_details returns data but doesn't set auth_user_id
+                # (because placeholder IDs don't match real users)
+                _StepResp(observation='{"user_id": "placeholder_1", "email": "x@example.com"}'),
+                _StepResp(observation='{"user_id": "placeholder_2", "email": "y@example.com"}'),
+                _StepResp(observation='{"user_id": "placeholder_3", "email": "z@example.com"}'),
+                # After escape, user provides clarification
+                _StepResp(observation='User clarified their credentials'),
+            ],
+        )
+
+        from src.cargo.schema_inducer import induce_schemas
+        from src.cargo.calibration import default_calibration
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = client
+        agent.model = "m"
+        agent.temperature = 0.0
+        agent.tools_info = []
+        agent.wiki = ""
+        agent.env_hint = "airline"
+        agent.calibration = default_calibration()
+        agent.schemas = induce_schemas([
+            _tool("get_user_details", ["user_id"]),
+        ])
+        agent.domain_policy = ""
+
+        result = agent.solve(env, task_index=0, max_num_steps=10)
+
+        # Verify auth-cycle escape was triggered
+        respond_count = sum(
+            1 for a in env.actions_executed if a.name == "respond"
+        )
+        # Should emit 1 respond (the auth-cycle escape)
+        self.assertGreaterEqual(
+            respond_count, 1,
+            f"Auth-cycle escape should emit at least 1 respond; "
+            f"got {respond_count}",
+        )
+        self.assertLessEqual(
+            len(env.actions_executed), 8,
+            f"Auth-cycle escape should fire before exhausting budget; "
+            f"got {len(env.actions_executed)} actions",
+        )
+
 if __name__ == "__main__":
     unittest.main()

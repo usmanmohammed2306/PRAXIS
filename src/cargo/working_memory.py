@@ -97,6 +97,16 @@ class WorkingMemory:
     # Set once we've already emitted an ASK_USER to escape search exhaustion,
     # so we don't fire the override twice for the same trajectory.
     search_exhaustion_triggered: bool = False
+    # Track consecutive auth-tool attempts (find_user_id_*, get_user_details)
+    # that don't progress toward confirmed authentication. When this exceeds
+    # a threshold, indicates a stuck auth loop; should escape with ASK_USER.
+    # (Observed failure: airline T1 alternates between get_user_details and
+    # respond proposals with 12+ abstains.)
+    consecutive_auth_attempts: int = 0
+    # Set once auth_user_id was confirmed, used to reset the auth-attempt counter
+    last_confirmed_auth_user_id: str = ""
+    # Set once we've triggered auth-loop escape via ASK_USER
+    auth_cycle_triggered: bool = False
 
     # ------------------------------------------------------------------
     # Updates
