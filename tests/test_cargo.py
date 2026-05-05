@@ -41,6 +41,9 @@ from src.cargo import (  # noqa: E402
     Constraint,
     FallbackRule,
     GenericCargoKernel,
+    GoalActionCandidate,
+    GoalField,
+    SoftGoalFieldRouter,
     Preference,
     ProposedAction,
     RiskClass,
@@ -6082,6 +6085,135 @@ class TestTrajectory43Regressions(unittest.TestCase):
             f"Auth-cycle escape should fire before exhausting budget; "
             f"got {len(env.actions_executed)} actions",
         )
+
+
+class TestSoftGoalFieldRouter(unittest.TestCase):
+    def _ask(self, text: str = "Hello! How can I assist you today?") -> ProposedAction:
+        return ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text=text,
+            raw_thought=text,
+        )
+
+    def test_goal_field_momentum_updates_deterministically(self) -> None:
+        wm = WorkingMemory(goal="Book a flight from New York to Seattle on May 20")
+        adapter = TauAirlineAdapter()
+        kernel = GenericCargoKernel(adapter)
+        wm.absorb_user_message(wm.goal)
+        kernel.observe_user_message(wm, wm.goal)
+        before = wm.goal_field.momentum
+
+        kernel.observe_tool_result(
+            wm,
+            "get_user_details",
+            '{"user_id":"mia_li_3668","reservations":["ABC123"]}',
+        )
+
+        self.assertGreater(wm.goal_field.momentum, before)
+        self.assertIn("tool:get_user_details", wm.goal_field.progress_events)
+        self.assertEqual(wm.goal_field.active_goal, wm.goal[:220])
+
+    def test_repeated_non_progress_raises_friction_and_changes_selection(self) -> None:
+        wm = WorkingMemory(goal="Book a flight from New York to Seattle on May 20")
+        wm.semantic_slots.update({"origin": "JFK", "destination": "SEA", "date": "2024-05-20"})
+        router = SoftGoalFieldRouter()
+        adapter = TauAirlineAdapter()
+        ask = self._ask()
+        read = ProposedAction(
+            name="search_direct_flight",
+            args={"origin": "JFK", "destination": "SEA", "date": "2024-05-20"},
+            declared_class=RiskClass.READ,
+            raw_thought="search flights",
+        )
+        wm.goal_field.record_friction(ask.signature(), 3.0, "repeated_generic_ask")
+
+        decision = router.choose(
+            wm,
+            [
+                GoalActionCandidate(ask, source="model", progress=0.0),
+                GoalActionCandidate(read, source="search", progress=0.8, uncertainty_reduction=0.8),
+            ],
+            adapter,
+        )
+
+        self.assertEqual(decision.selected.action.name, "search_direct_flight")
+        self.assertGreater(wm.goal_field.friction[ask.signature()], 0)
+
+    def test_generic_ask_suppressed_when_goal_slots_known(self) -> None:
+        wm = WorkingMemory(goal="I want to book a flight from New York to Seattle on May 20")
+        wm.semantic_slots.update({
+            "intents": ["book_flight"],
+            "origin": "JFK",
+            "destination": "SEA",
+            "date": "2024-05-20",
+        })
+        ask = self._ask("What would you like to do today?")
+        search = ProposedAction(
+            name="search_direct_flight",
+            args={"origin": "JFK", "destination": "SEA", "date": "2024-05-20"},
+            declared_class=RiskClass.READ,
+        )
+
+        decision = SoftGoalFieldRouter().choose(
+            wm,
+            [
+                GoalActionCandidate(ask, source="model", progress=0.1),
+                GoalActionCandidate(search, source="obligation", progress=1.0, uncertainty_reduction=0.8),
+            ],
+            TauAirlineAdapter(),
+        )
+
+        self.assertEqual(decision.selected.action.name, "search_direct_flight")
+
+    def test_wrong_retail_zip_recenters_but_preserves_order_branch(self) -> None:
+        wm = WorkingMemory(goal="Exchange items in order #W2378156")
+        wm.absorb_user_message("My name is Yusuf Rossi and ZIP is 10001 for order #W2378156")
+        adapter = TauRetailAdapter()
+        kernel = GenericCargoKernel(adapter)
+        kernel.observe_user_message(wm, wm.goal)
+        kernel.observe_tool_result(wm, "find_user_id_by_name_zip", "Error: user not found")
+
+        labels = {h.label for h in wm.goal_field.hypotheses}
+        self.assertIn("order_id_recovery", labels)
+        self.assertIn("identity_lookup_failed", wm.goal_field.recent_recenter_reason)
+
+    def test_airline_cached_profile_is_not_selected_over_progress(self) -> None:
+        wm = WorkingMemory(goal="Change my return flight")
+        wm.auth_user_id = "olivia_gonzalez_2305"
+        wm.user_profiles["olivia_gonzalez_2305"] = {"reservations": ["Z7GOZK"]}
+        stale = ProposedAction(
+            name="get_user_details",
+            args={"user_id": "olivia_gonzalez_2305"},
+            declared_class=RiskClass.READ,
+        )
+        reservation = ProposedAction(
+            name="get_reservation_details",
+            args={"reservation_id": "Z7GOZK"},
+            declared_class=RiskClass.READ,
+        )
+
+        decision = SoftGoalFieldRouter().choose(
+            wm,
+            [
+                GoalActionCandidate(stale, source="model", progress=0.2),
+                GoalActionCandidate(reservation, source="reservation_advance", progress=1.0, uncertainty_reduction=0.7),
+            ],
+            TauAirlineAdapter(),
+        )
+
+        self.assertEqual(decision.selected.action.name, "get_reservation_details")
+
+    def test_goal_field_render_stays_compact_for_small_models(self) -> None:
+        field = GoalField(active_goal="g")
+        for i in range(12):
+            field.record_friction(f"action_{i}", 1.0 + i / 10, "loop")
+            field.record_progress(f"progress_{i}", 0.1)
+        rendered = field.render_compact(max_chars=220)
+
+        self.assertLessEqual(len(rendered), 220)
+        self.assertIn("momentum=", rendered)
 
 if __name__ == "__main__":
     unittest.main()

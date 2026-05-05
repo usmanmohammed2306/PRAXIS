@@ -11,10 +11,14 @@ from ..core import (
     Constraint,
     ConstraintPriorityEngine,
     FallbackRule,
+    GoalActionCandidate,
+    GoalField,
+    GoalHypothesis,
     Preference,
     TaskState,
     normalize_key,
 )
+from ..risk_class import RiskClass
 from ..schemas import ProposedAction, ToolEffectSchema
 
 
@@ -182,6 +186,86 @@ class TauRetailAdapter(BaseCargoAdapter):
         if action.name == "return_delivered_order_items":
             return self._return_certificate(action, schema, wm)
         return super().build_commit_certificate(action, schema, wm)
+
+    def goal_stage(self, wm) -> str:
+        text = _goal_text(wm)
+        if getattr(wm, "task_completed", False):
+            return "complete"
+        if getattr(wm, "phase_locked", lambda _p: False)("mutation"):
+            return "post_write"
+        if re.search(r"\b(how\s+many|number\s+of|count)\b", text) and not getattr(wm, "product_count_finalized", False):
+            if not getattr(wm, "product_types", {}):
+                return "catalog"
+            return "catalog_details"
+        if re.search(r"\b(exchange|return|modify|change|update|cancel)\b", text):
+            if not getattr(wm, "auth_user_id", "") and not getattr(wm, "order_details", {}):
+                return "identity_or_order_anchor"
+            if not getattr(wm, "order_details", {}):
+                return "order_retrieval"
+            if re.search(r"\b(exchange|modify|change|update)\b", text):
+                return "product_variant_retrieval"
+            return "commit_ready"
+        return super().goal_stage(wm)
+
+    def update_goal_field(
+        self,
+        field: GoalField,
+        wm,
+        *,
+        event: str,
+        action_name: str = "",
+        obs: Any = None,
+    ) -> None:
+        super().update_goal_field(field, wm, event=event, action_name=action_name, obs=obs)
+        if event == "user":
+            text = _goal_text(wm)
+            if re.search(r"\b(exchange|return|modify|change|update)\b", text):
+                field.add_hypothesis(GoalHypothesis(
+                    hypothesis_id="retail_account_task",
+                    label="retail_account_task",
+                    confidence=0.75,
+                    anchors={"order_ids": list(getattr(wm, "typed_evidence_for", lambda _k: [])("order_id"))[-3:]},
+                    last_evidence_turn=field.turn,
+                ))
+            if re.search(r"\b(how\s+many|number\s+of|count)\b", text):
+                field.add_hypothesis(GoalHypothesis(
+                    hypothesis_id="retail_catalog_query",
+                    label="retail_catalog_query",
+                    confidence=0.7,
+                    anchors={"product_query": True},
+                    last_evidence_turn=field.turn,
+                ))
+        if event == "tool" and action_name == "find_user_id_by_name_zip":
+            if obs is not None and "not found" in str(obs).lower():
+                field.recenter("identity_lookup_failed_preserve_order_branch")
+                field.add_hypothesis(GoalHypothesis(
+                    hypothesis_id="order_id_recovery",
+                    label="order_id_recovery",
+                    confidence=0.8,
+                    anchors={"order_ids": list(getattr(wm, "typed_evidence_for", lambda _k: [])("order_id"))[-3:]},
+                    last_evidence_turn=field.turn,
+                ))
+
+    def score_goal_action(self, candidate: GoalActionCandidate, wm) -> float:
+        action = candidate.action
+        score = 0.0
+        if action.name == "get_order_details" and getattr(wm, "auth_failed_zips", []):
+            score += 1.1
+        if action.name == "get_product_details":
+            score += 0.45
+        if action.name in {
+            "exchange_delivered_order_items",
+            "return_delivered_order_items",
+            "modify_pending_order_items",
+        }:
+            score += 1.0
+        if action.name.startswith("find_user_id_by_name_zip"):
+            zip_arg = str(action.args.get("zip") or "")
+            if zip_arg and zip_arg in getattr(wm, "auth_failed_zips", []):
+                score -= 3.0
+        if action.declared_class == RiskClass.ASK_USER and getattr(wm, "order_details", {}):
+            score -= 1.0
+        return score
 
     def _exchange_certificate(
         self,

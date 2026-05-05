@@ -29,7 +29,7 @@ except Exception:  # noqa: BLE001
 from . import repair
 from .adapters import select_adapter
 from .calibration import default_calibration
-from .core import BaseCargoAdapter, GenericCargoKernel
+from .core import BaseCargoAdapter, GenericCargoKernel, GoalActionCandidate
 from .gates import (
     check_arg_grounding,
     check_counterfactual,
@@ -393,6 +393,90 @@ class CargoAgent(Agent):  # type: ignore[misc]
             text = ""
         parsed = parse_proposer_response(text, schemas=self.schemas)
         return parsed, text
+
+    def _raw_text_for_action(self, action: ProposedAction) -> str:
+        return json.dumps({
+            "thought": action.raw_thought,
+            "action": {
+                "name": action.name,
+                "args": action.args,
+                "declared_class": action.declared_class.value,
+                "declared_pre": action.declared_pre,
+                "declared_post": action.declared_post,
+                "informational_intent": action.informational_intent,
+                "user_text": action.user_text,
+            },
+        })
+
+    def _route_goal_field_action(
+        self,
+        action: ProposedAction,
+        wm: WorkingMemory,
+    ) -> ProposedAction:
+        """Select the next action through the soft goal-field router."""
+        candidates: List[GoalActionCandidate] = []
+        seen: Dict[str, int] = {}
+
+        def add(
+            candidate: Optional[ProposedAction],
+            source: str,
+            *,
+            progress: float = 0.0,
+            uncertainty: float = 0.0,
+            completion: float = 0.0,
+            frame: float = 0.0,
+            rationale: str = "",
+        ) -> None:
+            if candidate is None:
+                return
+            sig = candidate.signature()
+            wrapped = GoalActionCandidate(
+                action=candidate,
+                source=source,
+                progress=progress,
+                uncertainty_reduction=uncertainty,
+                completion=completion,
+                frame_match=frame,
+                rationale=rationale,
+            )
+            idx = seen.get(sig)
+            if idx is None:
+                seen[sig] = len(candidates)
+                candidates.append(wrapped)
+                return
+            cur = candidates[idx]
+            if (wrapped.progress + wrapped.uncertainty_reduction + wrapped.completion) > (
+                cur.progress + cur.uncertainty_reduction + cur.completion
+            ):
+                candidates[idx] = wrapped
+
+        add(action, "current_pipeline", progress=0.05, rationale="current proposal after deterministic repairs")
+        add(self._task_frame_stage_action(action, wm), "task_frame_stage", progress=1.2, uncertainty=0.3, frame=0.4)
+        add(self._resolve_get_user_details(action, wm), "identity_resolver", progress=0.8, uncertainty=0.3, frame=0.2)
+        add(self._advance_reservation_retrieval(action, wm), "reservation_advance", progress=1.1, uncertainty=0.6, frame=0.3)
+        if self._is_airline_adapter() and (self._known_user_id(wm) or wm.semantic_slots.get("origin")):
+            add(self._airline_obligation_action(action, wm), "airline_obligation", progress=1.3, uncertainty=0.8, frame=0.4)
+        add(self._no_auth_product_query_action(action, wm), "no_auth_catalog", progress=1.2, uncertainty=0.5, frame=0.4)
+        add(self._normalize_order_id_action(action, wm), "order_id_normalizer", progress=0.7, uncertainty=0.2, frame=0.2)
+        add(self._advance_after_product_list(action, wm), "product_detail_advance", progress=1.1, uncertainty=0.6, frame=0.3)
+        finalizer = self._finalize_product_count_query(action, wm)
+        add(finalizer, "product_count_finalizer", progress=1.0, uncertainty=0.2, completion=1.6 if finalizer is not None else 0.0, frame=0.4)
+        progress_action = self._grounded_progress_or_commit_action(action, wm)
+        add(
+            progress_action,
+            "grounded_progress",
+            progress=1.4,
+            uncertainty=0.7 if progress_action is not None and progress_action.declared_class == RiskClass.READ else 0.1,
+            completion=1.2 if progress_action is not None and progress_action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE) else 0.0,
+            frame=0.5,
+        )
+        add(self._resolve_product_id_name(action, wm), "product_id_resolver", progress=0.8, uncertainty=0.3, frame=0.2)
+        write = self._canonicalize_write_action(action, wm)
+        add(write, "write_canonicalizer", progress=0.7, completion=1.4 if write is not None else 0.0, frame=0.4)
+        if len(candidates) <= 1:
+            return action
+        decision = self._kernel().decision_engine.goal_router.choose(wm, candidates, self.adapter)
+        return decision.selected.action
 
     # ------------------------------------------------------------------
     # Gate orchestration
@@ -872,6 +956,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     })
                     action = write_action
 
+            # Soft Goal-Field Router: the fixed-order repairs above are still
+            # useful candidate producers, but the final choice is now made by
+            # a compact momentum/friction router before the hard gates run.
+            if action is not None:
+                routed_action = self._route_goal_field_action(action, wm)
+                if routed_action.signature() != action.signature():
+                    raw_text = self._raw_text_for_action(routed_action)
+                    action = routed_action
+
             messages.append({"role": "assistant", "content": raw_text or ""})
 
             if action is None:
@@ -956,6 +1049,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
 
             if failing is not None:
                 wm.record_failed_signature(action.signature())
+                self._kernel().decision_engine.goal_router.record_gate_failure(
+                    wm,
+                    action,
+                    failing,
+                    self.adapter,
+                )
                 stats.steps_gated += 1
                 stats.abstain_total += 1
                 rd = repair.decide(
@@ -1005,6 +1104,11 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 stats.steps_fast_path += 1
 
             wm.record_action_signature(action.signature())
+            self._kernel().decision_engine.goal_router.record_executed_action(
+                wm,
+                action,
+                self.adapter,
+            )
 
             # FINAL / ASK_USER → route through respond with the model's user_text.
             if (action.declared_class in (RiskClass.FINAL, RiskClass.ASK_USER)
@@ -1391,6 +1495,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 })
                 if user_reply_search:
                     wm.absorb_user_message(user_reply_search)
+                    self._kernel().observe_user_message(wm, user_reply_search)
                 reward = _float(getattr(env_resp_search, "reward", reward), reward)
                 info = getattr(env_resp_search, "info", info) or info
                 done = bool(getattr(env_resp_search, "done", False))
@@ -1472,6 +1577,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 })
                 if user_reply_auth:
                     wm.absorb_user_message(user_reply_auth)
+                    self._kernel().observe_user_message(wm, user_reply_auth)
                 reward = _float(getattr(env_resp_auth, "reward", reward), reward)
                 info = getattr(env_resp_auth, "info", info) or info
                 done = bool(getattr(env_resp_auth, "done", False))
@@ -1538,6 +1644,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 })
                 if user_reply2:
                     wm.absorb_user_message(user_reply2)
+                    self._kernel().observe_user_message(wm, user_reply2)
                 reward = _float(getattr(env_resp2, "reward", reward), reward)
                 info = getattr(env_resp2, "info", info) or info
                 done = bool(getattr(env_resp2, "done", False))
