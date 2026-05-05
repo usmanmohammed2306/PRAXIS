@@ -62,25 +62,34 @@ def tau_smoke() -> Dict[str, Any]:
         return {
             "status": "blocked",
             "reason": "no OPENAI_API_KEY or OPENAI_BASE_URL; live tau-bench needs a model endpoint and user simulator provider",
-            "rerun": "OPENAI_BASE_URL=http://localhost:8001/v1 OPENAI_API_KEY=dummy python3 -m src.runners.tau_runner --env retail --agent cargo --model qwen-agent --user-model gpt-4o --output-dir outputs/smoke/tau_retail --end-index 1 --num-trials 1 --max-concurrency 1 --max-num-steps 5",
+            "rerun": [
+                "OPENAI_BASE_URL=http://localhost:8001/v1 OPENAI_API_KEY=dummy python3 -m src.runners.tau_runner --env retail --agent cargo --model qwen-agent --user-model gpt-4o --output-dir outputs/smoke/tau_retail --end-index 1 --num-trials 1 --max-concurrency 1 --max-num-steps 5",
+                "OPENAI_BASE_URL=http://localhost:8001/v1 OPENAI_API_KEY=dummy python3 -m src.runners.tau_runner --env airline --agent cargo --model qwen-agent --user-model gpt-4o --output-dir outputs/smoke/tau_airline --end-index 1 --num-trials 1 --max-concurrency 1 --max-num-steps 5",
+            ],
         }
-    cmd = [
-        sys.executable, "-m", "src.runners.tau_runner",
-        "--env", "retail",
-        "--agent", "cargo",
-        "--model", os.environ.get("SMOKE_MODEL", "qwen-agent"),
-        "--user-model", os.environ.get("SMOKE_USER_MODEL", "gpt-4o"),
-        "--model-provider", os.environ.get("SMOKE_MODEL_PROVIDER", "openai"),
-        "--user-model-provider", os.environ.get("SMOKE_USER_MODEL_PROVIDER", "openai"),
-        "--output-dir", "outputs/smoke/tau_retail",
-        "--end-index", "1",
-        "--num-trials", "1",
-        "--max-concurrency", "1",
-        "--max-num-steps", "5",
-    ]
-    out = run(cmd, timeout=600)
-    out["status"] = "ok" if out["returncode"] == 0 else "failed"
-    return out
+    results: Dict[str, Any] = {}
+    for env in ("retail", "airline"):
+        cmd = [
+            sys.executable, "-m", "src.runners.tau_runner",
+            "--env", env,
+            "--agent", "cargo",
+            "--model", os.environ.get("SMOKE_MODEL", "qwen-agent"),
+            "--user-model", os.environ.get("SMOKE_USER_MODEL", "gpt-4o"),
+            "--model-provider", os.environ.get("SMOKE_MODEL_PROVIDER", "openai"),
+            "--user-model-provider", os.environ.get("SMOKE_USER_MODEL_PROVIDER", "openai"),
+            "--output-dir", f"outputs/smoke/tau_{env}",
+            "--end-index", "1",
+            "--num-trials", "1",
+            "--max-concurrency", "1",
+            "--max-num-steps", "5",
+        ]
+        out = run(cmd, timeout=600)
+        out["status"] = "ok" if out["returncode"] == 0 else "failed"
+        results[env] = out
+    return {
+        "status": "ok" if all(r.get("status") == "ok" for r in results.values()) else "failed",
+        "results": results,
+    }
 
 
 def ace_smoke() -> Dict[str, Any]:

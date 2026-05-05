@@ -822,6 +822,9 @@ class GenericCargoKernel:
             proposed = action.args.get(key, action.args.get(nkey))
             if proposed in (None, "", []):
                 continue
+            adapter_match = getattr(self.adapter, "semantic_values_match", None)
+            if callable(adapter_match) and adapter_match(nkey, proposed, expected):
+                continue
             if not semantic_values_match(proposed, expected):
                 return GateResult.failing(
                     "state_validity",

@@ -13,6 +13,28 @@ _NUMBER_WORDS = {
     "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
 }
 
+_AIRPORT_ALIASES = {
+    "atlanta": "ATL",
+    "boston": "BOS",
+    "charlotte": "CLT",
+    "chicago": "ORD",
+    "dallas": "DFW",
+    "denver": "DEN",
+    "detroit": "DTW",
+    "houston": "IAH",
+    "las vegas": "LAS",
+    "los angeles": "LAX",
+    "minneapolis": "MSP",
+    "newark": "EWR",
+    "new york": "JFK",
+    "orlando": "MCO",
+    "philadelphia": "PHL",
+    "phoenix": "PHX",
+    "san francisco": "SFO",
+    "seattle": "SEA",
+}
+_REGION_ALIASES = {"texas": {"DFW", "IAH"}}
+
 
 class TauAirlineAdapter(BaseCargoAdapter):
     name = "tau_airline"
@@ -205,6 +227,25 @@ class TauAirlineAdapter(BaseCargoAdapter):
             )
         return super().validate_final_completeness(action, wm)
 
+    def canonicalize_airport(self, value: Any, *, field: str = "") -> str:
+        return _airport_code(value) or _clean(str(value or ""))
+
+    def semantic_values_match(self, key: str, proposed: Any, expected: Any) -> bool:
+        if key not in {"origin", "destination"}:
+            return False
+        proposed_code = _airport_code(proposed)
+        expected_values = expected if isinstance(expected, list) else [expected]
+        for value in expected_values:
+            expected_code = _airport_code(value)
+            if proposed_code and expected_code and proposed_code == expected_code:
+                return True
+            expected_region = _region_airports(value)
+            if proposed_code and expected_region and proposed_code in expected_region:
+                return True
+            if _clean(str(proposed or "")).lower() == _clean(str(value or "")).lower():
+                return True
+        return False
+
     def _fact(self, state: TaskState, key: str, value: Any) -> List[Tuple[str, Any, bool]]:
         if value in (None, ""):
             return []
@@ -216,6 +257,34 @@ class TauAirlineAdapter(BaseCargoAdapter):
 
 def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip(" .,;:!?")
+
+
+def _airport_code(value: Any) -> str:
+    raw = _clean(str(value or ""))
+    if re.fullmatch(r"[A-Za-z]{3}", raw):
+        return raw.upper()
+    norm = re.sub(r"[^a-z0-9 ]+", " ", raw.lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if not norm:
+        return ""
+    if norm in _AIRPORT_ALIASES:
+        return _AIRPORT_ALIASES[norm]
+    # Phrases such as "only EWR, not JFK" or "Seattle airport" should still
+    # reduce to the actionable IATA token when one is present.
+    m = re.search(r"\b([A-Za-z]{3})\b", raw)
+    if m and m.group(1).upper() in set(_AIRPORT_ALIASES.values()):
+        return m.group(1).upper()
+    for phrase, code in sorted(_AIRPORT_ALIASES.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if re.search(rf"\b{re.escape(phrase)}\b", norm):
+            return code
+    return ""
+
+
+def _region_airports(value: Any) -> set[str]:
+    raw = _clean(str(value or ""))
+    norm = re.sub(r"[^a-z0-9 ]+", " ", raw.lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return set(_REGION_ALIASES.get(norm, set()))
 
 
 def _add_requested_operation(state: TaskState, operation: str) -> None:
