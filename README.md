@@ -73,7 +73,7 @@ unchanged.
             └─────────────────────────────────────────────────────────┘
 ```
 
-## CARGO-v2: Semantic State-Constraint Risk Gating
+## CARGO-v2: Generic Semantic State-Constraint Risk Gating
 
 CARGO remains a lightweight, training-free controller.  The v2 hardening
 does not add fine-tuning, a separate judge, benchmark answer retrieval, or a
@@ -81,7 +81,22 @@ tree-search planner.  It extends the original gate stack so the verifier asks
 two questions before acting:
 
 1. Is the action grounded and well-formed?
-2. Is the action correct for the current semantic task state?
+2. Is the action correct, complete, policy-compliant, and appropriate for the
+   current semantic task state?
+
+CARGO-v2 is split into a generic core plus pluggable adapters:
+
+- `src/cargo/core.py` defines the domain-neutral kernel: typed task state,
+  facts, constraints, preferences, fallback rules, candidate objects,
+  obligations, failed signatures, executed writes, semantic validation hooks,
+  completeness hooks, and terminal state.
+- `src/cargo/adapters/` contains benchmark/domain adapters.  The core does
+  not name retail products, flights, reservations, or ACEBench answer
+  patterns.  Adapters own tool schema enrichment, ID fields, non-ID semantic
+  fields, user-message binding, observation absorption, policy hooks,
+  semantic validators, and completion criteria.
+- Current adapters: `tau_retail`, `tau_airline`, `acebench`, and
+  `synthetic_generic`.
 
 The deterministic working memory now separates:
 
@@ -101,9 +116,10 @@ candidates after every hard filter has passed; fallbacks apply only when the
 strict constraint set is exhausted and the user allowed the fallback.
 
 The recovery ledger for uploaded failures is tracked in
-[`docs/known_issue_ledger.md`](docs/known_issue_ledger.md).  It maps each
-observed failure class to the invariant and regression test that now protects
-it.
+[`docs/known_issue_ledger.md`](docs/known_issue_ledger.md), with a
+machine-readable companion at [`docs/known_issues.json`](docs/known_issues.json).
+It maps each observed failure class to the invariant and regression test that
+now protects it.
 
 ## The five risk classes
 
@@ -175,6 +191,13 @@ model across every condition.
   the **twelve** evaluations (4 controllers × 3 benchmarks), shuts vLLM
   down, and writes the summary.
 
+No other `.sh` files are added.  Benchmark setup and smoke automation live
+as Python helpers:
+
+- `python3 scripts/benchmark_setup.py --bench all --install`
+- `python3 scripts/run_smoke.py --target all`
+- `python3 scripts/parse_smoke_results.py`
+
 ## Quickstart
 
 ```bash
@@ -203,6 +226,37 @@ bash run_project.sh --tau-only retail --controllers react,cargo --skip-acebench
 # Fine overrides (take precedence over the profile):
 bash run_project.sh --gpus 0,1 --tau-tasks 20 --tau-trials 2 --max-concurrency 16
 ```
+
+### Benchmark Setup And Smoke Tests
+
+Classic tau-bench and ACEBench are cloned into `external/`:
+
+```bash
+python3 scripts/benchmark_setup.py --bench all --install
+```
+
+By default the ACEBench helper installs the data/evaluation dependencies and
+skips ACEBench's pinned `vllm==0.6.1.post1`; `setup_env.sh` owns the model
+serving stack and filters upstream requirements so the CARGO vLLM build is not
+clobbered.  To reproduce upstream ACEBench exactly in an isolated environment,
+run:
+
+```bash
+python3 scripts/benchmark_setup.py --bench ace --install --include-ace-vllm
+```
+
+Run local smoke checks:
+
+```bash
+python3 scripts/run_smoke.py --target synthetic
+python3 scripts/run_smoke.py --target all
+python3 scripts/parse_smoke_results.py
+```
+
+If no `OPENAI_API_KEY` or `OPENAI_BASE_URL` is present, live tau/ACE smoke
+runs are marked `blocked` with rerun commands instead of being faked.  The
+synthetic smoke remains fully offline and exercises the generic core and
+adapter invariants.
 
 ### Auto-selected defaults
 
@@ -269,13 +323,13 @@ python3 -m unittest tests.test_cargo -v
 ```
 
 The suite checks: rule-based risk classification; tool schema caching;
-working-memory absorption (user text + observation); precondition
-matching (positive and negative); argument-grounding regex coverage;
-repeat-loop detection; self-consistency vote (mock client with `n>1`);
-counterfactual rollout (mock client); post-condition error detection;
-proposer JSON parsing (clean / fenced / malformed / nested); repair
-policy decisions; full agent loop on a mock env that returns scripted
-observations.
+working-memory absorption (user text + observation); typed task-state conflict
+handling; generic adapter schema enrichment; retail hard-constraint vs
+preference separation; ACEBench-style local-pass/global-fail decoy rejection;
+precondition matching; argument-grounding regex coverage; repeat-loop
+detection; self-consistency vote (mock client with `n>1`); counterfactual
+rollout (mock client); post-condition error detection; proposer JSON parsing;
+repair policy decisions; and full agent loop behavior on mock environments.
 
 ## What CARGO is — and isn't
 
@@ -288,13 +342,13 @@ CARGO is **lightweight on purpose**:
   that's ~16 calls vs ReAct's ~12.
 
 It uses **no** tree search, **no** multi-agent debate, **no**
-fine-tuning, **no** external LLM judge, **no** memory / fingerprint
-retrieval (slot reserved for v2).
+fine-tuning, **no** external LLM judge, and **no** memory / fingerprint
+retrieval.
 
 The novelty story is the *composition*: risk-class typing of tools
 (auto-induced) + class-specific calibrated abstention + selective
-self-consistency only on irreversible/final actions + deterministic
-argument-grounding + named deterministic repair. None of the parts is
+self-consistency only on risky actions + deterministic argument grounding +
+generic semantic state/constraint gates + named deterministic repair. None of the parts is
 unprecedented; the integration as a coherent training-free architecture
 for parameterized tool-using LLM agents, with **per-class** calibrated
 abstention rather than syntactic guardrails, is what differentiates it

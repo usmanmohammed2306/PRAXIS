@@ -93,19 +93,22 @@ def check_arg_grounding(
 
     ungrounded: List[str] = []
 
-    # Per-schema explicit ID fields are checked unconditionally.
+    # Per-schema explicit ID fields are checked unconditionally.  Adapter-
+    # declared semantic fields are ordinary task literals, not opaque IDs.
     id_fields = list(schema.arg_id_fields or [])
+    semantic_fields = set(getattr(schema, "arg_semantic_fields", []) or [])
 
     for k, v in action.args.items():
         for path, v_str in _iter_arg_values(k, v):
             base = _field_key(path)
             forced_id = k in id_fields or base in id_fields
+            forced_semantic = k in semantic_fields or base in semantic_fields
             typed_values = wm.typed_evidence_for(base) if forced_id else []
             if typed_values:
                 if v_str not in typed_values:
                     ungrounded.append(f"{path}={v_str}")
                 continue
-            if not forced_id and _is_semantic_literal_field(path):
+            if not forced_id and (forced_semantic or _is_semantic_literal_field(path)):
                 continue
             if not (forced_id or _looks_like_id(v_str)):
                 continue

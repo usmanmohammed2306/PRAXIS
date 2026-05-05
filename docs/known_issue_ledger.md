@@ -6,6 +6,8 @@ and the local regression suite.  It is intentionally phrased by failure
 class rather than benchmark task answer, so it remains a test and design
 artifact rather than an answer key.
 
+Machine-readable companion: `docs/known_issues.json`.
+
 ## Metric Timeline
 
 | Run | Domain | Success | Avg reward | Avg trajectory | Abstains | Retries | Ask repairs | Finalize repairs | Executed |
@@ -33,6 +35,17 @@ artifact rather than an answer key.
 - ACE/AgentCE-style evaluations contain local constraints, global constraints,
   and decoy candidates that can look valid locally but break the full task.
   This motivates semantic constraint validation as a gate, not a scorer.
+
+## CARGO-v2 Architecture Mapping
+
+- Generic core: `src/cargo/core.py` owns typed task state, fact precedence,
+  constraints, preferences, fallback rules, candidate objects, obligations,
+  semantic validation hooks, completeness hooks, and diagnostics.
+- Adapters: `src/cargo/adapters/` owns benchmark/domain knowledge.  Current
+  adapters are `tau_retail`, `tau_airline`, `acebench`, and
+  `synthetic_generic`.
+- Shell-script invariant: no new `.sh` files were added.  Benchmark setup and
+  smoke commands are Python helpers in `scripts/`.
 
 ## Ledger
 
@@ -64,13 +77,16 @@ artifact rather than an answer key.
 | State stored but unused | Cross-domain repeated loops despite cached facts | State was prompt-only rather than gate-visible | State validity gate must inspect current state before action | `test_i1_completed_auth_phase_blocks_auth_tool_reentry`, `test_i2_state_gate_blocks_search_conflicting_with_bound_date` | Fixed, verified |
 | Constraints extracted but not enforced | ACE-style decoys and retail variants passed local syntax | No semantic candidate validator | Constraints are filters, preferences rank only after filtering | G-series and H-series tests | Fixed, verified |
 | Partial solution treated as complete | Retail/airline final/write before all operations | Completion checked tool syntax instead of task closure | Completeness validator blocks partial writes/finals | H-series tests, booking completeness tests | Fixed, verified |
+| ACE-style decoy passes local checks | Candidate satisfies local slot but violates global task constraints | No adapter-owned global constraint hook | Local-pass/global-fail decoys must be rejected before write/final | `test_acebench_adapter_rejects_local_pass_global_fail_decoy` | Fixed, verified |
+| Domain logic leaking into core | Early CARGO-v2 state binding knew airline/retail names directly | Core was doing adapter work | Domain object semantics live only in adapters | `TestCargoV2Adapters` plus module split | Fixed, verified |
 
 ## Remaining Limitations
 
-- Live tau-bench and ACEBench packages are not installed in this local
-  environment, so full smoke evaluations cannot be executed here.  The local
-  regression suite exercises the CARGO loop with mocked environments and
-  verifies the failure classes above.
+- Classic tau-bench and ACEBench were cloned into `external/`; tau-bench was
+  installed locally.  ACEBench non-vLLM data/eval dependencies were installed,
+  while upstream `vllm==0.6.1.post1` remains intentionally skipped in the
+  generic helper unless `--include-ace-vllm` is used in an isolated
+  environment.  Live smoke still needs a model endpoint/API key.
 - Airline full booking selection is guarded for slot completeness and state
   consistency, but a complete deterministic cheapest-flight planner is still an
   open extension.  CARGO remains a lightweight gating controller, not a full
@@ -78,11 +94,11 @@ artifact rather than an answer key.
 
 ## Verification
 
-- `python3 -m unittest tests.test_cargo -v`: 222 passed, 2 skipped because
-  tau-bench is not installed locally.
+- `python3 -m unittest tests.test_cargo -v`: local regression suite.
 - `python3 -m compileall src tests`: passed.
 - `git diff --check`: passed.
 - `bash run_project.sh --dry-run`: passed configuration resolution without
   launching a model server or benchmark run.
-- Import availability check: `tau_bench`, `acebench`, and `ACEBench` are not
-  installed in this local environment, so live smoke metrics are not claimed.
+- `python3 scripts/run_smoke.py --target all`: synthetic checks run offline;
+  tau/ACE live smoke is blocked unless `OPENAI_API_KEY` or `OPENAI_BASE_URL`
+  is present.

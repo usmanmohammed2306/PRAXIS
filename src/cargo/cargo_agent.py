@@ -27,7 +27,9 @@ except Exception:  # noqa: BLE001
     _HAS_TAU = False
 
 from . import repair
+from .adapters import select_adapter
 from .calibration import default_calibration
+from .core import BaseCargoAdapter, GenericCargoKernel
 from .gates import (
     check_arg_grounding,
     check_counterfactual,
@@ -322,6 +324,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
             model=self.model,
             temperature=0.0,
         )
+        self.adapter = select_adapter(env_hint=env_hint, tools_info=self.tools_info, wiki=self.wiki)
+        self.kernel = GenericCargoKernel(self.adapter)
+        self.schemas = self.kernel.enrich_schemas(self.schemas)
         self.calibration = default_calibration()
 
     # ------------------------------------------------------------------
@@ -392,6 +397,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
     # ------------------------------------------------------------------
     # Gate orchestration
     # ------------------------------------------------------------------
+    def _kernel(self) -> GenericCargoKernel:
+        kernel = getattr(self, "kernel", None)
+        if kernel is None:
+            adapter = getattr(self, "adapter", None) or BaseCargoAdapter()
+            kernel = GenericCargoKernel(adapter)
+            self.adapter = adapter
+            self.kernel = kernel
+        return kernel
+
     def _run_gates(
         self,
         action: ProposedAction,
@@ -540,6 +554,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
 
         wm = WorkingMemory(goal=initial_user, budget_steps=max_num_steps)
         wm.absorb_user_message(initial_user)
+        self._kernel().observe_user_message(wm, initial_user)
 
         # ``messages`` is the *trajectory* surface tau-bench / scorers see.
         # We render it in the same OpenAI-chat shape the baselines use so
@@ -804,6 +819,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     if user_reply:
                         messages.append({"role": "user", "content": user_reply})
                         wm.absorb_user_message(user_reply)
+                        self._kernel().observe_user_message(wm, user_reply)
                     reward = _float(getattr(env_resp, "reward", reward), reward)
                     info = getattr(env_resp, "info", info) or info
                     done = bool(getattr(env_resp, "done", False))
@@ -834,6 +850,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 if user_reply:
                     messages.append({"role": "user", "content": user_reply})
                     wm.absorb_user_message(user_reply)
+                    self._kernel().observe_user_message(wm, user_reply)
                 reward = _float(getattr(env_resp, "reward", reward), reward)
                 info = getattr(env_resp, "info", info) or info
                 done = bool(getattr(env_resp, "done", False))
@@ -893,6 +910,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 if user_reply:
                     messages.append({"role": "user", "content": user_reply})
                     wm.absorb_user_message(user_reply)
+                    self._kernel().observe_user_message(wm, user_reply)
                 reward = _float(getattr(env_resp, "reward", reward), reward)
                 info = getattr(env_resp, "info", info) or info
                 done = bool(getattr(env_resp, "done", False))
@@ -967,6 +985,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 })
                 if user_reply:
                     wm.absorb_user_message(user_reply)
+                    self._kernel().observe_user_message(wm, user_reply)
                 reward = _float(getattr(env_resp, "reward", reward), reward)
                 info = getattr(env_resp, "info", info) or info
                 done = bool(getattr(env_resp, "done", False))
@@ -1018,6 +1037,11 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 })
                 wm.last_error = str(env_exc)[:80]  # tip 8: minimal failure record
                 wm.absorb_observation({"status": "error", "error": str(env_exc)[:80]})
+                self._kernel().observe_tool_result(
+                    wm,
+                    action.name,
+                    {"status": "error", "error": str(env_exc)[:80]},
+                )
                 wm.record_failed_signature(action.signature())
                 step_record["env_error"] = str(env_exc)[:80]
                 stats.record_step(step_record)
@@ -1040,6 +1064,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 wm.last_error = tool_obs[:80]
             wm.absorb_observation(tool_obs if not isinstance(env_resp, type(None))
                                   else "")
+            self._kernel().observe_tool_result(wm, action.name, tool_obs)
 
             # Track failed name+ZIP lookups so _auth_override doesn't retry the
             # same invalid ZIP on the next step.
@@ -2808,22 +2833,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     user_id=uid,
                 )
 
-        semantic_fields = ("date", "origin", "destination", "cabin", "trip_type")
-        for field in semantic_fields:
-            expected = wm.semantic_slots.get(field)
-            if expected in (None, "", []):
-                continue
-            proposed = action.args.get(field)
-            if proposed in (None, "", []):
-                continue
-            if not self._semantic_values_match(proposed, expected):
-                return GateResult.failing(
-                    "state_validity",
-                    f"action_{field}_conflicts_with_state",
-                    expected=expected,
-                    proposed=proposed,
-                )
-        return GateResult.passing("state_validity")
+        return self._kernel().validate_action(action, self._schema_for(action), wm)
 
     @staticmethod
     def _semantic_values_match(proposed: Any, expected: Any) -> bool:
@@ -2911,13 +2921,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
         exchanges/returns/modifies, decoy variant choices, and premature writes
         where some requested item is still unresolved.
         """
+        adapter_gate = self._kernel().validate_write_completeness(action, wm)
+        if adapter_gate is not None:
+            return adapter_gate
         if action.name not in {
             "exchange_delivered_order_items",
             "return_delivered_order_items",
             "modify_pending_order_items",
         }:
-            if action.name == "book_reservation":
-                return self._check_booking_completeness(action, wm)
             return GateResult.passing("completeness")
         canonical = self._grounded_retail_commit_action(wm)
         if canonical is None:
@@ -2941,36 +2952,6 @@ class CargoAgent(Agent):  # type: ignore[misc]
             )
         return GateResult.passing("completeness")
 
-    def _check_booking_completeness(
-        self,
-        action: ProposedAction,
-        wm: "WorkingMemory",
-    ) -> GateResult:
-        args = action.args or {}
-        missing: List[str] = []
-        if not (args.get("user_id") or wm.auth_user_id or wm.typed_evidence_for("user_id")):
-            missing.append("user_id")
-        if not (args.get("flights") or args.get("flight_numbers") or args.get("flight_number")):
-            missing.append("flights")
-        if not args.get("passengers"):
-            missing.append("passengers")
-        if not (
-            args.get("payment_methods")
-            or args.get("payment_method_id")
-            or wm.semantic_slots.get("payment_preferences")
-            or wm.typed_evidence_for("payment_method_id")
-        ):
-            missing.append("payment")
-        if not (args.get("cabin") or args.get("cabin_class") or wm.semantic_slots.get("cabin")):
-            missing.append("cabin")
-        if missing:
-            return GateResult.failing(
-                "completeness",
-                "booking_missing_required_slots",
-                missing=missing,
-            )
-        return GateResult.passing("completeness")
-
     def _check_final_completeness(
         self,
         action: ProposedAction,
@@ -2979,6 +2960,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
         """Prevent terminal answers while account-side work is still open."""
         if action.declared_class != RiskClass.FINAL:
             return GateResult.passing("final_completeness")
+        adapter_gate = self._kernel().validate_final_completeness(action, wm)
+        if adapter_gate is not None and not adapter_gate.ok:
+            return adapter_gate
         if not self._is_account_order_goal(wm):
             return GateResult.passing("final_completeness")
         if wm.phase_locked("mutation") or wm.task_completed or wm.auth_abandoned:
@@ -3696,7 +3680,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return self.schemas[action.name]
         # Synthesise a minimal schema using the declared class.
         from .schemas import ToolEffectSchema
-        return ToolEffectSchema(
+        schema = ToolEffectSchema(
             name=action.name,
             cls=action.declared_class,
             irreversible=is_irreversible_or_final(action.declared_class),
@@ -3707,6 +3691,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             required_params=[],
             description="(unknown tool — synthesised schema)",
         )
+        return self._kernel().adapter.enrich_schema(schema)
 
     def _respond(self, env, content: str):
         """Issue a ``respond`` action to the env. Returns the env response,

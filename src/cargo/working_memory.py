@@ -14,6 +14,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional
 
+from .core import TaskState
+
 
 # A short rolling window of recent action signatures (for repeat detection).
 _RECENT_WINDOW = 5
@@ -33,6 +35,7 @@ class WorkingMemory:
     failed_signatures: Dict[str, int] = field(default_factory=dict)
     evidence_version: int = 0
     typed_values: Dict[str, List[str]] = field(default_factory=dict)
+    task_state: TaskState = field(default_factory=TaskState)
     # CARGO-v2 semantic task state.  ``typed_values`` stores opaque IDs;
     # semantic_slots stores ordinary task facts such as dates, routes, cabin,
     # baggage count, insurance choice, payment preferences, and operations.
@@ -193,8 +196,22 @@ class WorkingMemory:
                 changed = True
         return changed
 
-    def _add_semantic_slot(self, key_path: str, value: Any, *, confirmed: bool) -> bool:
-        key = _normalize_semantic_key(key_path)
+    def bind_semantic_slot(self, key: str, value: Any, *, confirmed: bool = False) -> bool:
+        """Public adapter hook for semantic task-state updates."""
+        changed = self._add_semantic_slot(key, value, confirmed=confirmed, allow_new=True)
+        if changed:
+            self.evidence_version += 1
+        return changed
+
+    def _add_semantic_slot(
+        self,
+        key_path: str,
+        value: Any,
+        *,
+        confirmed: bool,
+        allow_new: bool = False,
+    ) -> bool:
+        key = _normalize_semantic_key(key_path, allow_new=allow_new)
         if not key:
             return False
         if key == "intent":
@@ -530,7 +547,7 @@ def _typed_keys_for_path(key_path: str, value: str) -> List[str]:
     return dedup
 
 
-def _normalize_semantic_key(key_path: str) -> str:
+def _normalize_semantic_key(key_path: str, *, allow_new: bool = False) -> str:
     key = str(key_path or "").strip().lower()
     key = re.sub(r"\[\d+\]", "", key)
     key = key.split(".")[-1]
@@ -540,22 +557,14 @@ def _normalize_semantic_key(key_path: str) -> str:
         "arrival_date": "date",
         "scheduled_departure_date": "date",
         "scheduled_arrival_date": "date",
-        "origin_airport": "origin",
-        "destination_airport": "destination",
-        "cabin_class": "cabin",
-        "class": "cabin",
-        "trip": "trip_type",
-        "insurance": "travel_insurance",
-        "total_bags": "baggage_count",
-        "total_baggages": "baggage_count",
-        "checked_bags": "baggage_count",
-        "checked_baggages": "baggage_count",
+        "intent": "intent",
+        "confirmation": "confirmation",
     }
     key = aliases.get(key, key)
+    if allow_new:
+        return key if re.fullmatch(r"[a-z][a-z0-9_]{0,60}", key) else ""
     semantic_keys = {
-        "date", "origin", "destination", "cabin", "trip_type",
-        "baggage_count", "travel_insurance", "intent",
-        "payment_preference", "time_preference",
+        "date", "intent", "confirmation",
     }
     return key if key in semantic_keys else ""
 
@@ -575,13 +584,14 @@ _MONTHS = {
     "december": 12, "dec": 12,
 }
 
-_NUMBER_WORDS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
-    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
-}
-
-
 def _extract_semantic_slots(text: str) -> List[tuple]:
+    """Extract only benchmark-neutral slots.
+
+    Domain-specific bindings (retail options, airline route/cabin/baggage,
+    ACEBench candidate constraints) are adapter-owned.  Keeping this helper
+    generic prevents the CARGO core from becoming a retail or airline rule
+    engine.
+    """
     s = str(text or "")
     if not s:
         return []
@@ -608,6 +618,8 @@ def _extract_semantic_slots(text: str) -> List[tuple]:
         push("intent", "exchange")
     if re.search(r"\b(return|refund)\b", low):
         push("intent", "return")
+    if re.search(r"\b(confirm|confirmed|yes|go ahead|proceed)\b", low):
+        push("confirmation", "yes")
 
     for m in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", s):
         push("date", m.group(0))
@@ -622,60 +634,7 @@ def _extract_semantic_slots(text: str) -> List[tuple]:
         day = int(m.group(2))
         if 1 <= day <= 31:
             push("date", f"{year:04d}-{month:02d}-{day:02d}")
-
-    route = re.search(r"\bfrom\s+([A-Za-z][A-Za-z .'-]{1,40}?)\s+to\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:[.,;]| on | in | at |$)", s, re.I)
-    if route:
-        push("origin", _clean_semantic_phrase(route.group(1)))
-        push("destination", _clean_semantic_phrase(route.group(2)))
-    depart = re.search(r"\b(?:departing|leaving|flying out)\s+from\s+([A-Z]{3}|[A-Za-z][A-Za-z .'-]{1,40})(?:[.,;]| on | in | at |$)", s, re.I)
-    if depart:
-        push("origin", _clean_semantic_phrase(depart.group(1)))
-
-    if "basic economy" in low:
-        push("cabin", "basic economy")
-    elif "business class" in low or re.search(r"\bbusiness\b", low):
-        push("cabin", "business")
-    elif re.search(r"\beconomy\b", low):
-        push("cabin", "economy")
-
-    if re.search(r"\bround[- ]trip\b", low):
-        push("trip_type", "round trip")
-    if re.search(r"\bone[- ]way\b", low):
-        push("trip_type", "one way")
-    if re.search(r"\breturn (?:flight|trip)\b", low):
-        push("trip_type", "round trip")
-
-    bag_match = re.search(r"\b(\d+|zero|one|two|three|four|five|six|seven|eight|nine)\s+checked\s+bags?\b", low)
-    if bag_match:
-        raw = bag_match.group(1)
-        push("baggage_count", int(raw) if raw.isdigit() else _NUMBER_WORDS.get(raw))
-
-    if re.search(r"\b(no|without|do not want|don't want)\s+(?:travel\s+)?insurance\b", low):
-        push("travel_insurance", "no")
-    elif re.search(r"\b(?:buy|get|add|want|need|using my)\s+(?:travel\s+)?insurance\b", low):
-        push("travel_insurance", "yes")
-
-    if "certificate" in low:
-        push("payment_preference", "certificate")
-    if "gift card" in low or "gift_card" in low:
-        push("payment_preference", "gift_card")
-    if "credit card" in low or "card" in low:
-        push("payment_preference", "credit_card")
-
-    if re.search(r"\bcheapest\b", low):
-        push("time_preference", "cheapest")
-    if re.search(r"\bdirect\b", low):
-        push("time_preference", "direct_preferred")
-    if re.search(r"\bone[- ]?stop|stopover\b", low):
-        push("time_preference", "onestop_allowed")
-    if re.search(r"\bafter\s+\d{1,2}\s*(?:am|pm)?\b", low):
-        push("time_preference", re.search(r"\bafter\s+\d{1,2}\s*(?:am|pm)?\b", low).group(0))
     return out
-
-
-def _clean_semantic_phrase(value: str) -> str:
-    val = re.sub(r"\s+", " ", str(value or "")).strip(" .,;:!?")
-    return val
 
 
 def _typed_keys_for_token(token: str) -> List[str]:

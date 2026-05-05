@@ -13,7 +13,9 @@ import json
 from typing import Any, Dict, List
 
 from . import repair
+from .adapters import select_adapter
 from .calibration import default_calibration
+from .core import GenericCargoKernel
 from .stats import CargoStats
 from .gates import (
     check_arg_grounding,
@@ -74,6 +76,7 @@ def _run_gates(
     wm: WorkingMemory,
     proposer_messages: List[Dict[str, Any]],
     schemas: Dict[str, ToolEffectSchema],
+    kernel: GenericCargoKernel,
     client,
     model: str,
     calibration,
@@ -86,6 +89,12 @@ def _run_gates(
     if not rl.ok:
         diag["gates_failed"].append("repeat_loop")
         return rl, diag
+    state_gate = kernel.validate_action(action, schema, wm)
+    diag["gates_run"].append("state_validity")
+    stats.record_gate(state_gate)
+    if not state_gate.ok:
+        diag["gates_failed"].append("state_validity")
+        return state_gate, diag
     if not is_gated(action.declared_class):
         ag = check_arg_grounding(action, schema, wm)
         diag["gates_run"].append("arg_grounding")
@@ -106,6 +115,13 @@ def _run_gates(
     if not ag.ok:
         diag["gates_failed"].append("arg_grounding")
         return ag, diag
+    completeness = kernel.validate_write_completeness(action, wm)
+    if completeness is not None:
+        diag["gates_run"].append("completeness")
+        stats.record_gate(completeness)
+        if not completeness.ok:
+            diag["gates_failed"].append("completeness")
+            return completeness, diag
     if not getattr(action, "bypass_gates", False):
         k = calibration.sc_k.get(action.declared_class, 0)
         threshold = calibration.sc_thresholds.get(action.declared_class, 0.0)
@@ -155,14 +171,18 @@ def run_cargo(
     domain_policy = system_prompt or ""
     sys_blob = _system_prompt(domain_policy=domain_policy)
 
+    adapter = select_adapter(env_hint="acebench", tools_info=tool_specs, wiki=domain_policy)
+    kernel = GenericCargoKernel(adapter)
     schemas = induce_schemas(
         tool_specs, client=client, model=model, temperature=0.0,
     )
+    schemas = kernel.enrich_schemas(schemas)
     calibration = default_calibration()
 
     wm = WorkingMemory(goal=user_turn, budget_steps=max_num_steps)
     if user_turn:
         wm.absorb_user_message(user_turn)
+        kernel.observe_user_message(wm, user_turn)
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": sys_blob}]
     if user_turn:
@@ -237,6 +257,7 @@ def run_cargo(
             failing, diag = _run_gates(
                 action=action, schema=schema, wm=wm,
                 proposer_messages=proposer_messages, schemas=schemas,
+                kernel=kernel,
                 client=client, model=model, calibration=calibration,
                 stats=stats,
             )
@@ -317,7 +338,9 @@ def run_cargo(
             stats.record_step(step_record)
             if not terminal:
                 # Absorb stub as a fact so subsequent steps don't repeat.
-                wm.absorb_observation(json.loads(stub))
+                stub_obj = json.loads(stub)
+                wm.absorb_observation(stub_obj)
+                kernel.observe_tool_result(wm, action.name, stub_obj)
             else:
                 break
     except Exception as exc:  # noqa: BLE001

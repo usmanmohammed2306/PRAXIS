@@ -23,6 +23,10 @@ class ToolEffectSchema:
     postconditions: List[str] = field(default_factory=list)
     # Param names whose values look like opaque IDs (regex-grounded).
     arg_id_fields: List[str] = field(default_factory=list)
+    # Param names whose values are ordinary semantic task literals.  These are
+    # adapter-declared non-ID fields, so the grounding gate must not treat them
+    # as opaque IDs merely because the string is capitalised or numeric-like.
+    arg_semantic_fields: List[str] = field(default_factory=list)
     # Raw parameter property dict from the OpenAI schema (for type lookups).
     param_properties: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Required parameter names (for missing-arg checks).

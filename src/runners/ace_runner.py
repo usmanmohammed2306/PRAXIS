@@ -60,14 +60,22 @@ def _candidate_task_paths(language: str) -> List[Path]:
     lang = language.lower()
     names = [
         f"data_all/data_{lang}/data_agent_{lang}.json",
+        f"data_all/data_{lang}/data_agent_multi_turn.json",
+        f"data_all/data_{lang}/data_agent_multi_step.json",
         f"data_all/data_agent_{lang}.json",
         f"data/data_{lang}/data_agent_{lang}.json",
+        f"data/data_{lang}/data_agent_multi_turn.json",
+        f"data/data_{lang}/data_agent_multi_step.json",
         f"data/data_agent_{lang}.json",
         f"data_agent_{lang}.json",
     ]
     candidates = [ACE_REPO / n for n in names]
     if ACE_REPO.exists():
         for p in ACE_REPO.rglob(f"data_agent_{lang}.json"):
+            candidates.append(p)
+        for p in ACE_REPO.rglob("data_agent_multi_turn.json"):
+            candidates.append(p)
+        for p in ACE_REPO.rglob("data_agent_multi_step.json"):
             candidates.append(p)
     seen: List[Path] = []
     for p in candidates:
