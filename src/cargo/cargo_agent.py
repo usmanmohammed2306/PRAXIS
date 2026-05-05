@@ -474,6 +474,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 diag["gates_failed"].append("completeness")
                 return completeness_gate, diag
 
+        if action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE, RiskClass.FINAL):
+            cert_gate = self._kernel().validate_commit_certificate(action, schema, wm)
+            diag["gates_run"].append("commit_certificate")
+            stats.record_gate(cert_gate)
+            if not cert_gate.ok:
+                diag["gates_failed"].append("commit_certificate")
+                return cert_gate, diag
+
         if not is_gated(action.declared_class):
             # Even on the fast path, run arg_grounding so hallucinated
             # placeholder values (e.g. "user@example.com") are caught before

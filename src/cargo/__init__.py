@@ -24,6 +24,7 @@ from .core import (
     CandidateObject,
     CandidateSelection,
     CandidateSet,
+    CommitCertificate,
     Constraint,
     ConstraintPriorityEngine,
     DecisionEngine,
@@ -31,6 +32,7 @@ from .core import (
     GenericCargoKernel,
     Obligation,
     Preference,
+    ProofObligation,
     TaskState,
 )
 from .proposer import (
@@ -51,6 +53,7 @@ __all__ = [
     "CandidateObject",
     "CandidateSelection",
     "CandidateSet",
+    "CommitCertificate",
     "Constraint",
     "ConstraintPriorityEngine",
     "DecisionEngine",
@@ -60,6 +63,7 @@ __all__ = [
     "Obligation",
     "ProposedAction",
     "Preference",
+    "ProofObligation",
     "RiskClass",
     "StepDiagnostics",
     "SYSTEM_PROMPT",
