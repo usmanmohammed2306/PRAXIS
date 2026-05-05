@@ -426,6 +426,75 @@ class TestCargoV2Adapters(unittest.TestCase):
         self.assertIn("destination", enriched.arg_semantic_fields)
         self.assertNotIn("origin", enriched.arg_id_fields)
 
+    def test_tool_observation_ids_do_not_become_semantic_slots(self) -> None:
+        wm = WorkingMemory()
+        kernel = GenericCargoKernel(TauRetailAdapter())
+        kernel.observe_tool_result(
+            wm,
+            "get_order_details",
+            {"items": [{"product_id": "1656367028", "item_id": "old_keyboard"}]},
+        )
+
+        self.assertNotIn("product_id", wm.semantic_slots)
+        self.assertTrue(
+            any(f.value == "1656367028" for f in wm.task_state.db_confirmed_facts.values())
+        )
+
+    def test_read_permissive_allows_grounded_product_retrieval_with_incomplete_state(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.adapter = TauRetailAdapter()
+        agent.kernel = GenericCargoKernel(agent.adapter)
+        agent.client = MockClient([])
+        agent.model = "test"
+        agent.temperature = 0.0
+        agent.calibration = default_calibration()
+        agent.schemas = {
+            "get_product_details": ToolEffectSchema(
+                name="get_product_details",
+                cls=RiskClass.READ,
+                arg_id_fields=["product_id"],
+                required_params=["product_id"],
+            )
+        }
+        wm = WorkingMemory()
+        # Simulate old polluted state from a prior scalar observation.  READ
+        # retrieval must still be allowed when the requested product_id is
+        # grounded in order details; semantic candidate validation is for WRITE.
+        wm.bind_semantic_slot("product_id", "0000000000", confirmed=True)
+        wm.order_details["#W1"] = {
+            "order_id": "#W1",
+            "items": [{"product_id": "1656367028", "item_id": "old_keyboard"}],
+        }
+        action = ProposedAction(
+            name="get_product_details",
+            args={"product_id": "1656367028"},
+            declared_class=RiskClass.READ,
+        )
+
+        failing, diag = agent._run_gates(action, agent.schemas["get_product_details"], wm, [], CargoStats())
+
+        self.assertIsNone(failing, failing.reason if failing else "")
+        self.assertIn("state_validity", diag["gates_run"])
+
+    def test_airline_adapter_binds_booking_intent_and_open_obligation(self) -> None:
+        wm = WorkingMemory()
+        kernel = GenericCargoKernel(TauAirlineAdapter())
+        text = (
+            "I'm looking to book a flight from New York to Seattle on May 20th "
+            "after 11 am in economy. One stopover is okay."
+        )
+        wm.absorb_user_message(text)
+        kernel.observe_user_message(wm, text)
+
+        self.assertIn("book_flight", wm.semantic_slots["intents"])
+        self.assertEqual(wm.semantic_slots["origin"], "New York")
+        self.assertEqual(wm.semantic_slots["destination"], "Seattle")
+        self.assertEqual(wm.semantic_slots["date"], "2024-05-20")
+        self.assertEqual(wm.semantic_slots["time_after"], "11:00")
+        self.assertIn("book_flight", wm.task_state.unresolved_obligations)
+
     def test_tau_retail_adapter_keeps_hard_constraints_separate_from_preferences(self) -> None:
         wm = WorkingMemory()
         kernel = GenericCargoKernel(TauRetailAdapter())
@@ -4389,6 +4458,7 @@ class TestTrajectory24Regressions(unittest.TestCase):
         agent = self._make_agent()
         wm = WorkingMemory()
         wm.absorb_user_message("Book a flight from New York to Seattle on May 20th.")
+        agent._kernel().observe_user_message(wm, "Book a flight from New York to Seattle on May 20th.")
         action = ProposedAction(
             name="search_direct_flight",
             args={
@@ -4406,10 +4476,80 @@ class TestTrajectory24Regressions(unittest.TestCase):
         self.assertEqual(failing.gate, "state_validity")
         self.assertIn("action_date_conflicts_with_state", failing.reason)
 
+    def test_i2b_airline_ask_loop_pivots_to_bound_flight_search(self) -> None:
+        agent = self._make_agent()
+        agent.schemas = {
+            "search_direct_flight": ToolEffectSchema(
+                name="search_direct_flight",
+                cls=RiskClass.READ,
+                arg_semantic_fields=["origin", "destination", "date"],
+                required_params=["origin", "destination", "date"],
+            ),
+            "search_onestop_flight": ToolEffectSchema(
+                name="search_onestop_flight",
+                cls=RiskClass.READ,
+                arg_semantic_fields=["origin", "destination", "date"],
+                required_params=["origin", "destination", "date"],
+            ),
+        }
+        wm = WorkingMemory()
+        text = (
+            "I'm looking to book a flight from New York to Seattle on May 20th. "
+            "Economy class, after 11 am, and one stopover is okay."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        ask = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="What would you like to do?",
+        )
+
+        replacement = agent._obligation_guided_action(ask, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_direct_flight")  # type: ignore[union-attr]
+        self.assertEqual(replacement.args["date"], "2024-05-20")  # type: ignore[union-attr]
+
+    def test_i2c_repeated_direct_search_pivots_to_onestop_when_allowed(self) -> None:
+        agent = self._make_agent()
+        agent.schemas = {
+            "search_direct_flight": ToolEffectSchema(
+                name="search_direct_flight",
+                cls=RiskClass.READ,
+                arg_semantic_fields=["origin", "destination", "date"],
+            ),
+            "search_onestop_flight": ToolEffectSchema(
+                name="search_onestop_flight",
+                cls=RiskClass.READ,
+                arg_semantic_fields=["origin", "destination", "date"],
+            ),
+        }
+        wm = WorkingMemory()
+        text = (
+            "Book a flight from New York to Seattle on May 20th. "
+            "Direct is preferred but one stopover is okay."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        direct = ProposedAction(
+            name="search_direct_flight",
+            args={"origin": "New York", "destination": "Seattle", "date": "2024-05-20"},
+            declared_class=RiskClass.READ,
+        )
+        wm.record_action_signature(direct.signature())
+
+        replacement = agent._obligation_guided_action(direct, wm)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement.name, "search_onestop_flight")  # type: ignore[union-attr]
+
     def test_i3_booking_write_requires_complete_slots(self) -> None:
         agent = self._make_agent()
         wm = WorkingMemory()
         wm.absorb_user_message("Please book an economy flight for alex_smith_42.")
+        agent._kernel().observe_user_message(wm, "Please book an economy flight for alex_smith_42.")
         action = ProposedAction(
             name="book_reservation",
             args={"user_id": "alex_smith_42"},

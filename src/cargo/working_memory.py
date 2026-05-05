@@ -470,6 +470,15 @@ class WorkingMemory:
                     val_s = str(val)
                 rendered.append(f"{key}={val_s}")
             parts.append("task_slots: " + "; ".join(rendered)[:220])
+        if self.task_state.open_slots:
+            parts.append(
+                "open_slots: " + ", ".join(sorted(self.task_state.open_slots))[:160]
+            )
+        if self.task_state.unresolved_obligations:
+            parts.append(
+                "open_obligations: "
+                + ", ".join(sorted(self.task_state.unresolved_obligations))[:180]
+            )
         parts += [
             "user_facts:",
             *(f"  {f[:90]}" for f in trim(self.user_facts, 5)),

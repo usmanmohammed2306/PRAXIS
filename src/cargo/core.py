@@ -1,8 +1,8 @@
-"""Generic CARGO-v2 state, adapter, and validation kernel.
+"""Generic CARGO-v3 state, adapter, and validation kernel.
 
 This module is intentionally domain-neutral.  It knows about facts, slots,
-constraints, preferences, candidates, actions, and gates; all domain and
-benchmark semantics live in ``src.cargo.adapters``.
+constraints, preferences, obligations, candidates, actions, and gates; all
+domain and benchmark semantics live in ``src.cargo.adapters``.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Set, Tuple, TYPE_CHECKING
 
+from .risk_class import RiskClass
 from .schemas import GateResult, ProposedAction, ToolEffectSchema
 
 if TYPE_CHECKING:  # pragma: no cover - type-only import avoids circularity.
@@ -79,6 +80,36 @@ class CandidateObject:
 
 
 @dataclass
+class Obligation:
+    """Domain-neutral unit of task closure.
+
+    Obligations describe what must become true before a task can commit.  The
+    core owns the shape; adapters decide which obligations exist for a domain.
+    """
+
+    obligation_id: str
+    operation_type: str
+    required_slots: Set[str] = field(default_factory=set)
+    required_constraints: Set[str] = field(default_factory=set)
+    candidate_retrieval_needs: Set[str] = field(default_factory=set)
+    selected_candidate_needs: Set[str] = field(default_factory=set)
+    confirmation_required: bool = False
+    execution_required: bool = True
+    status: str = "open"  # open | blocked | complete
+    blockers: List[str] = field(default_factory=list)
+
+    def open_slots(self, state: "TaskState") -> Set[str]:
+        return {
+            slot for slot in self.required_slots
+            if state.fact_value(slot) in (None, "") and slot not in state.confirmations
+        }
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "complete"
+
+
+@dataclass
 class TaskState:
     benchmark_name: str = ""
     domain_name: str = ""
@@ -94,14 +125,18 @@ class TaskState:
     inferred_facts: Dict[str, StateFact] = field(default_factory=dict)
     assumptions: Dict[str, StateFact] = field(default_factory=dict)
     conflicts: List[Dict[str, Any]] = field(default_factory=list)
+    open_slots: Set[str] = field(default_factory=set)
     constraints: List[Constraint] = field(default_factory=list)
     preferences: List[Preference] = field(default_factory=list)
     fallback_rules: List[FallbackRule] = field(default_factory=list)
+    candidate_sets: Dict[str, List[str]] = field(default_factory=dict)
     candidate_objects: Dict[str, CandidateObject] = field(default_factory=dict)
     selected_objects: Dict[str, str] = field(default_factory=dict)
+    obligations: Dict[str, Obligation] = field(default_factory=dict)
     unresolved_obligations: Set[str] = field(default_factory=set)
     confirmations: Set[str] = field(default_factory=set)
     executed_writes: Set[str] = field(default_factory=set)
+    completed_operations: Set[str] = field(default_factory=set)
     failed_action_signatures: Dict[str, int] = field(default_factory=dict)
     last_error: str = ""
     last_meaningful_state_change: int = 0
@@ -151,6 +186,10 @@ class TaskState:
                 "reason": "stronger_or_later_fact_replaced_prior",
             })
         target[nkey] = fact
+        if nkey == "intent" and str(value) not in self.intent:
+            self.intent.append(str(value))
+        if nkey == "confirmation":
+            self.confirmations.add(normalize_value(value))
         self.last_meaningful_state_change += 1
         return True
 
@@ -240,6 +279,46 @@ class TaskState:
         self.last_meaningful_state_change += 1
         return True
 
+    def upsert_obligation(self, obligation: Obligation) -> bool:
+        oid = normalize_key(obligation.obligation_id)
+        if not oid:
+            return False
+        obligation.obligation_id = oid
+        existing = self.obligations.get(oid)
+        if existing == obligation:
+            return False
+        self.obligations[oid] = obligation
+        if not obligation.complete:
+            self.unresolved_obligations.add(oid)
+        else:
+            self.unresolved_obligations.discard(oid)
+            self.completed_operations.add(obligation.operation_type)
+        self.refresh_open_slots()
+        self.last_meaningful_state_change += 1
+        return True
+
+    def mark_obligation_complete(self, obligation_id: str) -> bool:
+        oid = normalize_key(obligation_id)
+        ob = self.obligations.get(oid)
+        if not ob or ob.status == "complete":
+            return False
+        ob.status = "complete"
+        ob.blockers = []
+        self.unresolved_obligations.discard(oid)
+        self.completed_operations.add(ob.operation_type)
+        self.refresh_open_slots()
+        self.last_meaningful_state_change += 1
+        return True
+
+    def refresh_open_slots(self) -> Set[str]:
+        open_slots: Set[str] = set()
+        for obligation in self.obligations.values():
+            if obligation.complete:
+                continue
+            open_slots.update(obligation.open_slots(self))
+        self.open_slots = open_slots
+        return open_slots
+
     def hard_constraints_for(self, scope: Optional[str] = None) -> List[Constraint]:
         out = [c for c in self.constraints if c.hard]
         if scope:
@@ -261,6 +340,15 @@ class CargoDomainAdapter(Protocol):
         ...
 
     def absorb_observation(self, obs: Any, state: TaskState, action_name: str = "") -> List[Tuple[str, Any, bool]]:
+        ...
+
+    def update_obligations(self, state: TaskState, wm: "WorkingMemory") -> None:
+        ...
+
+    def validate_read_action(self, action: ProposedAction, schema: ToolEffectSchema, wm: "WorkingMemory") -> GateResult:
+        ...
+
+    def validate_ask_user(self, action: ProposedAction, wm: "WorkingMemory") -> GateResult:
         ...
 
     def validate_action(self, action: ProposedAction, schema: ToolEffectSchema, wm: "WorkingMemory") -> GateResult:
@@ -308,6 +396,18 @@ class BaseCargoAdapter:
             state.bind_fact(key, value, source="tool", confirmed=True)
             updates.append((key, value, True))
         return updates
+
+    def update_obligations(self, state: TaskState, wm: "WorkingMemory") -> None:
+        state.refresh_open_slots()
+
+    def validate_read_action(self, action: ProposedAction, schema: ToolEffectSchema, wm: "WorkingMemory") -> GateResult:
+        return GateResult.passing("state_validity", adapter=self.name, validation_level="read_permissive")
+
+    def validate_ask_user(self, action: ProposedAction, wm: "WorkingMemory") -> GateResult:
+        text = normalize_value(action.user_text or action.raw_thought)
+        if text and text == normalize_value(wm.last_final_text):
+            return GateResult.failing("state_validity", "ask_user_repeats_same_question")
+        return GateResult.passing("state_validity", adapter=self.name, validation_level="ask_user")
 
     def validate_action(self, action: ProposedAction, schema: ToolEffectSchema, wm: "WorkingMemory") -> GateResult:
         return GateResult.passing("semantic_validation", adapter=self.name)
@@ -377,11 +477,19 @@ class GenericCargoKernel:
         self._ensure_state_meta(wm)
         for key, value, confirmed in self.adapter.bind_user_message(text, wm.task_state):
             wm.bind_semantic_slot(key, value, confirmed=confirmed)
+        self.adapter.update_obligations(wm.task_state, wm)
 
     def observe_tool_result(self, wm: "WorkingMemory", action_name: str, obs: Any) -> None:
         self._ensure_state_meta(wm)
+        semantic_fields = set(getattr(self.adapter, "semantic_fields", set()) or set())
+        id_fields = set(getattr(self.adapter, "id_fields", set()) or set())
         for key, value, confirmed in self.adapter.absorb_observation(obs, wm.task_state, action_name):
-            wm.bind_semantic_slot(key, value, confirmed=confirmed)
+            nkey = normalize_key(key.split(".")[-1] if isinstance(key, str) else str(key))
+            if nkey in id_fields:
+                continue
+            if nkey in semantic_fields or nkey in {"date", "intent", "confirmation"}:
+                wm.bind_semantic_slot(nkey, value, confirmed=confirmed)
+        self.adapter.update_obligations(wm.task_state, wm)
 
     def validate_action(
         self,
@@ -390,7 +498,14 @@ class GenericCargoKernel:
         wm: "WorkingMemory",
     ) -> GateResult:
         self._ensure_state_meta(wm)
-        conflict = self._validate_action_against_bound_state(action, wm)
+        if action.declared_class == RiskClass.READ:
+            conflict = self._validate_read_against_bound_state(action, schema, wm)
+            if not conflict.ok:
+                return conflict
+            return self.adapter.validate_read_action(action, schema, wm)
+        if action.declared_class == RiskClass.ASK_USER:
+            return self.adapter.validate_ask_user(action, wm)
+        conflict = self._validate_commitment_against_bound_state(action, schema, wm)
         if not conflict.ok:
             return conflict
         return self.adapter.validate_action(action, schema, wm)
@@ -408,24 +523,79 @@ class GenericCargoKernel:
         if not state.domain_name:
             state.domain_name = getattr(self.adapter, "domain_name", "")
 
-    def _validate_action_against_bound_state(self, action: ProposedAction, wm: "WorkingMemory") -> GateResult:
+    def _validate_read_against_bound_state(
+        self,
+        action: ProposedAction,
+        schema: ToolEffectSchema,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        """READs are retrieval-permissive.
+
+        They may run while state is incomplete and may retrieve IDs that are
+        not yet selected.  The only semantic-state conflict we block is a READ
+        argument that contradicts a bound ordinary semantic field such as date,
+        origin, destination, or cabin.  Opaque IDs are handled by the grounding
+        gate, not by semantic state comparison.
+        """
+        semantic_fields = set(getattr(schema, "arg_semantic_fields", []) or [])
+        semantic_fields.update(getattr(self.adapter, "semantic_fields", set()) or set())
+        return self._validate_bound_state_fields(
+            action,
+            wm,
+            semantic_fields=semantic_fields,
+            skip_id_fields=True,
+            validation_level="read_permissive",
+        )
+
+    def _validate_commitment_against_bound_state(
+        self,
+        action: ProposedAction,
+        schema: ToolEffectSchema,
+        wm: "WorkingMemory",
+    ) -> GateResult:
+        semantic_fields = set(getattr(schema, "arg_semantic_fields", []) or [])
+        semantic_fields.update(getattr(self.adapter, "semantic_fields", set()) or set())
+        return self._validate_bound_state_fields(
+            action,
+            wm,
+            semantic_fields=semantic_fields,
+            skip_id_fields=True,
+            validation_level="commitment_strict",
+        )
+
+    def _validate_bound_state_fields(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+        *,
+        semantic_fields: Set[str],
+        skip_id_fields: bool,
+        validation_level: str,
+    ) -> GateResult:
+        id_fields = set(getattr(self.adapter, "id_fields", set()) or set())
         for key, expected in wm.semantic_slots.items():
+            nkey = normalize_key(key)
+            if skip_id_fields and nkey in id_fields:
+                continue
+            if semantic_fields and nkey not in semantic_fields and nkey not in {"date", "intent", "confirmation"}:
+                continue
             if expected in (None, "", []):
                 continue
-            if key not in action.args:
+            if key not in action.args and nkey not in action.args:
                 continue
-            proposed = action.args.get(key)
+            proposed = action.args.get(key, action.args.get(nkey))
             if proposed in (None, "", []):
                 continue
             if not semantic_values_match(proposed, expected):
                 return GateResult.failing(
                     "state_validity",
-                    f"action_{key}_conflicts_with_state",
+                    f"action_{nkey}_conflicts_with_state",
                     expected=expected,
                     proposed=proposed,
                     adapter=getattr(self.adapter, "name", "generic"),
+                    validation_level=validation_level,
                 )
-        return GateResult.passing("state_validity")
+        return GateResult.passing("state_validity", validation_level=validation_level)
 
 
 def semantic_values_match(proposed: Any, expected: Any) -> bool:
@@ -560,6 +730,7 @@ __all__ = [
     "Constraint",
     "FallbackRule",
     "GenericCargoKernel",
+    "Obligation",
     "Preference",
     "StateFact",
     "TaskState",
