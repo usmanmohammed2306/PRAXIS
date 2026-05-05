@@ -29,7 +29,7 @@ except Exception:  # noqa: BLE001
 from . import repair
 from .adapters import select_adapter
 from .calibration import default_calibration
-from .core import BaseCargoAdapter, GenericCargoKernel, GoalActionCandidate
+from .core import BaseCargoAdapter, GenericCargoKernel, GoalActionCandidate, PreCommitVerifier
 from .gates import (
     check_arg_grounding,
     check_counterfactual,
@@ -3874,6 +3874,32 @@ class CargoAgent(Agent):  # type: ignore[misc]
             direct_set
             and (direct_set.exhausted or (self._onestop_allowed(wm) and not direct_viable))
         )
+        one_set = None
+        one_exhausted = False
+        if self._onestop_allowed(wm):
+            one_args = {"origin": origin, "destination": destination, "date": date}
+            one_set = wm.task_state.candidate_set_for("search_onestop_flight", one_args)
+            one_exhausted = bool(one_set and one_set.exhausted)
+        proposed_origin = str(action.args.get("origin") or "").strip() if isinstance(action.args, dict) else ""
+        proposed_destination = str(action.args.get("destination") or "").strip() if isinstance(action.args, dict) else ""
+        proposed_date = str(action.args.get("date") or "").strip() if isinstance(action.args, dict) else ""
+        noncanonical_search = bool(
+            action.name in {"search_direct_flight", "search_onestop_flight"}
+            and (
+                proposed_origin != origin
+                or proposed_destination != destination
+                or (proposed_date and proposed_date != str(date))
+            )
+        )
+        recorded_search_replay = bool(
+            (action.name == "search_direct_flight" and direct_set is not None)
+            or (action.name == "search_onestop_flight" and one_set is not None)
+        )
+        placeholder_args = self._action_contains_placeholder(action)
+        booking_reservation_drift = bool(
+            self._airline_booking_goal(wm)
+            and action.name == "get_reservation_details"
+        )
 
         should_intercept = (
             action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
@@ -3881,9 +3907,18 @@ class CargoAgent(Agent):  # type: ignore[misc]
             or action.name.lower() in (RESPOND_TOOL_NAME, "respond", "final", "answer")
             or action.signature() in wm.recent_signatures
             or wm.failed_without_new_evidence(action.signature())
+            or noncanonical_search
+            or recorded_search_replay
+            or placeholder_args
+            or booking_reservation_drift
         )
         if action.name in {"search_direct_flight", "search_onestop_flight"}:
-            should_intercept = should_intercept or action.signature() in wm.recent_signatures
+            should_intercept = (
+                should_intercept
+                or action.signature() in wm.recent_signatures
+                or noncanonical_search
+                or recorded_search_replay
+            )
         if not should_intercept:
             return None
 
@@ -3900,12 +3935,6 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 if fresh is not None:
                     return fresh
 
-        one_set = None
-        one_exhausted = False
-        if self._onestop_allowed(wm):
-            one_args = {"origin": origin, "destination": destination, "date": date}
-            one_set = wm.task_state.candidate_set_for("search_onestop_flight", one_args)
-            one_exhausted = bool(one_set and one_set.exhausted)
         if self._onestop_allowed(wm) and one_set is None:
             one = self._flight_search_action(
                 "search_onestop_flight",
@@ -3946,6 +3975,13 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 bypass_gates=True,
             )
         return None
+
+    @staticmethod
+    def _action_contains_placeholder(action: ProposedAction) -> bool:
+        for _, value in PreCommitVerifier._iter_scalars(action.args):
+            if PreCommitVerifier._looks_placeholder(value):
+                return True
+        return False
 
     def _airline_user_id_request(
         self,

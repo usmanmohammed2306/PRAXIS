@@ -57,6 +57,11 @@ The spine is now:
   - computes certificate/card payment split from profile payment methods
   - computes free/non-free baggage from membership and cabin
   - asks for exact user confirmation before `book_reservation`
+- Added latest-corpus router recentering:
+  - canonicalizes airline city-name search arguments before execution
+  - treats `latest_search_result` reservation reads in booking tasks as drift
+  - suppresses direct-search replays when recorded evidence already proves no viable direct option
+  - ranks only viable itineraries before applying cheapest-price preference
 
 ## Test Coverage Added
 
@@ -68,6 +73,12 @@ The spine is now:
 - airline presents grounded itinerary details before booking
 - airline builds a complete `book_reservation` after confirmation
 - pre-commit verifier appears in the write gate diagnostics
+- latest result corpus is tracked in `docs/known_issues.json`
+- city-name airline search proposals become tool-native airport-code searches
+- placeholder reservation-detail reads recenter to grounded booking progress
+- direct-search rechecks after existing evidence present the selected itinerary
+- cheapest invalid airline itineraries are rejected before price ranking
+- latest retail name+ZIP+order tasks authenticate before order reads
 
 Existing tests for read-permissive behavior, write completeness, active task-frame isolation, commit certificates, soft goal-field routing, and synthetic smoke remain part of the suite.
 
@@ -106,7 +117,7 @@ Run:
 python3 -m unittest tests.test_cargo -q
 python3 -m compileall src tests scripts -q
 bash run_project.sh --dry-run
-python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_v2_spine.json
+python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_v2_corpus.json
 ```
 
 Live tau/ACE reruns require a model endpoint. The shell scripts are intentionally unchanged in this patch.

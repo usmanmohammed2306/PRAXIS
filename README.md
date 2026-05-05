@@ -518,14 +518,14 @@ spine checks; deterministic airline itinerary/payment/passenger booking
 candidates; proof-carrying commit certificates; post-write terminal response;
 and full agent loop behavior on mock environments.
 
-Latest local verification in this workspace: `289` tests passed, compileall
+Latest local verification in this workspace: `295` tests passed, compileall
 passed, `git diff --check` passed, `python3 -m pip check` passed, and
 `bash run_project.sh --dry-run` resolved the benchmark configuration.
 Synthetic smoke passed. Classic tau-bench and ACEBench dependencies are
 present, but live tau-bench / ACEBench smoke tests still require either
 `OPENAI_API_KEY` or an OpenAI-compatible `OPENAI_BASE_URL`; without one, the
 smoke helper reports them as blocked and leaves exact rerun commands in
-`outputs/smoke/smoke_summary_v2_spine.json`.
+`outputs/smoke/smoke_summary_v2_corpus.json`.
 
 The detailed redesign note is in
 [`docs/cargo_v2_redesign_plan.md`](docs/cargo_v2_redesign_plan.md). Current
