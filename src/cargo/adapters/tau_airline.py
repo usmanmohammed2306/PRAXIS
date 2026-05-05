@@ -1,10 +1,11 @@
 """tau-bench airline adapter."""
 from __future__ import annotations
 
+import json
 import re
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
-from ..core import BaseCargoAdapter, Obligation, Preference, TaskState
+from ..core import BaseCargoAdapter, Obligation, Preference, TaskState, normalize_key
 from ..schemas import GateResult, ProposedAction, ToolEffectSchema
 
 
@@ -48,6 +49,13 @@ class TauAirlineAdapter(BaseCargoAdapter):
         "date", "origin", "destination", "cabin", "trip_type",
         "baggage_count", "travel_insurance", "payment_preferences",
         "payment_preference", "time_preference", "time_after", "intent",
+    }
+    task_frame_fields = {
+        "origin", "destination", "date", "cabin", "cabin_class",
+        "trip_type", "flight_type", "baggage_count", "total_baggages",
+        "nonfree_baggages", "travel_insurance", "insurance",
+        "payment_preference", "payment_preferences", "time_preference",
+        "time_after",
     }
 
     def bind_user_message(self, text: str, state: TaskState) -> List[Tuple[str, Any, bool]]:
@@ -137,6 +145,36 @@ class TauAirlineAdapter(BaseCargoAdapter):
             if ampm == "am" and hour == 12:
                 hour = 0
             updates += self._fact(state, "time_after", f"{hour:02d}:{minute:02d}")
+        return updates
+
+    def absorb_observation(
+        self,
+        obs: Any,
+        state: TaskState,
+        action_name: str = "",
+    ) -> List[Tuple[str, Any, bool]]:
+        """Treat airline tool data as evidence, not as the active goal frame.
+
+        Reservation/profile reads often contain unrelated routes, cabins,
+        dates, and insurance choices from historical bookings.  Those facts
+        are valuable for candidate selection, but letting them overwrite the
+        user-bound task frame is exactly how a booking request for New York →
+        Seattle drifts into a cached Denver → Las Vegas reservation.  Opaque
+        IDs and payment facts still bind normally.
+        """
+        updates: List[Tuple[str, Any, bool]] = []
+        for key, value in _iter_airline_scalars(_coerce_airline_obs(obs)):
+            leaf = normalize_key(str(key).split(".")[-1])
+            if leaf in self.task_frame_fields:
+                state.conflicts.append({
+                    "key": leaf,
+                    "value": value,
+                    "source_action": action_name,
+                    "reason": "cached_airline_fact_quarantined_from_task_frame",
+                })
+                continue
+            state.bind_fact(key, value, source="tool", confirmed=True)
+            updates.append((key, value, True))
         return updates
 
     def update_obligations(self, state: TaskState, wm) -> None:
@@ -301,6 +339,35 @@ def _state_values(state: TaskState, key: str) -> List[Any]:
         vals.append(fact.value)
     vals.extend(p.value for p in state.preferences if p.slot == key)
     return vals
+
+
+def _coerce_airline_obs(obs: Any) -> Any:
+    if isinstance(obs, (dict, list)):
+        return obs
+    if isinstance(obs, str):
+        text = obs.strip()
+        if not text:
+            return None
+        if text[0] in "[{":
+            try:
+                return json.loads(text)
+            except Exception:
+                return None
+    return None
+
+
+def _iter_airline_scalars(value: Any, prefix: str = ""):
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            yield from _iter_airline_scalars(item, path)
+        return
+    if isinstance(value, list):
+        for idx, item in enumerate(value):
+            yield from _iter_airline_scalars(item, f"{prefix}[{idx}]")
+        return
+    if value not in (None, "") and prefix:
+        yield prefix, value
 
 
 def _is_payment_question(text: str) -> bool:

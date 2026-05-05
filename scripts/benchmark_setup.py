@@ -64,12 +64,28 @@ def install_ace(*, include_vllm: bool) -> Dict[str, Any]:
         return run([sys.executable, "-m", "pip", "install", "-r", str(req)])
     safe = []
     skipped = []
+    # ACEBench's historical requirements pin several shared packages below
+    # what tau-bench and current OpenAI-compatible clients need.  For smoke
+    # testing we only need import-level compatibility, so keep the environment
+    # stable and skip pins that would downgrade the active benchmark runtime.
+    conflict_prone = {
+        "vllm",
+        "openai",
+        "litellm",
+        "pydantic",
+        "numpy",
+        "pandas",
+        "httpx",
+        "python-dotenv",
+        "typing-extensions",
+        "tqdm",
+    }
     for raw in req.read_text().splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         name = line.split("==", 1)[0].strip().lower().replace("_", "-")
-        if name in {"vllm"}:
+        if name in conflict_prone:
             skipped.append(line)
         else:
             safe.append(line)
