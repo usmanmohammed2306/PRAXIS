@@ -672,7 +672,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     })
                     action = res_action
 
-            # CARGO-v3 obligation guide: READ actions build state, so when a
+            # CARGO-v4 obligation/decision guide: READ actions build state, so when a
             # proposal is an unhelpful ASK/FINAL/repeated read but obligations
             # already identify the next information need, deterministically
             # choose that READ.  Commitment gates remain strict later.
@@ -1086,6 +1086,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             wm.absorb_observation(tool_obs if not isinstance(env_resp, type(None))
                                   else "")
             self._kernel().observe_tool_result(wm, action.name, tool_obs)
+            self._kernel().record_action_candidates(wm, action.name, action.args, tool_obs)
 
             # Track failed name+ZIP lookups so _auth_override doesn't retry the
             # same invalid ZIP on the next step.
@@ -3004,7 +3005,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
     ) -> Optional[ProposedAction]:
         """Choose the next information-gathering action from open obligations.
 
-        This is the CARGO-v3 controller layer.  It is deliberately narrow and
+        This is the CARGO-v4 controller layer.  It is deliberately narrow and
         retrieval-focused: it may replace a stuck ASK/FINAL/repeated READ with
         a grounded READ that reduces uncertainty, but it does not fabricate a
         WRITE.  Writes still flow through canonicalization and completeness.
@@ -3052,6 +3053,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
         date = self._slot_value(slots, "date")
         if not (origin and destination and date):
             return None
+        direct_args = {"origin": origin, "destination": destination, "date": date}
+        direct_set = wm.task_state.candidate_set_for("search_direct_flight", direct_args)
+        direct_exhausted = bool(direct_set and direct_set.exhausted)
 
         should_intercept = (
             action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
@@ -3064,30 +3068,60 @@ class CargoAgent(Agent):  # type: ignore[misc]
         if not should_intercept:
             return None
 
-        direct = self._flight_search_action(
-            "search_direct_flight",
-            origin=origin,
-            destination=destination,
-            date=date,
-            thought="Obligation guide: route/date are bound; search direct flights.",
-        )
-        if direct is not None:
-            fresh = self._fresh_action_or_none(direct, wm)
-            if fresh is not None:
-                return fresh
+        if not direct_exhausted:
+            direct = self._flight_search_action(
+                "search_direct_flight",
+                origin=origin,
+                destination=destination,
+                date=date,
+                thought="Decision engine: route/date are bound; search direct flights.",
+            )
+            if direct is not None:
+                fresh = self._fresh_action_or_none(direct, wm)
+                if fresh is not None:
+                    return fresh
 
+        one_set = None
+        one_exhausted = False
         if self._onestop_allowed(wm):
+            one_args = {"origin": origin, "destination": destination, "date": date}
+            one_set = wm.task_state.candidate_set_for("search_onestop_flight", one_args)
+            one_exhausted = bool(one_set and one_set.exhausted)
+        if self._onestop_allowed(wm) and not one_exhausted:
             one = self._flight_search_action(
                 "search_onestop_flight",
                 origin=origin,
                 destination=destination,
                 date=date,
-                thought="Obligation guide: direct search is exhausted; search one-stop options.",
+                thought="Decision engine: direct search is exhausted; search one-stop options.",
             )
             if one is not None:
                 fresh = self._fresh_action_or_none(one, wm)
                 if fresh is not None:
                     return fresh
+        all_searches_exhausted = direct_exhausted and (
+            not self._onestop_allowed(wm) or bool(one_set and one_set.exhausted)
+        )
+        if all_searches_exhausted:
+            wm.task_state.terminal_status = "blocked_no_matching_flights"
+            return ProposedAction(
+                name=RESPOND_TOOL_NAME,
+                args={},
+                declared_class=RiskClass.FINAL,
+                declared_pre=["all allowed flight searches exhausted"],
+                declared_post=["user informed no matching flight exists"],
+                informational_intent="terminate airline task with search blocker",
+                raw_thought=(
+                    "Decision engine: direct and allowed one-stop searches are "
+                    "exhausted for the grounded route/date, so stop instead of looping."
+                ),
+                user_text=(
+                    "I could not find any matching flights for the requested route and date "
+                    "under the allowed search strategies."
+                ),
+                raw_response="",
+                bypass_gates=True,
+            )
         return None
 
     def _flight_search_action(
@@ -3751,6 +3785,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
         *,
         mode: str,
     ) -> Optional[str]:
+        adapter_selector = getattr(getattr(self, "adapter", None), "select_replacement_variant_id", None)
+        if callable(adapter_selector):
+            selected = adapter_selector(details, old_item, goal)
+            if selected:
+                return selected
+
         variants = details.get("variants") or {}
         if not isinstance(variants, dict):
             return None

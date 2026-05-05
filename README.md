@@ -9,7 +9,7 @@ and **ACEBench Agent**:
 | 1 | **Vanilla TC** (`baseline`) | Native function-calling, minimal system prompt. |
 | 2 | **Act** (`act`)             | Yao et al. 2022 ablation: action-only, no reasoning prose. |
 | 3 | **ReAct** (`react`)         | Yao et al. 2022: one-line `Thought:` before each Action. |
-| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; deterministic gates check argument grounding, task-state validity, semantic completeness, and pre-conditions, and a calibrated self-consistency vote (+ counterfactual rollout for IRREVERSIBLE / FINAL) decides whether to commit, retry, ask, or finalize. Mutations execute only after every gate passes. |
+| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; a deterministic decision engine updates state, stores candidate sets, applies hard constraints before preferences, schedules the next pipeline step, and then risk gates check grounding, task-state validity, semantic completeness, and pre-conditions. Calibrated self-consistency plus counterfactual rollout are still reserved for high-risk actions. |
 
 All four conditions share the **same in-process loop, model,
 temperature, max-steps, and truncation budget**. The only varying axis is
@@ -73,19 +73,23 @@ unchanged.
             └─────────────────────────────────────────────────────────┘
 ```
 
-## CARGO-v3: Incremental State + Obligation-Guided Risk Gating
+## CARGO-v4: Decision-Centric Risk-Gated State Controller
 
-CARGO remains a lightweight, training-free controller. The v3 hardening
-does not add fine-tuning, a separate judge, benchmark answer retrieval, or a
-tree-search planner. It changes the controller architecture so CARGO no
-longer treats every action as a commitment. The control law is:
+CARGO remains a lightweight, training-free controller. The previous
+state/obligation hardening becomes v4 by adding a deterministic decision
+layer. It still does not add
+fine-tuning, a separate judge, benchmark answer retrieval, or a tree-search
+planner. It changes the controller architecture so CARGO no longer asks the
+LLM to perform deterministic candidate selection when structured tool data is
+available. The control law is:
 
 ```
 observe
 → bind_user_and_tool_evidence
 → update_incremental_state
 → update_obligation_graph
-→ choose_next_information_need_or_commit_action
+→ update_candidate_sets
+→ decision_engine_choose_next_step
 → validate_by_action_class
 → execute_or_repair
 → verify_state_transition
@@ -103,12 +107,13 @@ The key rule is **retrieval-permissive, commitment-strict**:
 - `ASK_USER` is reserved for genuinely missing slots. If a user already
   answered, deterministic binding updates state before the proposer is called.
 
-CARGO-v3 is split into a generic core plus pluggable adapters:
+CARGO-v4 is split into a generic core plus pluggable adapters:
 
 - `src/cargo/core.py` defines the domain-neutral kernel: typed task state,
   layered facts, open slots, constraints, preferences, fallback rules,
   candidate sets, candidate objects, obligations, failed signatures, executed
-  writes, semantic validation hooks, completeness hooks, and terminal state.
+  writes, semantic validation hooks, completeness hooks, terminal state, and
+  the deterministic `DecisionEngine`.
 - `src/cargo/adapters/` contains benchmark/domain adapters.  The core does
   not name retail products, flights, reservations, or ACEBench answer
   patterns.  Adapters own tool schema enrichment, ID fields, non-ID semantic
@@ -129,12 +134,31 @@ The deterministic working memory and task state now separate:
 - open slots and obligations such as “retrieve candidates”, “select valid
   replacement”, “obtain confirmation”, “execute once”, and “terminate”
 
-CARGO-v3 fixes the deeper failure from the uploaded logs: old `state_validity`
-was too flat. It sometimes blocked valid retrieval such as
-`get_product_details(product_id=...)` because a tool-returned opaque ID had
-been treated like a semantic constraint. The new validation is class-specific:
-READ may retrieve grounded IDs from user/tool evidence; WRITE and FINAL still
-run strict semantic and completeness checks.
+CARGO-v4 fixes the deeper failure from the uploaded logs: old CARGO could
+reject or allow actions, but it did not deterministically decide the correct
+candidate or next pipeline step. The current decision engine provides:
+
+- **Constraint priority engine**: hard constraints and global constraints
+  filter first, availability/actionability filters next, fallback rules apply
+  only after strict candidates are exhausted, and preferences only rank valid
+  candidates.
+- **Candidate-set manager**: READ results are stored with source tool, query
+  args, empty/exhausted status, rejected candidates, and selected candidates.
+  Empty searches are not repeated without new evidence.
+- **Pipeline scheduler**: obligations move through intent binding,
+  prerequisite retrieval, candidate search, candidate selection, secondary
+  details, confirmation, write, verification, and termination.
+- **Search termination policy**: direct and one-stop airline searches pivot
+  once through allowed strategies and then terminate with a truthful blocker
+  instead of looping.
+- **Ask-user policy**: questions are allowed only for genuinely missing,
+  user-only values at the current stage. Payment/certificate details are not
+  requested before a flight candidate exists and profile/tool state has been
+  consulted.
+
+The same class-specific validation remains: READ may retrieve grounded IDs
+from user/tool evidence while state is incomplete; WRITE and FINAL still run
+strict semantic and completeness checks.
 
 The gate stack uses state and obligations to block completed-phase re-entry,
 repeated dead-end actions without new evidence, repeated ASK_USER loops,
@@ -362,7 +386,7 @@ repair policy decisions; READ-permissive / WRITE-strict validation; airline
 obligation-guided search progression; and full agent loop behavior on mock
 environments.
 
-Latest local verification in this workspace: `232` tests passed. Live
+Latest local verification in this workspace: `239` tests passed. Live
 tau-bench / ACEBench smoke tests require either `OPENAI_API_KEY` or an
 OpenAI-compatible `OPENAI_BASE_URL`; without one, the smoke helper reports
 them as blocked and leaves exact rerun commands.

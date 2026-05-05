@@ -185,6 +185,26 @@ class TauAirlineAdapter(BaseCargoAdapter):
             )
         return GateResult.passing("completeness", adapter=self.name)
 
+    def validate_ask_user(self, action: ProposedAction, wm) -> GateResult:
+        text = str(action.user_text or action.raw_thought or "").lower()
+        if _is_payment_question(text) and not _flight_candidate_selected(wm):
+            return GateResult.failing(
+                "state_validity",
+                "payment_question_before_flight_selection",
+                adapter=self.name,
+                validation_level="ask_user",
+            )
+        return super().validate_ask_user(action, wm)
+
+    def validate_final_completeness(self, action: ProposedAction, wm) -> Optional[GateResult]:
+        if wm.task_state.terminal_status == "blocked_no_matching_flights":
+            return GateResult.passing(
+                "final_completeness",
+                adapter=self.name,
+                terminal_status=wm.task_state.terminal_status,
+            )
+        return super().validate_final_completeness(action, wm)
+
     def _fact(self, state: TaskState, key: str, value: Any) -> List[Tuple[str, Any, bool]]:
         if value in (None, ""):
             return []
@@ -212,6 +232,28 @@ def _state_values(state: TaskState, key: str) -> List[Any]:
         vals.append(fact.value)
     vals.extend(p.value for p in state.preferences if p.slot == key)
     return vals
+
+
+def _is_payment_question(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(payment|pay|card|credit\s+card|gift\s+card|certificate|"
+            r"voucher|billing)\b",
+            text,
+        )
+    )
+
+
+def _flight_candidate_selected(wm) -> bool:
+    state = getattr(wm, "task_state", None)
+    if state is None:
+        return False
+    selected = getattr(state, "selected_objects", {}) or {}
+    if any(k in selected for k in ("itinerary", "flight", "flights")):
+        return True
+    # Some future adapters may bind selected flight numbers as semantic slots.
+    slots = getattr(wm, "semantic_slots", {}) or {}
+    return bool(slots.get("selected_flight") or slots.get("selected_itinerary"))
 
 
 __all__ = ["TauAirlineAdapter"]
