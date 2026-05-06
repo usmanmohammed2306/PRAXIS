@@ -229,7 +229,9 @@ def _promote_records_to_runtime(
     Uses the legacy ``promote_trajectories`` API (which writes
     ``ExperienceCard``-shaped JSONL the existing seed bank also produces).
     The richer :func:`pipeline_promote_records` is invoked separately for
-    the ``ProcessMemoryCard`` runtime store under ``${REX_RUNTIME_DIR}/v2``.
+    the ``ProcessMemoryCard`` runtime store. By default, both v1 and v2 cards
+    are written to ``${REX_RUNTIME_DIR}``; the ``v2/`` subdirectory is only
+    used if an explicit ``--runtime-dir`` override is passed to the runner.
     """
     if not _should_promote(ns):
         return {"status": "skipped", "reason": f"task_split={ns.task_split}"}

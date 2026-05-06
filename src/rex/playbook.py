@@ -93,10 +93,11 @@ def synthesize_playbook(
 
       * Sections appear in fixed order (``_SECTION_TITLES``) so the prompt
         is stable across runs.
-      * Each section is independently capped to
-        ``config.playbook_section_chars``.
-      * The whole playbook is capped to ``config.playbook_max_chars`` and
-        ``config.playbook_max_lines``.
+      * Each section is trimmed to approximately
+        ``config.playbook_section_chars`` before assembly (soft per-section limit).
+      * The final playbook is hard-capped to ``config.playbook_max_chars`` and
+        ``config.playbook_max_lines``; sections are added sequentially until
+        budget is exhausted, then assembly stops.
     """
     cfg = config or default_config()
     if not cards:
