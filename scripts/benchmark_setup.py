@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Clone and lightly install benchmark dependencies for CARGO smoke tests.
+"""Clone and lightly install benchmark dependencies for REx smoke tests.
 
 This is a Python helper rather than another shell script because the project
 intentionally keeps exactly two shell scripts: ``setup_env.sh`` and
 ``run_project.sh``.
 
 ACEBench pins a few runtime packages to versions that conflict with the
-current CARGO/tau-bench LiteLLM stack.  The default helper intentionally keeps
+current REx/tau-bench LiteLLM stack.  The default helper intentionally keeps
 those project-owned packages installed and skips only the incompatible pins;
 use a separate virtualenv for an exact upstream ACEBench environment.
 """

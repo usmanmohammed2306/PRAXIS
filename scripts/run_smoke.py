@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the smallest honest CARGO smoke checks available in this environment."""
+"""Run the smallest honest REx-RPE smoke checks available in this environment."""
 from __future__ import annotations
 
 import argparse
@@ -46,8 +46,7 @@ def synthetic_smoke() -> Dict[str, Any]:
         sys.executable,
         "-m",
         "unittest",
-        "tests.test_cargo.TestCargoV2Adapters",
-        "tests.test_cargo.TestRunCargoIntegration",
+        "tests.test_rex",
         "-v",
     ]
     out = run(cmd)
@@ -63,8 +62,8 @@ def tau_smoke() -> Dict[str, Any]:
             "status": "blocked",
             "reason": "no OPENAI_API_KEY or OPENAI_BASE_URL; live tau-bench needs a model endpoint and user simulator provider",
             "rerun": [
-                "OPENAI_BASE_URL=http://localhost:8001/v1 OPENAI_API_KEY=dummy python3 -m src.runners.tau_runner --env retail --agent cargo --model qwen-agent --user-model gpt-4o --output-dir outputs/smoke/tau_retail --end-index 1 --num-trials 1 --max-concurrency 1 --max-num-steps 5",
-                "OPENAI_BASE_URL=http://localhost:8001/v1 OPENAI_API_KEY=dummy python3 -m src.runners.tau_runner --env airline --agent cargo --model qwen-agent --user-model gpt-4o --output-dir outputs/smoke/tau_airline --end-index 1 --num-trials 1 --max-concurrency 1 --max-num-steps 5",
+                "OPENAI_BASE_URL=http://localhost:8001/v1 OPENAI_API_KEY=dummy python3 -m src.runners.tau_runner --env retail --agent rex --model qwen-agent --user-model gpt-4o --output-dir outputs/smoke/tau_retail --end-index 1 --num-trials 1 --max-concurrency 1 --max-num-steps 5",
+                "OPENAI_BASE_URL=http://localhost:8001/v1 OPENAI_API_KEY=dummy python3 -m src.runners.tau_runner --env airline --agent rex --model qwen-agent --user-model gpt-4o --output-dir outputs/smoke/tau_airline --end-index 1 --num-trials 1 --max-concurrency 1 --max-num-steps 5",
             ],
         }
     results: Dict[str, Any] = {}
@@ -72,7 +71,7 @@ def tau_smoke() -> Dict[str, Any]:
         cmd = [
             sys.executable, "-m", "src.runners.tau_runner",
             "--env", env,
-            "--agent", "cargo",
+            "--agent", "rex",
             "--model", os.environ.get("SMOKE_MODEL", "qwen-agent"),
             "--user-model", os.environ.get("SMOKE_USER_MODEL", "gpt-4o"),
             "--model-provider", os.environ.get("SMOKE_MODEL_PROVIDER", "openai"),
@@ -107,11 +106,11 @@ def ace_smoke() -> Dict[str, Any]:
         return {
             "status": "blocked",
             "reason": "no OPENAI_API_KEY or OPENAI_BASE_URL; ACEBench inference needs a model endpoint",
-            "rerun": "OPENAI_BASE_URL=http://localhost:8001/v1 OPENAI_API_KEY=dummy python3 -m src.runners.ace_runner --agent cargo --model qwen-agent --limit 1 --max-concurrency 1 --max-num-steps 5 --output-dir outputs/smoke/ace_agent",
+            "rerun": "OPENAI_BASE_URL=http://localhost:8001/v1 OPENAI_API_KEY=dummy python3 -m src.runners.ace_runner --agent rex --model qwen-agent --limit 1 --max-concurrency 1 --max-num-steps 5 --output-dir outputs/smoke/ace_agent",
         }
     cmd = [
         sys.executable, "-m", "src.runners.ace_runner",
-        "--agent", "cargo",
+        "--agent", "rex",
         "--model", os.environ.get("SMOKE_MODEL", "qwen-agent"),
         "--limit", "1",
         "--max-concurrency", "1",

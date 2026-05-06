@@ -7,17 +7,14 @@
 # + cu130 torch stack + vLLM 0.18.0 from source), serves a single local vLLM
 # instance, and runs 12 evaluations:
 #
-#   4 controllers (vanilla tool-calling, Act, ReAct, CARGO)
+#   4 controllers (vanilla tool-calling, Act, ReAct, REx-RPE)
 #   x 3 benchmarks (tau-retail, tau-airline, ACEBench Agent)
 #
 # All four controllers share the same in-process loop, model, temperature,
 # tool schemas, max steps, and truncation budget — so the only varying axis
-# is the controller (and, for CARGO only, the calibrated risk-typed gate
-# stack: a JSON-emitting proposer declares a risk class + pre/post-conditions
-# for each step; deterministic gates check argument grounding and pre-conditions,
-# and a calibrated self-consistency vote (+ counterfactual rollout for
-# IRREVERSIBLE / FINAL) decides whether to commit, retry with a critique,
-# ask the user, or finalize. Mutations execute only after every gate passes).
+# is the controller. REx-RPE keeps native function-calling but adds audited
+# procedural experience retrieval, one brief startup analysis, and write-only
+# SABER-style mutation reflection.
 # Produces outputs/summary/{summary.json,summary.md}.
 #
 # The venv created by setup_env.sh must already exist.
@@ -35,8 +32,8 @@
 #   bash run_project.sh --profile medium      # 30 tasks × 3 trials (~3–6 h)  [default]
 #   bash run_project.sh --profile full        # 50 tasks × 4 trials (~8–14 h, full 15h budget)
 #   bash run_project.sh --tau-tasks 20 --tau-trials 2 --ace-limit 10
-#   bash run_project.sh --controllers baseline,react,cargo --skip-acebench
-#   bash run_project.sh --tau-only retail --controllers cargo
+#   bash run_project.sh --controllers baseline,react,rex --skip-acebench
+#   bash run_project.sh --tau-only retail --controllers rex
 #   bash run_project.sh --dry-run             # print resolved config and exit
 #
 # Run `bash run_project.sh --help` for the full flag reference. Every CLI
@@ -97,8 +94,8 @@ Workload:
   --ace-max-steps N      Cap ACEBench steps per trajectory.   Env: ACE_MAX_STEPS=N
 
 Controller filter:
-  --controllers LIST     Comma-separated subset of {baseline,act,react,cargo}.
-                         Default: baseline,act,react,cargo. Env: CONTROLLERS=...
+  --controllers LIST     Comma-separated subset of {baseline,act,react,rex}.
+                         Default: baseline,act,react,rex. Env: CONTROLLERS=...
   --skip-acebench        Skip ACEBench cells; run only τ-bench retail+airline.
                          Env: SKIP_ACEBENCH=1
   --tau-only ENV         Run only one τ-bench env (retail|airline). Env: TAU_ONLY=...
@@ -131,7 +128,7 @@ GPUS_OPT="${GPUS:-}"
 MODEL_TIER="${MODEL_TIER:-auto}"
 TP_OPT="${TENSOR_PARALLEL_SIZE:-}"
 PROFILE="${PROFILE:-medium}"
-CONTROLLERS_OPT="${CONTROLLERS:-baseline,act,react,cargo}"
+CONTROLLERS_OPT="${CONTROLLERS:-baseline,act,react,rex}"
 SKIP_ACEBENCH="${SKIP_ACEBENCH:-0}"
 TAU_ONLY="${TAU_ONLY:-}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -220,11 +217,9 @@ fi
 # Why 14B over 7B on a single 80 GB A100/H100?
 #   • 14B BF16 weights ≈ 28 GB + KV cache at max_model_len=32768 ≈ 24 GB → ~52 GB total
 #     (concurrency=4 × 32K tokens, paged pool). Fits in 80 GB at 0.85 mem util.
-#   • The CARGO proposer must output valid structured JSON reliably. 14B has
-#     measurably better instruction-following and JSON compliance than 7B —
-#     fewer json_parse_failures, more consistent declared_class / declared_pre.
-#   • Self-consistency gate (k=3): quality of the 3 samples matters. 14B produces
-#     more meaningful votes, making the SC gate a better signal.
+#   • REx-RPE relies on native function-calling plus short reflection. 14B has
+#     measurably better tool argument reliability than 7B while still fitting
+#     a one-GPU evaluation budget.
 #   • Speed cost: ~1.8–2.0× slower than 7B per call, still fits medium profile
 #     in ~5–9 h on a single 80 GB GPU.
 #
@@ -314,7 +309,7 @@ PRIMARY_MEM_UTIL="${GPU_MEM_UTIL_OPT:-${GPU_MEM_UTIL:-$TIER_DEFAULT_MEM_UTIL}}"
 # Validate --controllers / --tau-only up-front so typos fail fast (also
 # during --dry-run).
 # ---------------------------------------------------------------------------
-ALLOWED_CONTROLLERS=("baseline" "act" "react" "cargo")
+ALLOWED_CONTROLLERS=("baseline" "act" "react" "rex")
 IFS=',' read -r -a REQUESTED_CONTROLLERS <<<"$CONTROLLERS_OPT"
 for c in "${REQUESTED_CONTROLLERS[@]}"; do
   c="$(echo "$c" | tr -d '[:space:]')"
@@ -789,6 +784,15 @@ log "Using $ACTIVE_MODEL (impl=$ACTIVE_IMPL max_len=$ACTIVE_MAX_LEN) for ALL con
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 export OPENAI_BASE_URL="http://127.0.0.1:${PORT}/v1"
 export OPENAI_API_BASE="$OPENAI_BASE_URL"
+
+# Build the REx procedural-memory bank from allowed support data only. This is
+# fast, deterministic, and explicitly avoids prior eval trajectories.
+export REX_EXPERIENCE_DIR="${REX_EXPERIENCE_DIR:-${OUTPUTS_DIR}/experience_bank}"
+if [[ "$CONTROLLERS_OPT" == *"rex"* ]]; then
+  log "Building REx experience bank: $REX_EXPERIENCE_DIR"
+  python -m src.rex.experience --output-dir "$REX_EXPERIENCE_DIR" \
+    || log "WARNING: REx experience bank build failed; controller will fall back to built-in policy cards"
+fi
 
 # ---------------------------------------------------------------------------
 # Runners
