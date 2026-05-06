@@ -1,8 +1,19 @@
 """Tau-bench REx-RPE agent.
 
-REx intentionally uses the native OpenAI-compatible tool-calling surface. The
-experience layer is prompt-only procedural memory; it never supplies concrete
-task answers.
+Continual procedural-memory tool-calling agent. The agent:
+
+  1. **Retrieves** relevant procedural cards from the merged seed+runtime
+     memory bank using the hybrid lexical+embedding :class:`HybridRetriever`.
+  2. **Synthesizes** a compact :class:`TacticalPlaybook` and injects it
+     into the system prompt at every refresh point.
+  3. **Executes** native OpenAI-style tool calls.
+  4. **Reflects** before mutating tools (write-only SABER-style guard).
+  5. **Refreshes** retrieval at every ``REX_RETRIEVAL_REFRESH_EVERY``
+     effective steps so the playbook evolves with the trajectory state.
+  6. **Logs** retrieval diagnostics to ``$REX_RETRIEVAL_LOG_DIR`` for
+     post-run summary aggregation.
+
+All cards are leakage-audited; nothing in the prompt contains raw IDs.
 """
 from __future__ import annotations
 
@@ -32,7 +43,19 @@ except Exception:  # pragma: no cover - exercised in minimal test envs
             self.total_cost = total_cost
 
 from ..common.openai_client import get_client
-from .experience import ExperienceRetriever, load_experience_cards, redact_text, render_experience_brief
+from .config import RexConfig
+from .experience import (
+    ExperienceRetriever,
+    load_experience_cards,
+    redact_text,
+    render_experience_brief,
+)
+from .memory_types import from_experience_card
+from .pipeline import refresh_playbook
+from .playbook import synthesize_playbook
+from .retrieval import HybridRetriever, build_query
+from .retrieval_logging import RetrievalLogger
+from .working_state import working_state_for_messages
 
 
 RESPOND_TOOL_NAME = "respond"
@@ -144,7 +167,14 @@ def _tool_names(tools: Sequence[Dict[str, Any]]) -> List[str]:
 
 
 class RexAgent(Agent):  # type: ignore[misc]
-    """Native tool-calling agent with leakage-safe procedural retrieval."""
+    """Native tool-calling agent with continual procedural-memory retrieval.
+
+    The agent keeps the legacy :class:`ExperienceRetriever` corpus accessible
+    via ``self.cards`` / ``self.retriever`` for backward-compatible surface
+    area, but delegates retrieval at runtime to a :class:`HybridRetriever`
+    that combines BM25 with deterministic embeddings and uses the
+    ``WorkingState`` to evolve queries with the trajectory.
+    """
 
     style_name = "rex"
 
@@ -159,6 +189,8 @@ class RexAgent(Agent):  # type: ignore[misc]
         client: Any = None,
         bank_dir: Optional[Path] = None,
         runtime_dir: Optional[Path] = None,
+        config: Optional[RexConfig] = None,
+        retrieval_logger: Optional[RetrievalLogger] = None,
     ) -> None:
         self.tools_info = tools_info or []
         self.wiki = wiki or ""
@@ -169,18 +201,44 @@ class RexAgent(Agent):  # type: ignore[misc]
         self.client = client or get_client()
         default_bank = Path(os.environ.get("REX_EXPERIENCE_DIR", str(Path.cwd() / "outputs" / "experience_bank")))
         self.bank_dir = bank_dir or default_bank
-        # Runtime memory dir: auto-resolves to ${REX_RUNTIME_DIR} env or default.
         self.runtime_dir = runtime_dir
+        # Resolve config last so explicit args win.
+        cfg_overrides: Dict[str, Any] = {"bank_dir": Path(self.bank_dir)}
+        if self.runtime_dir is not None:
+            cfg_overrides["runtime_dir"] = Path(self.runtime_dir)
+        self.config = (config or RexConfig.from_env()).with_overrides(**cfg_overrides)
+
+        # ------------------------------------------------------------------
+        # Legacy corpus (kept for backwards-compatible diagnostics + tests).
+        # ------------------------------------------------------------------
         self.cards = load_experience_cards(
             self._experience_domain(), self.bank_dir, runtime_dir=self.runtime_dir,
         )
         self.retriever = ExperienceRetriever(self.cards)
-        self.enable_startup_analysis = os.environ.get("REX_STARTUP_ANALYSIS", "1") != "0"
-        self.enable_reflection = os.environ.get("REX_MUTATION_REFLECTION", "1") != "0"
-        # Stateful re-retrieval: refresh the playbook every N effective steps.
-        # 0 disables (only the initial brief is used).
-        self.retrieval_refresh_every = int(os.environ.get("REX_RETRIEVAL_REFRESH_EVERY", "2") or 0)
 
+        # ------------------------------------------------------------------
+        # Hybrid pipeline corpus — same cards, lifted to ProcessMemoryCard.
+        # We avoid re-reading from disk so behavior matches the legacy path.
+        # ------------------------------------------------------------------
+        process_cards = [from_experience_card(c) for c in self.cards]
+        self.process_cards = process_cards
+        try:
+            self.hybrid_retriever: Optional[HybridRetriever] = HybridRetriever(
+                process_cards, config=self.config,
+            )
+        except Exception:
+            # If embedding setup fails for any reason, fall back to legacy retrieval.
+            self.hybrid_retriever = None
+
+        self.retrieval_logger = retrieval_logger or RetrievalLogger(config=self.config)
+        self.enable_startup_analysis = bool(self.config.startup_analysis)
+        self.enable_reflection = bool(self.config.mutation_reflection)
+        # Stateful re-retrieval cadence; 0 disables (only initial brief is used).
+        self.retrieval_refresh_every = int(self.config.retrieval_refresh_every or 0)
+
+    # ------------------------------------------------------------------
+    # Domain helpers
+    # ------------------------------------------------------------------
     def _infer_domain(self) -> str:
         names = set(_tool_names(self.tools_info))
         if "get_order_details" in names or "exchange_delivered_order_items" in names:
@@ -201,6 +259,9 @@ class RexAgent(Agent):  # type: ignore[misc]
             return MUTATING_TOOLS_AIRLINE
         return set()
 
+    # ------------------------------------------------------------------
+    # Prompt construction
+    # ------------------------------------------------------------------
     def _system_prompt(self, brief: str, startup_analysis: str = "") -> str:
         parts = [
             "You are REx-RPE, a confident customer-service tool agent.",
@@ -216,11 +277,49 @@ class RexAgent(Agent):  # type: ignore[misc]
             parts.append("\n--- Domain Policy ---\n" + self.wiki)
         return "\n".join(parts)
 
+    def _initial_brief(self, initial_user: str) -> tuple[str, List[str]]:
+        """Build the first experience brief at trajectory start."""
+        if self.hybrid_retriever and self.hybrid_retriever.num_cards:
+            query = build_query(
+                initial_user=initial_user,
+                messages=[],
+                environment=self._experience_domain(),
+                benchmark=self._benchmark_label(),
+                controller="rex",
+                step_index=0,
+                top_k=self.config.top_k,
+            )
+            result = self.hybrid_retriever.search(query)
+            playbook = synthesize_playbook(result.cards, config=self.config)
+            self.retrieval_logger.log(
+                benchmark=self._benchmark_label(),
+                environment=self._experience_domain(),
+                controller="rex",
+                task_id="initial",
+                trial=0,
+                step_index=0,
+                query=query,
+                result=result,
+                playbook=playbook,
+            )
+            return playbook.body, result.card_ids()
+        # Legacy fallback
+        selected = self.retriever.search(initial_user, k=3)
+        return render_experience_brief(selected), [c.card_id for c in selected]
+
+    def _benchmark_label(self) -> str:
+        if self.env_hint in {"retail", "airline"}:
+            return "tau-bench"
+        if self.env_hint == "ace":
+            return "ACEBench"
+        return "unknown"
+
     def _startup_analysis(self, initial_user: str, brief: str) -> str:
         if not self.enable_startup_analysis:
             return ""
+        max_words = max(40, int(self.config.startup_analysis_max_words))
         prompt = (
-            "Return a concise plan in <=120 words. Do not call tools.\n"
+            f"Return a concise plan in <={max_words} words. Do not call tools.\n"
             "Fields: intent, first_tool, evidence_needed, write_risk.\n"
             "Use retrieved examples as process only and never copy example IDs.\n\n"
             f"Experience brief:\n{brief}\n\nUser request:\n{redact_text(initial_user)}"
@@ -237,6 +336,9 @@ class RexAgent(Agent):  # type: ignore[misc]
         except Exception:
             return ""
 
+    # ------------------------------------------------------------------
+    # Mutation reflection
+    # ------------------------------------------------------------------
     def _reflection_prompt(self, tool_name: str, args: Dict[str, Any], messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         recent = messages[-10:]
         compact = []
@@ -299,19 +401,20 @@ class RexAgent(Agent):  # type: ignore[misc]
         )
         return False, question[:RESPOND_MAX_CHARS]
 
+    # ------------------------------------------------------------------
+    # Stateful retrieval helpers (legacy + new)
+    # ------------------------------------------------------------------
     def _retrieval_query(
         self,
         initial_user: str,
         messages: List[Dict[str, Any]],
     ) -> str:
-        """Build a stateful retrieval query.
+        """Build a stateful retrieval *string* (legacy compat for tests).
 
-        The query evolves with the trajectory: it includes the initial user
-        request, the latest user reply, the most recent tool name, and a
-        truncated snippet of its observation. This is the architectural
-        change that turns retrieval from a one-shot thing into a stateful
-        process: cards retrieved at step 5 reflect what we've already
-        learned, not what the user said at step 0.
+        The hybrid pipeline uses :func:`build_query` to construct a
+        :class:`RetrievalQuery` directly, but tests rely on this string
+        surface. The two stay aligned: the string here is what would be
+        passed as the ``text`` field of the structured query.
         """
         parts: List[str] = [initial_user or ""]
         last_user = ""
@@ -336,8 +439,33 @@ class RexAgent(Agent):  # type: ignore[misc]
         self,
         initial_user: str,
         messages: List[Dict[str, Any]],
+        *,
+        step_index: int = 0,
+        task_id: Any = "",
+        trial: int = 0,
     ) -> tuple[str, List[Any]]:
-        """Re-run retrieval with the current trajectory state and return the brief."""
+        """Re-run retrieval with current state and return ``(brief, card_objs)``.
+
+        Uses the hybrid retriever when available; falls back to the legacy
+        BM25-style retriever otherwise (kept for environments where embedding
+        backends fail).
+        """
+        if self.hybrid_retriever and self.hybrid_retriever.num_cards:
+            playbook, result, _state = refresh_playbook(
+                retriever=self.hybrid_retriever,
+                initial_user=initial_user,
+                messages=messages,
+                environment=self._experience_domain(),
+                benchmark=self._benchmark_label(),
+                controller="rex",
+                step_index=step_index,
+                config=self.config,
+                logger=self.retrieval_logger,
+                task_id=task_id,
+                trial=trial,
+            )
+            return playbook.body, result.cards
+        # Legacy fallback
         query = self._retrieval_query(initial_user, messages)
         selected = self.retriever.search(query, k=3)
         return render_experience_brief(selected), selected
@@ -348,7 +476,6 @@ class RexAgent(Agent):  # type: ignore[misc]
         new_brief: str,
         startup_analysis: str,
     ) -> None:
-        """Mutate ``messages`` in place to replace the system prompt with a fresh brief."""
         if not messages:
             return
         if messages[0].get("role") != "system":
@@ -358,13 +485,14 @@ class RexAgent(Agent):  # type: ignore[misc]
     def _trim_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if len(messages) <= 16:
             return messages
-        # Keep system prompt plus the recent task evidence. This is the context
-        # cleaner that avoids old CARGO-style stale fixed points.
         tail = list(messages[-14:])
         while tail and tail[0].get("role") == "tool":
             tail.pop(0)
         return [messages[0]] + tail
 
+    # ------------------------------------------------------------------
+    # Solve loop
+    # ------------------------------------------------------------------
     def solve(
         self,
         env,
@@ -373,15 +501,14 @@ class RexAgent(Agent):  # type: ignore[misc]
     ) -> SolveResult:
         env_reset = env.reset(task_index=task_index)
         initial_user = _extract_initial_user_message(env_reset)
-        selected = self.retriever.search(initial_user, k=3)
-        brief = render_experience_brief(selected)
+        brief, initial_card_ids = self._initial_brief(initial_user)
         startup = self._startup_analysis(initial_user, brief)
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": self._system_prompt(brief, startup)}]
         if initial_user:
             messages.append({"role": "user", "content": initial_user})
 
-        cards_used_ids: List[str] = [c.card_id for c in selected]
+        cards_used_ids: List[str] = list(initial_card_ids)
         stats: Dict[str, Any] = {
             "controller": "rex",
             "cards_loaded": len(self.cards),
@@ -393,6 +520,8 @@ class RexAgent(Agent):  # type: ignore[misc]
             "tool_calls_executed": 0,
             "mutating_tool_calls": 0,
             "retrieval_refreshes": 0,
+            "retrieval_backend": "hybrid" if self.hybrid_retriever else "legacy",
+            "playbook_chars": len(brief),
         }
         reward: float = 0.0
         info: Dict[str, Any] = {}
@@ -402,22 +531,25 @@ class RexAgent(Agent):  # type: ignore[misc]
 
         effective_steps = 0
         for _ in range(max_num_steps):
-            # Stateful re-retrieval: every N effective steps, regenerate the
-            # experience brief from the current trajectory state. This is the
-            # core architectural change that turns retrieval from "look once"
-            # into "look as the conversation evolves."
             if (
                 self.retrieval_refresh_every
                 and effective_steps > 0
                 and effective_steps % self.retrieval_refresh_every == 0
             ):
-                new_brief, new_selected = self._refresh_brief(initial_user, messages)
+                new_brief, new_selected = self._refresh_brief(
+                    initial_user,
+                    messages,
+                    step_index=effective_steps,
+                    task_id=task_index if task_index is not None else "",
+                    trial=0,
+                )
                 self._replace_system_prompt(messages, new_brief, startup)
                 stats["retrieval_refreshes"] += 1
-                # Track distinct cards seen across refreshes for diagnostics.
+                stats["playbook_chars"] = len(new_brief)
                 for c in new_selected:
-                    if c.card_id not in cards_used_ids:
-                        cards_used_ids.append(c.card_id)
+                    cid = getattr(c, "card_id", "")
+                    if cid and cid not in cards_used_ids:
+                        cards_used_ids.append(cid)
                 stats["cards_used"] = cards_used_ids
 
             try:
@@ -516,6 +648,13 @@ class RexAgent(Agent):  # type: ignore[misc]
             effective_steps += 1
             if done:
                 break
+
+        # Final working-state summary added to diagnostics for post-run analysis.
+        try:
+            final_state = working_state_for_messages(messages, initial_user=initial_user)
+            stats["working_state"] = final_state.to_dict()
+        except Exception:
+            pass
 
         info = dict(info) if info else {}
         if step_error:

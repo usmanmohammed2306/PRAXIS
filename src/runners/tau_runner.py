@@ -32,7 +32,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
+from ..rex.config import RexConfig
 from ..rex.experience import promote_trajectories
+from ..rex.memory_quality import consolidate
+from ..rex.memory_store import MemoryStore
+from ..rex.pipeline import promote_records as pipeline_promote_records
+from ..rex.retrieval_logging import aggregate_logs
 
 
 AGENT_CHOICES = ["baseline", "act", "react", "rex"]
@@ -167,6 +172,22 @@ def _compute_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "error_tasks": info_errors,
     }
     if rex_n:
+        # Aggregate playbook & retrieval-backend telemetry from rex_stats.
+        playbook_chars: List[float] = []
+        backends: Dict[str, int] = {}
+        retrieval_refreshes_sum = 0
+        for r in records:
+            info = r.get("info") or {}
+            rs = info.get("rex_stats") if isinstance(info, dict) else None
+            if not isinstance(rs, dict):
+                continue
+            pc = rs.get("playbook_chars")
+            if isinstance(pc, (int, float)):
+                playbook_chars.append(float(pc))
+            backend = rs.get("retrieval_backend") or ""
+            if backend:
+                backends[backend] = backends.get(backend, 0) + 1
+            retrieval_refreshes_sum += int(rs.get("retrieval_refreshes") or 0)
         out["rex_diagnostics"] = {
             "trajectories_with_stats": rex_n,
             "reflection_calls": rex_reflections,
@@ -175,6 +196,9 @@ def _compute_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             "mutating_tool_calls": rex_mutations,
             "avg_cards_loaded": rex_cards_loaded / max(1, rex_n),
             "avg_cards_used": rex_cards_used / max(1, rex_n),
+            "avg_playbook_chars": (sum(playbook_chars) / len(playbook_chars)) if playbook_chars else 0.0,
+            "retrieval_backends": backends,
+            "total_retrieval_refreshes": retrieval_refreshes_sum,
         }
     return out
 
@@ -200,7 +224,13 @@ def _promote_records_to_runtime(
     ns: argparse.Namespace,
     records: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Distill ``records`` into the runtime memory bank for ``ns.env``."""
+    """Distill ``records`` into the runtime memory bank for ``ns.env``.
+
+    Uses the legacy ``promote_trajectories`` API (which writes
+    ``ExperienceCard``-shaped JSONL the existing seed bank also produces).
+    The richer :func:`pipeline_promote_records` is invoked separately for
+    the ``ProcessMemoryCard`` runtime store under ``${REX_RUNTIME_DIR}/v2``.
+    """
     if not _should_promote(ns):
         return {"status": "skipped", "reason": f"task_split={ns.task_split}"}
     runtime_dir = Path(ns.runtime_dir) if ns.runtime_dir else None
@@ -212,6 +242,32 @@ def _promote_records_to_runtime(
             allow_test_split=ns.promote_runtime_memory == "always",
         )
         manifest["status"] = "ok"
+        # Also run the v2 pipeline (ProcessMemoryCard schema) for richer
+        # diagnostics + memory consolidation. Failure here is non-fatal:
+        # the legacy bank still survives and existing tests still pass.
+        try:
+            v2_runtime = (runtime_dir / "v2") if runtime_dir else None
+            v2_manifest = pipeline_promote_records(
+                records,
+                domain=ns.env,
+                runtime_dir=v2_runtime,
+                allow_test_split=ns.promote_runtime_memory == "always",
+            )
+            manifest["v2"] = v2_manifest
+        except Exception as exc:  # noqa: BLE001
+            manifest["v2_error"] = f"{exc.__class__.__name__}: {exc}"
+        # Memory consolidation pass — runs detect_duplicates, contradictions,
+        # decay over the v2 store.
+        try:
+            cfg = RexConfig.from_env()
+            v2_runtime_dir = (runtime_dir / "v2") if runtime_dir else cfg.runtime_dir
+            store = MemoryStore(seed_dir=cfg.bank_dir, runtime_dir=v2_runtime_dir, config=cfg)
+            cards = store.load_runtime(ns.env)
+            if cards:
+                report = consolidate(cards, config=cfg)
+                manifest["consolidation"] = report.to_dict()
+        except Exception as exc:  # noqa: BLE001
+            manifest["consolidation_error"] = f"{exc.__class__.__name__}: {exc}"
         return manifest
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
@@ -340,6 +396,14 @@ def main() -> int:
     # always is set.
     promotion = _promote_records_to_runtime(ns, records)
 
+    # Aggregate retrieval logs (best-effort).
+    retrieval_logs_summary: Dict[str, Any] = {}
+    try:
+        cfg = RexConfig.from_env()
+        retrieval_logs_summary = aggregate_logs(cfg.retrieval_log_dir)
+    except Exception as exc:  # noqa: BLE001
+        retrieval_logs_summary = {"error": f"{exc.__class__.__name__}: {exc}"}
+
     summary = {
         "benchmark": "tau-bench",
         "env": ns.env,
@@ -358,6 +422,7 @@ def main() -> int:
         },
         "metrics": metrics,
         "runtime_memory_promotion": promotion,
+        "retrieval_logs": retrieval_logs_summary,
     }
     write_json(os.path.join(ns.output_dir, "metrics.json"), summary)
     print(json.dumps(summary["metrics"], indent=2))
