@@ -63,10 +63,20 @@ SYSTEM_PROMPT = (
     "- thought: one sentence maximum.\n"
     "- informational_intent: ≤10 words.\n"
     "\n"
+    "CARGO-N predictive-coding discipline:\n"
+    "- Read the KNOWN FACTS, OPEN OBLIGATIONS, CURRENT PHASE, CURRENT GRADIENT,\n"
+    "  and LAST CRITIQUE sections first.\n"
+    "- Your action must address the CURRENT GRADIENT. Do not ask for known\n"
+    "  facts; use locked/tool facts directly.\n"
+    "- Set gradient_id to the CURRENT GRADIENT label you are addressing.\n"
+    "- Set thought_uses_known_facts=true when your thought cites a known fact.\n"
+    "\n"
     "Output STRICT JSON only — no markdown, no commentary outside the JSON.\n"
     "Schema:\n"
     "{\n"
     "  \"thought\": str,\n"
+    "  \"gradient_id\": str,\n"
+    "  \"thought_uses_known_facts\": bool,\n"
     "  \"action\": {\n"
     "    \"name\": str,\n"
     "    \"args\": object,\n"
@@ -99,6 +109,7 @@ def render_proposer_user_message(
     *,
     wm: WorkingMemory,
     tools_block: str,
+    belief_view: str = "",
     history_tail: str = "",
     critique: str = "",
     domain_policy: str = "",
@@ -108,6 +119,8 @@ def render_proposer_user_message(
     if domain_policy:
         parts.append("--- Domain policy ---\n" + domain_policy.strip())
     parts.append(tools_block)
+    if belief_view:
+        parts.append("--- CARGO-N belief view ---\n" + belief_view.strip())
     parts.append("--- Working memory ---\n" + wm.render_compact())
     if history_tail:
         parts.append("--- Recent turns ---\n" + history_tail.strip())
@@ -166,6 +179,8 @@ def parse_proposer_response(
     if not obj:
         return None
     thought = str(obj.get("thought", ""))[:600]
+    gradient_id = str(obj.get("gradient_id") or obj.get("gradient") or "")[:120]
+    thought_uses_known_facts = bool(obj.get("thought_uses_known_facts", False))
     raw_action = obj.get("action")
     if not isinstance(raw_action, dict) or not raw_action:
         # Permit a flat schema where the action lives at the top level.
@@ -228,6 +243,8 @@ def parse_proposer_response(
         raw_thought=thought,
         user_text=user_text,
         raw_response=text[:4000],
+        gradient_id=gradient_id or str(raw_action.get("gradient_id") or raw_action.get("gradient") or "")[:120],
+        thought_uses_known_facts=thought_uses_known_facts or bool(raw_action.get("thought_uses_known_facts", False)),
     )
 
 

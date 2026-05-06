@@ -107,11 +107,13 @@ Machine-readable companion: `docs/known_issues.json`.
   boundary and a deterministic pre-commit verifier for WRITE/IRREVERSIBLE
   actions.  Commit certificates remain final safety guards rather than a
   planner.
-- CARGO-N-lite adds a compact typed belief snapshot, deterministic progress
-  gradients, critique injection, and short friction blacklists on top of the
-  existing router.  This makes repeated non-progress change the next prompt
-  and candidate score without adding tree search, a judge model, fine-tuning,
-  or benchmark-specific planning in the core.
+- CARGO-N adds a compact typed belief snapshot, deterministic progress
+  gradients, a free-energy-style prediction-error residual, critique
+  injection, and short friction blacklists on top of the existing router.  The
+  belief view is rendered into the proposer prompt, the proposer can emit
+  `gradient_id` / `thought_uses_known_facts`, and a conservative
+  `gradient_match` gate sends clear ask-loop or terminal-drift residuals back
+  into the critique/friction path without replacing the existing write guards.
 - Airline new-booking progression now records nested one-stop itinerary
   candidate sets and can assemble a grounded booking action from profile,
   search, baggage, insurance, and payment evidence after exact user
@@ -182,6 +184,7 @@ Machine-readable companion: `docs/known_issues.json`.
 | 400-trajectory failure clusters still under-tested | A broader pass over metrics/trajectories (56)/(57) found 2218 retail repeat-loop gate failures, 3045 airline repeat-loop failures, 117 airline trajectories with repeated profile proposals, malformed `get_reservation_details(user_id=...)`, ambiguous Texas/Newark search drift, generic asks after grounded booking evidence, pseudo cost writes, and retail placeholder-auth loops | The previous corpus tests covered headline examples but not recurring clusters that could return as soon as model wording changes | Added cluster-level tests and fixes: cached airline profiles route to search, booking reservation scans route to flight search, malformed reservation lookups scan profile IDs, ambiguous-region searches scan reservations first, generic/calculate asks recenter to grounded booking summaries, direct preference survives one-stop allowance, semantic `none` is not over-blocked by pre-commit, nested ID placeholders are blocked, and retail placeholder/generic auth proposals use known credentials | `test_v2_corpus_cached_airline_profile_routes_to_search_not_refetch`, `test_v2_corpus_booking_reservation_scan_routes_to_flight_search`, `test_v2_corpus_calculate_cost_routes_to_grounded_booking_summary`, `test_v2_corpus_generic_ask_after_booking_evidence_uses_summary`, `test_v2_corpus_direct_viable_beats_onestop_when_direct_preferred`, `test_v2_corpus_malformed_reservation_lookup_scans_profile_ids`, `test_v2_corpus_ambiguous_region_search_scans_reservations_first`, `test_v2_corpus_retail_placeholder_email_with_name_zip_uses_name_zip`, `test_v2_corpus_retail_generic_ask_with_credentials_authenticates`, `test_v2_corpus_retail_cached_profile_fetches_order_not_profile_loop`, `test_v2_corpus_precommit_blocks_nested_id_none_but_allows_semantic_none`, `test_v2_corpus_precommit_blocks_nested_latest_placeholder`, `test_v2_corpus_goal_field_downweights_repeated_profile_against_search` | Fixed, verified |
 | Latest 800 tau trajectories needed broad difficult/diverse regressions | metrics/trajectories (56)/(57)/(59)/(60) contain 800 tau runs with improved but still brittle success: retail `0.065`, airline `0.23`, thousands of abstains, generic asks after known facts, cached profile re-fetch, reservation drift, search exhaustion, and retail mixed-goal/auth recovery failures | Handwritten corpus tests covered selected examples but not enough diversity to catch the same failure shape under different task wording | Added a generated 400-case unittest-visible fixture: 220 airline, 160 retail, 20 core. The cases encode behavioral invariants, not answer leakage, and exercise the belief-gradient/friction router plus adapter-owned recovery checks | `tests.test_cargo_corpus.CargoNCorpusRegressionTests` | Fixed, verified |
 | Critiques did not alter the next progress target strongly enough | Repeated gate failures could still leave the same generic ask/profile/search signature competitive in the router | The goal field tracked friction, but there was no compact belief-gradient object or short blacklist to make repeated failures change the next prompt/candidate score deterministically | Added `BeliefSnapshot`, `GradientDirective`, `PredictiveGradientScheduler`, critique residual rendering, and friction blacklisting after repeated failures | `test_cn_386_core_belief_compactness`, `test_cn_391_core_friction_gradient`, existing soft goal-field tests | Fixed, verified |
+| Proposer prompt and gates did not fully consume the CARGO-N gradient | The first CARGO-N pass projected belief state but the proposer still mostly saw the old working-memory prompt, and failed actions did not always prove they ignored the current progress target | The belief scheduler was diagnostic/candidate-facing rather than a closed proposer/verifier residual loop | Render the belief view before working memory, parse `gradient_id` and `thought_uses_known_facts`, compute domain prediction-error weights, and run a conservative `gradient_match` gate after state validity | `test_cargo_n_fields_parse_from_top_level_and_action`, `test_cargo_n_fields_parse_from_flat_action_shape`, `test_belief_prompt_view_renders_locked_facts_gradient_and_critique`, `test_scheduler_uses_domain_weights_and_nonzero_prediction_error`, `test_gradient_match_blocks_generic_ask_when_goal_frame_is_known`, `test_gradient_match_is_run_inside_gate_stack`, `test_proposer_user_message_includes_belief_view_before_working_memory` | Fixed, verified |
 
 ## Remaining Limitations
 
@@ -202,9 +205,9 @@ Machine-readable companion: `docs/known_issues.json`.
 
 ## Verification
 
-- `python3 -m unittest tests.test_cargo -q`: 308 local regression tests passed.
+- `python3 -m unittest tests.test_cargo -q`: 316 local regression tests passed.
 - `python3 -m unittest tests.test_cargo_corpus -q`: 400 generated corpus regression tests passed.
-- `python3 -m unittest tests.test_cargo tests.test_cargo_corpus -q`: 708 offline regression tests passed.
+- `python3 -m unittest tests.test_cargo tests.test_cargo_corpus -q`: 716 offline regression tests passed.
 - `python3 -m compileall src tests scripts -q`: passed.
 - `bash run_project.sh --dry-run`: passed configuration resolution without
   launching a model server or benchmark run.
@@ -212,7 +215,7 @@ Machine-readable companion: `docs/known_issues.json`.
 - `git diff --check`: passed.
 - `python3 -m json.tool docs/known_issues.json`: passed.
 - Shell invariant check found exactly `./run_project.sh` and `./setup_env.sh`.
-- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_cargo_n_corpus.json`:
+- `python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_cargo_n_full.json`:
   synthetic checks passed; tau retail/airline and ACE live smoke are blocked
   unless `OPENAI_API_KEY` or `OPENAI_BASE_URL` is present.
-- `python3 scripts/parse_smoke_results.py --smoke-summary outputs/smoke/smoke_summary_cargo_n_corpus.json --json-out outputs/smoke/smoke_compact_cargo_n_corpus.json`: passed.
+- `python3 scripts/parse_smoke_results.py --smoke-summary outputs/smoke/smoke_summary_cargo_n_full.json --json-out outputs/smoke/smoke_compact_cargo_n_full.json`: passed.

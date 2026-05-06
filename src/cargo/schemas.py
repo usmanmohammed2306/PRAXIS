@@ -53,6 +53,12 @@ class ProposedAction:
     user_text: str = ""
     # Convenience: the raw JSON or text that produced this action.
     raw_response: str = ""
+    # CARGO-N: optional scheduler target the proposer claims to address.
+    # Older prompts do not emit it, so gates treat an empty value as unknown.
+    gradient_id: str = ""
+    # CARGO-N prompt discipline: useful for diagnostics and future constrained
+    # decoding, but not trusted as a hard safety signal.
+    thought_uses_known_facts: bool = False
     # When True, the self-consistency and counterfactual gates are skipped.
     # Set by deterministic overrides (auth-abandon FINALs, product-count
     # finalisers, etc.) so that the SC gate's independent proposer samples

@@ -343,11 +343,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
         critique: str,
     ) -> List[Dict[str, Any]]:
         tools_block = render_tools_block(self.schemas)
+        snapshot = self._kernel().decision_engine.gradient_scheduler.snapshot(wm, self.adapter)
+        belief_view = snapshot.render_prompt_view(max_chars=1600)
         # n_turns=8 messages ≈ 2-3 complete steps; compression keeps it ≤300 tokens.
         history_tail = trim_history(history, n_turns=8, max_chars=800)
         user_msg = render_proposer_user_message(
             wm=wm,
             tools_block=tools_block,
+            belief_view=belief_view,
             history_tail=history_tail,
             critique=critique,
             domain_policy="",  # already in the system prompt
@@ -406,6 +409,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 "informational_intent": action.informational_intent,
                 "user_text": action.user_text,
             },
+            "gradient_id": getattr(action, "gradient_id", ""),
+            "thought_uses_known_facts": bool(getattr(action, "thought_uses_known_facts", False)),
         })
 
     def _route_goal_field_action(
@@ -538,6 +543,22 @@ class CargoAgent(Agent):  # type: ignore[misc]
         if not state_gate.ok:
             diag["gates_failed"].append("state_validity")
             return state_gate, diag
+
+        # CARGO-N residual check: the proposer may still emit a locally valid
+        # action that ignores the scheduler's current progress target. Keep
+        # this conservative so useful READs remain permissive, but route clear
+        # ask-loop / terminal-drift / commit-drift errors into the same
+        # critique+friction feedback path as other gate failures.
+        gradient_gate = self._kernel().decision_engine.gradient_scheduler.validate_gradient_match(
+            action,
+            wm,
+            self.adapter,
+        )
+        diag["gates_run"].append("gradient_match")
+        stats.record_gate(gradient_gate)
+        if not gradient_gate.ok:
+            diag["gates_failed"].append("gradient_match")
+            return gradient_gate, diag
 
         if action.declared_class == RiskClass.FINAL:
             final_gate = self._check_final_completeness(action, wm)

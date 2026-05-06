@@ -7,6 +7,7 @@ domain and benchmark semantics live in ``src.cargo.adapters``.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Set, Tuple, TYPE_CHECKING
@@ -383,6 +384,7 @@ class GradientDirective:
     target: str = ""
     reason: str = ""
     score_delta: float = 0.0
+    description: str = ""
 
     def label(self) -> str:
         return f"{self.kind}:{self.target}" if self.target else self.kind
@@ -396,9 +398,16 @@ class BeliefSnapshot:
     stage: str = "start"
     slots: Dict[str, BeliefSlot] = field(default_factory=dict)
     obligations: List[BeliefObligation] = field(default_factory=list)
+    derived_facts: Dict[str, Any] = field(default_factory=dict)
+    open_candidates: List[str] = field(default_factory=list)
     phase: str = "DISCOVER"
+    phase_posterior: Dict[str, float] = field(default_factory=dict)
+    phase_entropy: float = 0.0
     last_critique: str = ""
     friction: Dict[str, float] = field(default_factory=dict)
+    weights: Dict[str, float] = field(default_factory=dict)
+    free_energy: float = 0.0
+    user_summary: List[str] = field(default_factory=list)
     gradient: GradientDirective = field(default_factory=lambda: GradientDirective(kind="ASK_USER"))
 
     def render_compact(self, max_chars: int = 700) -> str:
@@ -415,6 +424,7 @@ class BeliefSnapshot:
             f"phase={self.phase}",
             f"stage={self.stage}",
             f"gradient={self.gradient.label()}",
+            f"F={self.free_energy:.2f}",
             "known=" + ",".join(locked) if locked else "",
             "open=" + ",".join(sorted(set(open_slots))[:10]) if open_slots else "",
             f"critique={self.last_critique[:100]}" if self.last_critique else "",
@@ -423,6 +433,53 @@ class BeliefSnapshot:
             top = sorted(self.friction.items(), key=lambda kv: kv[1], reverse=True)[:3]
             parts.append("friction=" + ",".join(f"{k[:28]}:{v:.1f}" for k, v in top))
         return " | ".join(p for p in parts if p)[:max_chars]
+
+    def render_prompt_view(self, max_chars: int = 1500) -> str:
+        """Render the predictive-coding prompt section.
+
+        This is deliberately compact and structured so small Qwen2.5 models do
+        not have to rediscover the task frame from raw chat history.
+        """
+        known = [
+            f"- {slot.name} = {str(slot.value)[:72]} [via {slot.source}, conf {slot.confidence:.2f}]"
+            for slot in self.slots.values()
+            if slot.value not in (None, "", []) and (slot.locked or slot.confidence >= 0.7)
+        ][:10]
+        derived = [
+            f"- {key} = {str(value)[:72]}"
+            for key, value in sorted(self.derived_facts.items())[:8]
+            if value not in (None, "", [])
+        ]
+        obligations = []
+        for obligation in self.obligations[:8]:
+            blocked = ",".join(sorted(obligation.blocked_by)) or "-"
+            obligations.append(
+                f"- {obligation.obligation_id}; needs={','.join(sorted(obligation.required_slots)) or '-'}; "
+                f"status={obligation.status}; blocked_by={blocked}"
+            )
+        candidates = [f"- {value}" for value in self.open_candidates[:8]]
+        user_lines = [f"- {text[:120]}" for text in self.user_summary[-2:]]
+        phase_bits = ",".join(
+            f"{key}={value:.2f}" for key, value in sorted(self.phase_posterior.items())
+        )
+        parts = [
+            "KNOWN FACTS:",
+            *(known or ["- none locked yet"]),
+            "DERIVED:",
+            *(derived or ["- none"]),
+            "USER said:",
+            *(user_lines or ["- none"]),
+            "OPEN OBLIGATIONS:",
+            *(obligations or ["- none"]),
+            "OPEN CANDIDATES:",
+            *(candidates or ["- none"]),
+            f"CURRENT PHASE: {self.phase} / {self.stage} (entropy={self.phase_entropy:.2f}; posterior={phase_bits})",
+            f"PREDICTION_ERROR_F: {self.free_energy:.2f}",
+            f"GRADIENT THIS TURN: {self.gradient.label()}",
+            f"What this means: {self.gradient.description or self.gradient.reason or 'advance the current task frame'}",
+            f"LAST CRITIQUE: {self.last_critique or 'none'}",
+        ]
+        return "\n".join(parts)[:max_chars]
 
 
 @dataclass
@@ -1165,18 +1222,61 @@ class ConstraintPriorityEngine:
 
 
 class PredictiveGradientScheduler:
-    """Deterministic CARGO-N-lite scheduler.
+    """Deterministic CARGO-N predictive-coding scheduler.
 
-    It does not plan a route or prove a write.  It only chooses the next
-    progress gradient from compact state so the model is not asked to rederive
-    task continuity from the raw chat log every turn.
+    It does not search a tree.  It projects working memory into a compact
+    belief, estimates a small prediction-error functional, and chooses the
+    next progress gradient that should reduce that error.
     """
 
     WRITE_STAGES = {"commit", "commit_ready", "confirmation", "confirm"}
+    PRIORITY = {
+        "COMMIT": 80,
+        "CONFIRM": 70,
+        "GROUND_SLOT": 60,
+        "RESOLVE_CANDIDATES": 50,
+        "ASK_USER": 40,
+        "RESPOND": 30,
+        "ESCALATE": 20,
+    }
+    DESCRIPTIONS = {
+        "GROUND_SLOT": "Ground a missing required slot with a READ or a precise user question.",
+        "RESOLVE_CANDIDATES": "Choose among grounded candidates using hard constraints before preferences.",
+        "CONFIRM": "Ask the user to confirm one fully specified mutation.",
+        "COMMIT": "Execute the confirmed complete mutation.",
+        "ASK_USER": "Ask only for a genuinely missing user-only fact.",
+        "RESPOND": "Finish because obligations are closed or a blocker is known.",
+        "ESCALATE": "Stop repeating a failed branch and escalate or ask a different recovery question.",
+    }
+    DEFAULT_WEIGHTS = {
+        "w_obl": 1.0,
+        "w_grd": 0.8,
+        "w_amb": 0.5,
+        "w_phase": 0.4,
+        "w_fric": 0.5,
+        "w_writ": -0.8,
+    }
+    RETAIL_WEIGHTS = {
+        "w_obl": 1.0,
+        "w_grd": 0.5,
+        "w_amb": 0.3,
+        "w_phase": 0.4,
+        "w_fric": 0.5,
+        "w_writ": -1.0,
+    }
+    AIRLINE_WEIGHTS = {
+        "w_obl": 1.5,
+        "w_grd": 1.0,
+        "w_amb": 0.7,
+        "w_phase": 0.6,
+        "w_fric": 0.7,
+        "w_writ": -0.7,
+    }
 
     def snapshot(self, wm: "WorkingMemory", adapter: CargoDomainAdapter) -> BeliefSnapshot:
         phase = PhaseEngine().decide(wm, adapter)
         slots: Dict[str, BeliefSlot] = {}
+        derived_facts: Dict[str, Any] = {}
 
         state = getattr(wm, "task_state", None)
         if state is not None:
@@ -1194,6 +1294,8 @@ class PredictiveGradientScheduler:
                         confidence=float(getattr(fact, "confidence", 1.0)),
                         locked=bool(getattr(fact, "confirmed", False) or locked_default),
                     )
+                    if store_name == "derived":
+                        derived_facts[str(key)] = getattr(fact, "value", fact)
 
         for key, value in (getattr(wm, "semantic_slots", {}) or {}).items():
             slots.setdefault(
@@ -1216,11 +1318,28 @@ class PredictiveGradientScheduler:
                 confidence=1.0,
                 locked=True,
             )
+        if getattr(wm, "auth_email", ""):
+            slots.setdefault("email", BeliefSlot(
+                name="email",
+                value=getattr(wm, "auth_email"),
+                slot_type="semantic",
+                source="tool",
+                confidence=1.0,
+                locked=True,
+            ))
 
         obligations: List[BeliefObligation] = []
         if state is not None:
+            grounded_slots = {
+                normalize_key(key)
+                for key, slot in slots.items()
+                if slot.value not in (None, "", []) and slot.confidence >= 0.7
+            }
             for obligation in (getattr(state, "obligations", {}) or {}).values():
-                blocked = set(obligation.open_slots(state))
+                blocked = {
+                    slot for slot in obligation.open_slots(state)
+                    if normalize_key(slot) not in grounded_slots
+                }
                 obligations.append(BeliefObligation(
                     obligation_id=obligation.obligation_id,
                     required_slots=set(obligation.required_slots or set()),
@@ -1231,16 +1350,43 @@ class PredictiveGradientScheduler:
                 ))
 
         field = getattr(wm, "goal_field", GoalField())
-        gradient = self.pick(wm, adapter, phase=phase, obligations=obligations)
+        phase_posterior = self.phase_posterior(phase)
+        phase_entropy = self.entropy(phase_posterior)
+        weights = self.weights_for(adapter)
+        open_candidates = self.open_candidate_labels(wm)
+        friction = dict(sorted(getattr(field, "friction", {}).items(), key=lambda kv: kv[1], reverse=True)[:8])
+        free_energy = self.free_energy(
+            obligations=obligations,
+            open_candidate_count=len(open_candidates),
+            phase_entropy=phase_entropy,
+            friction=friction,
+            weights=weights,
+        )
+        gradient = self.pick(
+            wm,
+            adapter,
+            phase=phase,
+            obligations=obligations,
+            phase_entropy=phase_entropy,
+            free_energy=free_energy,
+            weights=weights,
+        )
         field.last_gradient = gradient.label()
         return BeliefSnapshot(
             active_goal=str(getattr(wm, "goal", "") or "")[:220],
             stage=phase.stage,
             slots=slots,
             obligations=obligations,
+            derived_facts=derived_facts,
+            open_candidates=open_candidates,
             phase=phase.phase,
+            phase_posterior=phase_posterior,
+            phase_entropy=phase_entropy,
             last_critique=getattr(field, "last_critique", ""),
-            friction=dict(sorted(getattr(field, "friction", {}).items(), key=lambda kv: kv[1], reverse=True)[:8]),
+            friction=friction,
+            weights=weights,
+            free_energy=free_energy,
+            user_summary=list(getattr(wm, "user_facts", [])[-2:]),
             gradient=gradient,
         )
 
@@ -1251,44 +1397,228 @@ class PredictiveGradientScheduler:
         *,
         phase: Optional[PhaseDecision] = None,
         obligations: Optional[List[BeliefObligation]] = None,
+        phase_entropy: Optional[float] = None,
+        free_energy: Optional[float] = None,
+        weights: Optional[Dict[str, float]] = None,
     ) -> GradientDirective:
         field = getattr(wm, "goal_field", GoalField())
-        if any(v >= 3 for v in (getattr(field, "recent_failures", {}) or {}).values()):
-            return GradientDirective("ESCALATE", reason="friction_threshold")
-
         phase = phase or PhaseEngine().decide(wm, adapter)
-        if getattr(wm, "task_completed", False) or phase.phase == "WRAP":
-            return GradientDirective("RESPOND", reason="task_complete_or_wrap")
-        state = getattr(wm, "task_state", None)
-        if state is not None and getattr(state, "terminal_status", ""):
-            return GradientDirective("RESPOND", target=str(state.terminal_status), reason="terminal_status")
-
         obligations = obligations if obligations is not None else []
+        phase_entropy = float(phase_entropy if phase_entropy is not None else self.entropy(self.phase_posterior(phase)))
+        weights = weights or self.weights_for(adapter)
+        free_energy = float(free_energy if free_energy is not None else self.free_energy(
+            obligations=obligations,
+            open_candidate_count=len(self.open_candidate_labels(wm)),
+            phase_entropy=phase_entropy,
+            friction=getattr(field, "friction", {}) or {},
+            weights=weights,
+        ))
+        candidates = self.candidate_gradients(wm, adapter, phase, obligations)
+        scored: List[GradientDirective] = []
+        for directive in candidates:
+            directive.description = self.DESCRIPTIONS.get(directive.kind, directive.reason)
+            directive.score_delta = self.estimate_delta(
+                directive,
+                free_energy=free_energy,
+                weights=weights,
+                friction=getattr(field, "friction", {}) or {},
+            )
+            scored.append(directive)
+        if not scored:
+            scored = [GradientDirective("ASK_USER", reason="insufficient_goal_frame")]
+        scored.sort(key=lambda d: (d.score_delta, -self.PRIORITY.get(d.kind, 0), d.label()))
+        return scored[0]
+
+    def candidate_gradients(
+        self,
+        wm: "WorkingMemory",
+        adapter: CargoDomainAdapter,
+        phase: PhaseDecision,
+        obligations: List[BeliefObligation],
+    ) -> List[GradientDirective]:
+        field = getattr(wm, "goal_field", GoalField())
+        if any(v >= 3 for v in (getattr(field, "recent_failures", {}) or {}).values()):
+            return [GradientDirective("ESCALATE", reason="friction_threshold")]
+
+        state = getattr(wm, "task_state", None)
+        if getattr(wm, "task_completed", False) or phase.phase == "WRAP":
+            return [GradientDirective("RESPOND", reason="task_complete_or_wrap")]
+        if state is not None and getattr(state, "terminal_status", ""):
+            return [GradientDirective("RESPOND", target=str(state.terminal_status), reason="terminal_status")]
+
+        out: List[GradientDirective] = []
         ready_writes = [
             o for o in obligations
             if o.is_write and not o.blocked_by and o.status in {"open", "ready"}
         ]
         if phase.phase == "COMMIT" or (phase.stage and normalize_key(phase.stage) in self.WRITE_STAGES and ready_writes):
             target = ready_writes[0].obligation_id if ready_writes else phase.stage
-            return GradientDirective("COMMIT", target=target, reason="ready_write")
+            out.append(GradientDirective("COMMIT", target=target, reason="ready_write"))
 
         if getattr(wm, "pending_commit_signature", "") and not getattr(wm, "confirmed_commit_signature", ""):
-            return GradientDirective("CONFIRM", target=getattr(wm, "pending_commit_summary", "")[:80], reason="awaiting_confirmation")
+            out.append(GradientDirective("CONFIRM", target=getattr(wm, "pending_commit_summary", "")[:80], reason="awaiting_confirmation"))
 
         open_slots: List[str] = []
         for obligation in obligations:
             open_slots.extend(sorted(obligation.blocked_by or set()))
-        if open_slots:
-            return GradientDirective("GROUND_SLOT", target=open_slots[0], reason="open_required_slot")
+        for slot in sorted(set(open_slots))[:4]:
+            out.append(GradientDirective("GROUND_SLOT", target=slot, reason="open_required_slot"))
 
         if state is not None:
             for candidate_set in (getattr(state, "candidate_sets", {}) or {}).values():
                 if len(getattr(candidate_set, "candidates", []) or []) > 1 and not getattr(candidate_set, "selected_candidate_id", ""):
-                    return GradientDirective("RESOLVE_CANDIDATES", target=candidate_set.set_id, reason="ambiguous_candidate_set")
+                    out.append(GradientDirective("RESOLVE_CANDIDATES", target=candidate_set.set_id, reason="ambiguous_candidate_set"))
 
         if getattr(wm, "semantic_slots", {}) or getattr(wm, "auth_user_id", ""):
-            return GradientDirective("RESPOND" if not obligations else "GROUND_SLOT", reason="state_has_goal_frame")
-        return GradientDirective("ASK_USER", reason="insufficient_goal_frame")
+            out.append(GradientDirective("RESPOND" if not obligations else "GROUND_SLOT", reason="state_has_goal_frame"))
+        else:
+            out.append(GradientDirective("ASK_USER", reason="insufficient_goal_frame"))
+        return out
+
+    def estimate_delta(
+        self,
+        directive: GradientDirective,
+        *,
+        free_energy: float,
+        weights: Dict[str, float],
+        friction: Mapping[str, float],
+    ) -> float:
+        kind = directive.kind
+        if kind == "COMMIT":
+            gain = abs(weights.get("w_writ", -0.8)) + weights.get("w_obl", 1.0)
+        elif kind == "CONFIRM":
+            gain = 0.8 * weights.get("w_obl", 1.0)
+        elif kind == "GROUND_SLOT":
+            gain = weights.get("w_grd", 0.8)
+        elif kind == "RESOLVE_CANDIDATES":
+            gain = weights.get("w_amb", 0.5)
+        elif kind == "RESPOND":
+            gain = 0.5 if free_energy <= 0.5 else -0.2
+        elif kind == "ESCALATE":
+            gain = weights.get("w_fric", 0.5) * max(1.0, max(friction.values(), default=0.0))
+        else:
+            gain = 0.2
+        sig = normalize_key(directive.label())
+        penalty = weights.get("w_fric", 0.5) * float(friction.get(sig, 0.0))
+        return round(free_energy - gain + penalty, 4)
+
+    def validate_gradient_match(
+        self,
+        action: ProposedAction,
+        wm: "WorkingMemory",
+        adapter: CargoDomainAdapter,
+    ) -> GateResult:
+        if getattr(action, "bypass_gates", False):
+            return GateResult.passing("gradient_match", skipped="bypass_gates")
+        snapshot = self.snapshot(wm, adapter)
+        gradient = snapshot.gradient
+        kind = normalize_key(gradient.kind)
+        text = normalize_value(action.user_text or action.raw_thought)
+        generic_ask = bool(re.search(
+            r"\b(how can i assist|what would you like|anything else|provide more detail|specific request)\b",
+            text,
+            re.I,
+        ))
+        has_goal_frame = bool(getattr(wm, "semantic_slots", {}) or getattr(wm, "auth_user_id", "") or snapshot.obligations)
+        if action.declared_class == RiskClass.ASK_USER and generic_ask and has_goal_frame and kind not in {"ask_user", "confirm"}:
+            return GateResult.failing(
+                "gradient_match",
+                "generic_ask_does_not_address_gradient",
+                gradient=gradient.label(),
+                belief=snapshot.render_compact(max_chars=260),
+            )
+        if kind == "commit" and action.declared_class == RiskClass.READ:
+            return GateResult.failing(
+                "gradient_match",
+                "read_does_not_address_commit_gradient",
+                gradient=gradient.label(),
+            )
+        terminal_gradient_is_hard = bool(
+            getattr(wm, "task_completed", False)
+            or getattr(getattr(wm, "task_state", None), "terminal_status", "")
+            or snapshot.phase == "WRAP"
+        )
+        if (
+            kind == "respond"
+            and terminal_gradient_is_hard
+            and action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE)
+        ):
+            return GateResult.failing(
+                "gradient_match",
+                "mutation_after_terminal_gradient",
+                gradient=gradient.label(),
+            )
+        return GateResult.passing(
+            "gradient_match",
+            gradient=gradient.label(),
+            action_gradient=getattr(action, "gradient_id", ""),
+            belief=snapshot.render_compact(max_chars=260),
+        )
+
+    def phase_posterior(self, phase: PhaseDecision) -> Dict[str, float]:
+        names = {
+            "AUTHENTICATE": "discover",
+            "DISCOVER": "plan",
+            "CONFIRM": "confirm",
+            "COMMIT": "commit",
+            "WRAP": "closeout",
+        }
+        active = names.get(phase.phase, "plan")
+        posterior = {k: 0.05 for k in ("discover", "plan", "confirm", "commit", "closeout")}
+        posterior[active] = 0.8
+        total = sum(posterior.values()) or 1.0
+        return {k: v / total for k, v in posterior.items()}
+
+    @staticmethod
+    def entropy(posterior: Mapping[str, float]) -> float:
+        return -sum(float(p) * math.log(max(float(p), 1e-9)) for p in posterior.values())
+
+    def weights_for(self, adapter: CargoDomainAdapter) -> Dict[str, float]:
+        name = str(getattr(adapter, "name", "") or getattr(adapter, "domain_name", "")).lower()
+        if "retail" in name:
+            return dict(self.RETAIL_WEIGHTS)
+        if "airline" in name:
+            return dict(self.AIRLINE_WEIGHTS)
+        return dict(self.DEFAULT_WEIGHTS)
+
+    def free_energy(
+        self,
+        *,
+        obligations: List[BeliefObligation],
+        open_candidate_count: int,
+        phase_entropy: float,
+        friction: Mapping[str, float],
+        weights: Mapping[str, float],
+    ) -> float:
+        open_obligations = [o for o in obligations if o.status not in {"complete", "committed", "cancelled"}]
+        ungrounded = set()
+        ready_write = 0
+        for obligation in open_obligations:
+            ungrounded.update(obligation.blocked_by or set())
+            if obligation.is_write and not obligation.blocked_by:
+                ready_write += 1
+        ambiguity = math.log(max(open_candidate_count, 1)) if open_candidate_count > 1 else 0.0
+        recent_friction = sum(float(v) for v in list(friction.values())[:3])
+        total = (
+            weights.get("w_obl", 1.0) * len(open_obligations)
+            + weights.get("w_grd", 0.8) * len(ungrounded)
+            + weights.get("w_amb", 0.5) * ambiguity
+            + weights.get("w_phase", 0.4) * phase_entropy
+            + weights.get("w_fric", 0.5) * recent_friction
+            + weights.get("w_writ", -0.8) * ready_write
+        )
+        return round(max(0.0, total), 4)
+
+    def open_candidate_labels(self, wm: "WorkingMemory") -> List[str]:
+        state = getattr(wm, "task_state", None)
+        if state is None:
+            return []
+        labels: List[str] = []
+        for candidate_set in (getattr(state, "candidate_sets", {}) or {}).values():
+            count = len(getattr(candidate_set, "candidates", []) or [])
+            if count > 0 and not getattr(candidate_set, "selected_candidate_id", ""):
+                labels.append(f"{candidate_set.set_id}:{count}")
+        return labels[:12]
 
     def score_alignment(self, action: ProposedAction, gradient: GradientDirective) -> float:
         kind = normalize_key(gradient.kind)

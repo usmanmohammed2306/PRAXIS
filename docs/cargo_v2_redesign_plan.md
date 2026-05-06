@@ -36,8 +36,9 @@ The spine is now:
 2. Maintain compact task state and candidate sets.
 3. Use a phase-aware deterministic controller before gates:
    `AUTHENTICATE -> DISCOVER -> CONFIRM -> COMMIT -> WRAP`.
-4. Render a CARGO-N-lite belief snapshot and choose a deterministic progress
-   gradient before the soft goal-field router scores candidates.
+4. Render a CARGO-N belief snapshot into the proposer prompt and choose a
+   deterministic progress gradient before the soft goal-field router scores
+   candidates.
 5. Run a cheap deterministic pre-commit verifier only on `WRITE`/`IRREVERSIBLE`.
 6. Keep commit certificates as final safety evidence for now, not as the planner.
 
@@ -66,12 +67,23 @@ The spine is now:
   - treats `latest_search_result` reservation reads in booking tasks as drift
   - suppresses direct-search replays when recorded evidence already proves no viable direct option
   - ranks only viable itineraries before applying cheapest-price preference
-- Added CARGO-N-lite belief/gradient hardening:
+- Added CARGO-N belief/gradient hardening:
   - `BeliefSnapshot`, `BeliefSlot`, `BeliefObligation`, `CritiqueResidual`,
     and `GradientDirective` in the generic core
   - `PredictiveGradientScheduler` selects `GROUND_SLOT`,
     `RESOLVE_CANDIDATES`, `CONFIRM`, `COMMIT`, `ASK_USER`, `RESPOND`, or
     `ESCALATE`
+  - the scheduler computes a free-energy-style residual from unmet
+    obligations, ungrounded slots, candidate ambiguity, phase entropy,
+    friction, and ready-write pressure
+  - the proposer prompt now includes a compact CARGO-N belief view with
+    `KNOWN FACTS`, `DERIVED`, `OPEN OBLIGATIONS`, `CURRENT PHASE`,
+    `PREDICTION_ERROR_F`, `GRADIENT THIS TURN`, and `LAST CRITIQUE`
+  - proposer parsing accepts `gradient_id` and `thought_uses_known_facts` for
+    diagnostics and future constrained decoding
+  - `_run_gates` now records a conservative `gradient_match` gate so clear
+    residuals feed back into the critique/friction path without replacing the
+    normal write guards
   - gate failures inject a compact critique into the goal field
   - repeated failed signatures enter a short friction blacklist
   - router scores include gradient alignment before existing gates run
@@ -105,6 +117,12 @@ The spine is now:
 - retail placeholder-email and generic-ask loops use known name/ZIP/order state
 - compact belief snapshot rendering stays under a small-model budget
 - friction blacklists repeated non-progress after repeated critiques
+- CARGO-N proposer fields parse from nested and flat action JSON
+- the belief prompt renders locked facts, free-energy residual, current
+  gradient, and critique before the older working memory
+- generic `ASK_USER` after a known goal frame fails the `gradient_match` gate
+- the full gate stack records `gradient_match` and returns its critique for
+  clear ask-loop residuals
 - generated 400-case corpus regressions cover airline known-user ask loops,
   cached profile re-fetch, reservation drift, malformed reservation lookup,
   city canonicalization, search exhaustion, booking/update progression,
@@ -138,7 +156,9 @@ The highest-value next hyperparameter change is to disable expensive verificatio
 
 - Retail still needs a cleaner exact confirmation barrier for every mutation, not just policy-shaped intent text.
 - Airline modify/cancel/update flows need deterministic write builders similar to the new booking builder.
-- The proposer prompt still carries older proof/verifier wording; it should be shortened after the new phase spine proves out in live smoke.
+- The proposer prompt now carries both older proof/verifier wording and the
+  new CARGO-N belief section; it should be shortened after live smoke proves
+  which wording is redundant for Qwen2.5.
 - Live tau/ACE smoke still requires `OPENAI_API_KEY` or `OPENAI_BASE_URL`.
 
 ## Verification Commands
@@ -150,7 +170,7 @@ python3 -m unittest tests.test_cargo -q
 python3 -m unittest tests.test_cargo tests.test_cargo_corpus -q
 python3 -m compileall src tests scripts -q
 bash run_project.sh --dry-run
-python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_cargo_n_corpus.json
+python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_cargo_n_full.json
 ```
 
 Live tau/ACE reruns require a model endpoint. The shell scripts are intentionally unchanged in this patch.
