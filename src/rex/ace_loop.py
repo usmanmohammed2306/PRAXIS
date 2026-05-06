@@ -69,9 +69,54 @@ def _assistant_message_dict(msg: Any) -> Dict[str, Any]:
     return out
 
 
+def _ace_runtime_dir() -> Path:
+    """Resolve the ACE runtime memory directory (env override > default)."""
+    return Path(
+        os.environ.get(
+            "REX_RUNTIME_DIR",
+            str(Path.cwd() / "outputs" / "experience_runtime"),
+        )
+    )
+
+
+def _ace_bank_dir() -> Path:
+    return Path(
+        os.environ.get(
+            "REX_EXPERIENCE_DIR",
+            str(Path.cwd() / "outputs" / "experience_bank"),
+        )
+    )
+
+
+def _load_ace_cards() -> List[Any]:
+    return load_experience_cards("ace", _ace_bank_dir(), runtime_dir=_ace_runtime_dir())
+
+
 def _tool_brief_cards(tool_specs: Sequence[Dict[str, Any]], user_turn: str) -> List[Any]:
-    cards = load_experience_cards("ace", Path(os.environ.get("REX_EXPERIENCE_DIR", str(Path.cwd() / "outputs" / "experience_bank"))))
-    return ExperienceRetriever(cards).search(user_turn + " " + " ".join(_tool_names(tool_specs)), k=3)
+    cards = _load_ace_cards()
+    return ExperienceRetriever(cards).search(
+        user_turn + " " + " ".join(_tool_names(tool_specs)), k=3,
+    )
+
+
+def _stateful_retrieval_query(
+    user_turn: str,
+    tool_specs: Sequence[Dict[str, Any]],
+    messages: Sequence[Dict[str, Any]],
+) -> str:
+    """Build a retrieval query that incorporates the latest tool result."""
+    parts: List[str] = [user_turn or "", " ".join(_tool_names(tool_specs))]
+    last_tool = ""
+    last_obs = ""
+    for m in messages:
+        if m.get("role") == "tool":
+            last_tool = str(m.get("name") or "")
+            last_obs = str(m.get("content") or "")
+    if last_tool:
+        parts.append(last_tool)
+    if last_obs:
+        parts.append(last_obs[:240])
+    return " ".join(p for p in parts if p)
 
 
 def _tool_names(tool_specs: Sequence[Dict[str, Any]]) -> List[str]:
@@ -93,18 +138,41 @@ def run_rex(
     max_num_steps: int,
     temperature: float,
 ) -> Dict[str, Any]:
-    selected = _tool_brief_cards(tool_specs, user_turn)
+    cards = _load_ace_cards()
+    retriever = ExperienceRetriever(cards)
+    selected = retriever.search(user_turn + " " + " ".join(_tool_names(tool_specs)), k=3)
     brief = render_experience_brief(selected)
     startup = _startup_analysis(client, model, user_turn, brief)
     messages: List[Dict[str, Any]] = [{"role": "system", "content": _system_prompt(task, brief, startup)}]
     if user_turn:
         messages.append({"role": "user", "content": user_turn})
 
+    cards_used_ids: List[str] = [c.card_id for c in selected]
+    refresh_every = int(os.environ.get("REX_RETRIEVAL_REFRESH_EVERY", "2") or 0)
+    refreshes = 0
+
     tool_calls_made: List[str] = []
     status = "ok"
     error = ""
     try:
-        for _ in range(max_num_steps):
+        for step_idx in range(max_num_steps):
+            # Stateful re-retrieval: refresh the brief based on latest tool obs.
+            if (
+                refresh_every
+                and step_idx > 0
+                and step_idx % refresh_every == 0
+            ):
+                query = _stateful_retrieval_query(user_turn, tool_specs, messages)
+                new_selected = retriever.search(query, k=3)
+                refreshes += 1
+                for c in new_selected:
+                    if c.card_id not in cards_used_ids:
+                        cards_used_ids.append(c.card_id)
+                if messages and messages[0].get("role") == "system":
+                    messages[0]["content"] = _system_prompt(
+                        task, render_experience_brief(new_selected), startup,
+                    )
+
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -139,9 +207,10 @@ def run_rex(
         "messages": messages,
         "tool_calls_made": tool_calls_made,
         "rex_stats": {
-            "cards_loaded": len(load_experience_cards("ace")),
-            "cards_used": [c.card_id for c in selected],
+            "cards_loaded": len(cards),
+            "cards_used": cards_used_ids,
             "startup_analysis": bool(startup),
+            "retrieval_refreshes": refreshes,
         },
     }
 

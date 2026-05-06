@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
+from ..rex.experience import promote_trajectories
 
 
 AGENT_CHOICES = ["baseline", "act", "react", "rex"]
@@ -67,6 +68,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-num-steps", type=int, default=30)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--promote-runtime-memory",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help=(
+            "After the run completes, distill successful trajectories into the REx "
+            "runtime memory bank under $REX_RUNTIME_DIR (auto = promote unless task "
+            "split is 'test')."
+        ),
+    )
+    p.add_argument(
+        "--runtime-dir",
+        default="",
+        help="Override REX_RUNTIME_DIR for this run; empty falls back to the env var.",
+    )
     return p.parse_args()
 
 
@@ -161,6 +177,44 @@ def _compute_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             "avg_cards_used": rex_cards_used / max(1, rex_n),
         }
     return out
+
+
+def _should_promote(ns: argparse.Namespace) -> bool:
+    """Decide whether to distill this run's trajectories into runtime memory.
+
+    Promotion writes to a memory bank that future runs read, so we never
+    promote test-split runs by default — that would cause label leakage.
+    The ``always`` option exists for ablation studies that explicitly want
+    it; ``never`` opts out entirely.
+    """
+    mode = (ns.promote_runtime_memory or "auto").lower()
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    # auto: promote only when split is not the held-out test split
+    return (ns.task_split or "").strip().lower() != "test"
+
+
+def _promote_records_to_runtime(
+    ns: argparse.Namespace,
+    records: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Distill ``records`` into the runtime memory bank for ``ns.env``."""
+    if not _should_promote(ns):
+        return {"status": "skipped", "reason": f"task_split={ns.task_split}"}
+    runtime_dir = Path(ns.runtime_dir) if ns.runtime_dir else None
+    try:
+        manifest = promote_trajectories(
+            records,
+            domain=ns.env,
+            runtime_dir=runtime_dir,
+            allow_test_split=ns.promote_runtime_memory == "always",
+        )
+        manifest["status"] = "ok"
+        return manifest
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
 
 
 def _make_env(ns: argparse.Namespace, task_index: int):
@@ -279,6 +333,13 @@ def main() -> int:
 
     records = _collect_records(Path(ns.output_dir))
     metrics = _compute_metrics(records)
+
+    # Promote successful + recoverable-failure trajectories into the runtime
+    # memory bank so that the next run can retrieve lessons learned in this
+    # run. Skipped automatically for the test split unless --promote-runtime-memory
+    # always is set.
+    promotion = _promote_records_to_runtime(ns, records)
+
     summary = {
         "benchmark": "tau-bench",
         "env": ns.env,
@@ -293,8 +354,10 @@ def main() -> int:
             "num_trials": ns.num_trials,
             "max_num_steps": ns.max_num_steps,
             "temperature": ns.temperature,
+            "promote_runtime_memory": ns.promote_runtime_memory,
         },
         "metrics": metrics,
+        "runtime_memory_promotion": promotion,
     }
     write_json(os.path.join(ns.output_dir, "metrics.json"), summary)
     print(json.dumps(summary["metrics"], indent=2))

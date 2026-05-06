@@ -11,6 +11,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass
@@ -21,6 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 ROOT = Path(__file__).resolve().parents[2]
 EXTERNAL_TAU = ROOT / "external" / "tau-bench"
 DEFAULT_BANK_DIR = ROOT / "outputs" / "experience_bank"
+DEFAULT_RUNTIME_DIR = ROOT / "outputs" / "experience_runtime"
 
 
 SENSITIVE_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
@@ -395,13 +397,8 @@ def build_experience_bank(
     return manifest
 
 
-def load_experience_cards(domain: str, bank_dir: Path = DEFAULT_BANK_DIR) -> List[ExperienceCard]:
-    path = bank_dir / f"{domain}.jsonl"
-    if not path.exists():
-        try:
-            build_experience_bank(output_dir=bank_dir)
-        except Exception:
-            return _policy_airline_cards() if domain == "airline" else (_ace_schema_cards() if domain == "ace" else [])
+def _read_cards_jsonl(path: Path) -> List[ExperienceCard]:
+    """Read an experience-card JSONL file. Tolerant of malformed lines."""
     cards: List[ExperienceCard] = []
     if not path.exists():
         return cards
@@ -416,6 +413,64 @@ def load_experience_cards(domain: str, bank_dir: Path = DEFAULT_BANK_DIR) -> Lis
             except Exception:
                 continue
     return cards
+
+
+def load_experience_cards(
+    domain: str,
+    bank_dir: Path = DEFAULT_BANK_DIR,
+    runtime_dir: Optional[Path] = None,
+) -> List[ExperienceCard]:
+    """Return seed + runtime experience cards for ``domain``.
+
+    The seed bank is built once from allowed support data (retail train/dev,
+    policy-derived airline cards, ACE schema cards). The runtime bank is
+    accumulated across runs by ``promote_trajectories``. Both are loaded so
+    later runs can benefit from lessons distilled from earlier ones.
+    """
+    bank_path = bank_dir / f"{domain}.jsonl"
+    if not bank_path.exists():
+        try:
+            build_experience_bank(output_dir=bank_dir)
+        except Exception:
+            seed = _policy_airline_cards() if domain == "airline" else (
+                _ace_schema_cards() if domain == "ace" else []
+            )
+            runtime = _load_runtime_cards(domain, runtime_dir)
+            return _dedupe_cards(seed + runtime)
+    seed_cards = _read_cards_jsonl(bank_path)
+    runtime_cards = _load_runtime_cards(domain, runtime_dir)
+    return _dedupe_cards(seed_cards + runtime_cards)
+
+
+def _resolve_runtime_dir(runtime_dir: Optional[Path]) -> Path:
+    if runtime_dir is not None:
+        return runtime_dir
+    env_dir = os.environ.get("REX_RUNTIME_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return DEFAULT_RUNTIME_DIR
+
+
+def _load_runtime_cards(
+    domain: str,
+    runtime_dir: Optional[Path] = None,
+) -> List[ExperienceCard]:
+    """Read the runtime memory file for ``domain`` if present."""
+    rdir = _resolve_runtime_dir(runtime_dir)
+    return _read_cards_jsonl(rdir / f"{domain}.jsonl")
+
+
+def _dedupe_cards(cards: Sequence[ExperienceCard]) -> List[ExperienceCard]:
+    """Drop cards whose searchable text duplicates an already-kept card."""
+    seen: Set[str] = set()
+    out: List[ExperienceCard] = []
+    for c in cards:
+        key = f"{c.intent}|{'->'.join(c.tool_sequence)}|{c.common_trap}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
 
 
 class ExperienceRetriever:
@@ -483,12 +538,276 @@ def render_experience_brief(cards: Sequence[ExperienceCard]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Trajectory distillation -> runtime memory
+# ---------------------------------------------------------------------------
+#
+# The runtime bank is populated by reading each completed trajectory from a
+# benchmark run and converting it into a *procedural* card. Cards capture
+# what worked (or what failed and why) without copying answer-shaped content
+# such as IDs, emails, or argument values. The card is then audited with the
+# same redaction + forbidden-token check used for the seed bank.
+#
+# Promotion is conservative on purpose: only successful trajectories
+# (reward >= 1.0) and recoverable-failure trajectories (reward >= 0.0 with a
+# non-trivial trace) are eligible. Failures with no useful sequence are
+# dropped. This is the "4th human learns from the first 3" pattern: keep
+# lessons, drop noise.
+
+
+def _trajectory_tool_calls(messages: Sequence[Dict[str, Any]]) -> List[str]:
+    """Extract the ordered list of tool names called in a trajectory."""
+    names: List[str] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls", []) or []:
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                if isinstance(fn, dict) and fn.get("name"):
+                    names.append(str(fn["name"]))
+    return names
+
+
+def _trajectory_user_text(messages: Sequence[Dict[str, Any]]) -> str:
+    """Return the first user message of a trajectory, redacted."""
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "user" and m.get("content"):
+            return _truncate(redact_text(str(m.get("content"))))
+    return ""
+
+
+def _outcome_label(record: Dict[str, Any]) -> str:
+    reward = float(record.get("reward") or 0.0)
+    if reward >= 1.0:
+        return "successful"
+    if reward > 0.0:
+        return "partial"
+    return "failed"
+
+
+def _eligible_for_promotion(record: Dict[str, Any]) -> bool:
+    """Filter trajectories that are worth distilling.
+
+    Only trajectories whose controller did not crash AND that reached a
+    tool-using state are eligible. ``info.error`` is *not* itself
+    disqualifying — a recorded recoverable error becomes the trap on an
+    "avoid this sequence" card, which is exactly the lesson we want to
+    keep.
+    """
+    if not isinstance(record, dict):
+        return False
+    if record.get("status") not in (None, "ok"):
+        return False
+    msgs = record.get("messages") or record.get("traj") or []
+    if not isinstance(msgs, list) or len(msgs) < 2:
+        return False
+    return bool(_trajectory_tool_calls(msgs))
+
+
+def _distill_card_id(domain: str, record: Dict[str, Any], idx: int) -> str:
+    task = record.get("task_id")
+    trial = record.get("trial")
+    return f"{domain}-runtime-{task or 0}-{trial or 0}-{idx:03d}"
+
+
+def distill_trajectory(
+    record: Dict[str, Any],
+    *,
+    domain: str,
+    idx: int = 0,
+) -> Optional[ExperienceCard]:
+    """Convert a completed trajectory record into a procedural card.
+
+    Returns None when the record is not eligible (no tools used, error, etc)
+    or when redaction would leave sensitive content in the card.
+    """
+    if not _eligible_for_promotion(record):
+        return None
+
+    msgs = record.get("messages") or record.get("traj") or []
+    actions = _trajectory_tool_calls(msgs)
+    if not actions:
+        return None
+
+    instruction = _trajectory_user_text(msgs) or "runtime-distilled-card"
+    outcome = _outcome_label(record)
+
+    # Trap text records the failure / observation that future runs should avoid.
+    info = record.get("info") or {}
+    error_text = ""
+    if isinstance(info, dict) and info.get("error"):
+        error_text = _truncate(redact_text(str(info.get("error"))), limit=180)
+
+    intent = _intent_from_actions(domain, actions, instruction)
+    evidence = _evidence_for(domain, actions)
+    sequence = _process_for(domain, actions)
+
+    if outcome == "successful":
+        confirmation = _confirmation_for(actions)
+        trap = (
+            error_text
+            or _trap_for(domain, actions)
+            or "follow this sequence; do not deviate without fresh evidence"
+        )
+        intent_tag = f"{intent}__success"
+    elif outcome == "partial":
+        confirmation = _confirmation_for(actions)
+        trap = (
+            error_text
+            or "partial success: re-check evidence before each write; ask the user when uncertain"
+        )
+        intent_tag = f"{intent}__partial"
+    else:
+        # Failed runs still teach what NOT to do
+        confirmation = "stop and ask the user before writing; previous attempt did not succeed"
+        trap = (
+            error_text
+            or "this exact sequence did not satisfy the goal; collect fresh evidence first"
+        )
+        intent_tag = f"{intent}__avoid"
+
+    card = ExperienceCard(
+        card_id=_distill_card_id(domain, record, idx),
+        domain=domain,
+        source=f"runtime_{outcome}",
+        intent=intent_tag,
+        instruction_template=instruction,
+        needed_evidence=evidence,
+        tool_sequence=sequence,
+        confirmation=confirmation,
+        common_trap=trap,
+    )
+    ok, _ = audit_card(card)
+    return card if ok else None
+
+
+def _is_test_split_record(record: Dict[str, Any]) -> bool:
+    """Refuse to distill a record that came from the held-out test split.
+
+    Promotion writes to a memory bank that future test runs will read, so
+    distilling test-split trajectories would create label leakage. Records
+    typically tag their split via ``info.task_split`` or via their parent
+    runner config; default to *blocking* anything that looks like a test
+    trajectory but allow trajectories where the field is absent (the runner
+    is always our own and does not retain test split info on the record by
+    default — promotion is gated separately at the runner level).
+    """
+    info = record.get("info") if isinstance(record, dict) else None
+    if isinstance(info, dict):
+        split = (info.get("task_split") or "").strip().lower()
+        if split == "test":
+            return True
+    return False
+
+
+def promote_trajectories(
+    records: Sequence[Dict[str, Any]],
+    *,
+    domain: str,
+    runtime_dir: Optional[Path] = None,
+    allow_test_split: bool = False,
+    forbidden_tokens: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """Distill ``records`` into a runtime card file appended to disk.
+
+    Returns a small manifest describing how many cards were promoted.
+    Existing cards in the runtime file are de-duplicated by their searchable
+    key so re-running the same workload doesn't grow memory unboundedly.
+    """
+    rdir = _resolve_runtime_dir(runtime_dir)
+    rdir.mkdir(parents=True, exist_ok=True)
+    runtime_path = rdir / f"{domain}.jsonl"
+
+    existing_keys: Set[str] = set()
+    for c in _read_cards_jsonl(runtime_path):
+        existing_keys.add(f"{c.intent}|{'->'.join(c.tool_sequence)}")
+
+    promoted: List[ExperienceCard] = []
+    rejected: List[Dict[str, Any]] = []
+    for idx, record in enumerate(records or []):
+        if not allow_test_split and _is_test_split_record(record):
+            rejected.append({"task_id": record.get("task_id"), "reason": "test_split_blocked"})
+            continue
+        card = distill_trajectory(record, domain=domain, idx=idx)
+        if card is None:
+            continue
+        ok, reason = audit_card(card, forbidden_tokens)
+        if not ok:
+            rejected.append({"task_id": record.get("task_id"), "reason": reason})
+            continue
+        key = f"{card.intent}|{'->'.join(card.tool_sequence)}"
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        promoted.append(card)
+
+    if promoted:
+        with runtime_path.open("a", encoding="utf-8") as f:
+            for card in promoted:
+                f.write(json.dumps(asdict(card), ensure_ascii=False, sort_keys=True) + "\n")
+
+    manifest = {
+        "domain": domain,
+        "runtime_dir": str(rdir),
+        "promoted": len(promoted),
+        "rejected": rejected[:25],
+        "total_runtime_cards_after": _count_runtime_cards(domain, rdir),
+    }
+    return manifest
+
+
+def _count_runtime_cards(domain: str, runtime_dir: Path) -> int:
+    path = runtime_dir / f"{domain}.jsonl"
+    if not path.exists():
+        return 0
+    with path.open(encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser("rex.experience")
     parser.add_argument("--output-dir", default=str(DEFAULT_BANK_DIR))
     parser.add_argument("--no-retail-dev", action="store_true")
+    parser.add_argument(
+        "--promote-from",
+        default="",
+        help=(
+            "Optional path to a trajectories.jsonl file. When set, distill those "
+            "trajectories into runtime memory under --runtime-dir for --domain."
+        ),
+    )
+    parser.add_argument("--runtime-dir", default=str(DEFAULT_RUNTIME_DIR))
+    parser.add_argument("--domain", default="retail")
+    parser.add_argument("--allow-test-split", action="store_true")
     ns = parser.parse_args()
-    manifest = build_experience_bank(output_dir=Path(ns.output_dir), include_retail_dev=not ns.no_retail_dev)
+
+    if ns.promote_from:
+        records: List[Dict[str, Any]] = []
+        with Path(ns.promote_from).open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    continue
+        manifest = promote_trajectories(
+            records,
+            domain=ns.domain,
+            runtime_dir=Path(ns.runtime_dir),
+            allow_test_split=ns.allow_test_split,
+        )
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
+        return 0
+
+    manifest = build_experience_bank(
+        output_dir=Path(ns.output_dir),
+        include_retail_dev=not ns.no_retail_dev,
+    )
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
     return 0
 
