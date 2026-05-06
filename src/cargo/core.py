@@ -155,6 +155,9 @@ class GoalField:
     active_task_frame: Dict[str, Any] = field(default_factory=dict)
     recent_recenter_reason: str = ""
     last_selected_signature: str = ""
+    last_gradient: str = ""
+    last_critique: str = ""
+    friction_blacklist: Dict[str, int] = field(default_factory=dict)
     last_decision: Dict[str, Any] = field(default_factory=dict)
     turn: int = 0
 
@@ -202,10 +205,28 @@ class GoalField:
             return
         self.friction[sig] = min(12.0, self.friction.get(sig, 0.0) + float(amount))
         self.recent_failures[sig] = self.recent_failures.get(sig, 0) + 1
+        if self.recent_failures[sig] >= 2:
+            self.friction_blacklist[sig] = 3
         self.momentum = max(0.0, self.momentum - (0.2 * float(amount)))
         if reason:
             self.recent_recenter_reason = str(reason)[:120]
         self._trim()
+
+    def record_critique(self, signature: str, code: str, reason: str) -> None:
+        sig = str(signature or "unknown")[:180]
+        clean_code = normalize_key(code or "critique")
+        clean_reason = str(reason or "").strip()[:120]
+        self.last_critique = f"{clean_code}:{clean_reason}"[:180]
+        self.record_friction(sig, 1.0, clean_reason or clean_code)
+
+    def tick_friction_blacklist(self) -> None:
+        if not self.friction_blacklist:
+            return
+        updated: Dict[str, int] = {}
+        for sig, ttl in self.friction_blacklist.items():
+            if int(ttl) > 1:
+                updated[sig] = int(ttl) - 1
+        self.friction_blacklist = updated
 
     def recenter(self, reason: str, *, preserve_goal: bool = True) -> None:
         self.recent_recenter_reason = str(reason or "recentered")[:120]
@@ -253,6 +274,10 @@ class GoalField:
                 "friction="
                 + ";".join(f"{k.split('(')[0][:28]}:{v:.1f}" for k, v in top_friction)
             )
+        if self.last_gradient:
+            parts.append(f"gradient={self.last_gradient[:48]}")
+        if self.last_critique:
+            parts.append(f"critique={self.last_critique[:72]}")
         if self.recent_recenter_reason:
             parts.append(f"recenter={self.recent_recenter_reason[:80]}")
         return " | ".join(p for p in parts if p)[:max_chars]
@@ -288,6 +313,8 @@ class GoalField:
                 k: v for k, v in self.recent_failures.items()
                 if k in keep_keys
             }
+        if len(self.friction_blacklist) > 24:
+            self.friction_blacklist = dict(list(self.friction_blacklist.items())[-24:])
 
 
 @dataclass
@@ -312,6 +339,90 @@ class GoalFieldDecision:
     selected: GoalActionCandidate
     alternatives: List[GoalActionCandidate] = field(default_factory=list)
     reason: str = ""
+
+
+@dataclass
+class BeliefSlot:
+    """Compact typed fact rendered to small models.
+
+    This is not a second working memory.  It is a deterministic projection of
+    WorkingMemory/TaskState for routing and prompt continuity.
+    """
+
+    name: str
+    value: Any = None
+    slot_type: str = "semantic"
+    source: str = "user"
+    confidence: float = 0.0
+    locked: bool = False
+
+
+@dataclass
+class BeliefObligation:
+    obligation_id: str
+    required_slots: Set[str] = field(default_factory=set)
+    status: str = "open"
+    blocked_by: Set[str] = field(default_factory=set)
+    requires_confirmation: bool = False
+    is_write: bool = False
+
+
+@dataclass
+class CritiqueResidual:
+    signature: str
+    code: str
+    reason: str = ""
+    turn: int = 0
+
+
+@dataclass
+class GradientDirective:
+    """Next deterministic progress target for the proposer/router."""
+
+    kind: str
+    target: str = ""
+    reason: str = ""
+    score_delta: float = 0.0
+
+    def label(self) -> str:
+        return f"{self.kind}:{self.target}" if self.target else self.kind
+
+
+@dataclass
+class BeliefSnapshot:
+    """Small CARGO-N belief view derived from current state."""
+
+    active_goal: str = ""
+    stage: str = "start"
+    slots: Dict[str, BeliefSlot] = field(default_factory=dict)
+    obligations: List[BeliefObligation] = field(default_factory=list)
+    phase: str = "DISCOVER"
+    last_critique: str = ""
+    friction: Dict[str, float] = field(default_factory=dict)
+    gradient: GradientDirective = field(default_factory=lambda: GradientDirective(kind="ASK_USER"))
+
+    def render_compact(self, max_chars: int = 700) -> str:
+        locked = [
+            f"{slot.name}={str(slot.value)[:36]}"
+            for slot in self.slots.values()
+            if slot.locked and slot.value not in (None, "")
+        ][:8]
+        open_slots: List[str] = []
+        for obligation in self.obligations:
+            open_slots.extend(sorted(obligation.blocked_by or set()))
+        parts = [
+            f"goal={self.active_goal[:120]}" if self.active_goal else "",
+            f"phase={self.phase}",
+            f"stage={self.stage}",
+            f"gradient={self.gradient.label()}",
+            "known=" + ",".join(locked) if locked else "",
+            "open=" + ",".join(sorted(set(open_slots))[:10]) if open_slots else "",
+            f"critique={self.last_critique[:100]}" if self.last_critique else "",
+        ]
+        if self.friction:
+            top = sorted(self.friction.items(), key=lambda kv: kv[1], reverse=True)[:3]
+            parts.append("friction=" + ",".join(f"{k[:28]}:{v:.1f}" for k, v in top))
+        return " | ".join(p for p in parts if p)[:max_chars]
 
 
 @dataclass
@@ -1053,12 +1164,163 @@ class ConstraintPriorityEngine:
         return sorted(candidates, key=score, reverse=True)[0]
 
 
+class PredictiveGradientScheduler:
+    """Deterministic CARGO-N-lite scheduler.
+
+    It does not plan a route or prove a write.  It only chooses the next
+    progress gradient from compact state so the model is not asked to rederive
+    task continuity from the raw chat log every turn.
+    """
+
+    WRITE_STAGES = {"commit", "commit_ready", "confirmation", "confirm"}
+
+    def snapshot(self, wm: "WorkingMemory", adapter: CargoDomainAdapter) -> BeliefSnapshot:
+        phase = PhaseEngine().decide(wm, adapter)
+        slots: Dict[str, BeliefSlot] = {}
+
+        state = getattr(wm, "task_state", None)
+        if state is not None:
+            for store_name, store, locked_default in (
+                ("tool", getattr(state, "db_confirmed_facts", {}) or {}, True),
+                ("user", getattr(state, "user_provided_facts", {}) or {}, False),
+                ("derived", getattr(state, "inferred_facts", {}) or {}, False),
+            ):
+                for key, fact in list(store.items())[-18:]:
+                    slots[str(key)] = BeliefSlot(
+                        name=str(key),
+                        value=getattr(fact, "value", fact),
+                        slot_type="opaque_id" if str(key) in getattr(adapter, "id_fields", set()) else "semantic",
+                        source=store_name,
+                        confidence=float(getattr(fact, "confidence", 1.0)),
+                        locked=bool(getattr(fact, "confirmed", False) or locked_default),
+                    )
+
+        for key, value in (getattr(wm, "semantic_slots", {}) or {}).items():
+            slots.setdefault(
+                str(key),
+                BeliefSlot(
+                    name=str(key),
+                    value=value,
+                    slot_type="semantic",
+                    source="user",
+                    confidence=0.8,
+                    locked=bool((getattr(wm, "db_confirmed_slots", {}) or {}).get(key)),
+                ),
+            )
+        if getattr(wm, "auth_user_id", ""):
+            slots["user_id"] = BeliefSlot(
+                name="user_id",
+                value=getattr(wm, "auth_user_id"),
+                slot_type="opaque_id",
+                source="tool",
+                confidence=1.0,
+                locked=True,
+            )
+
+        obligations: List[BeliefObligation] = []
+        if state is not None:
+            for obligation in (getattr(state, "obligations", {}) or {}).values():
+                blocked = set(obligation.open_slots(state))
+                obligations.append(BeliefObligation(
+                    obligation_id=obligation.obligation_id,
+                    required_slots=set(obligation.required_slots or set()),
+                    status=obligation.status,
+                    blocked_by=blocked,
+                    requires_confirmation=bool(obligation.confirmation_required),
+                    is_write=bool(obligation.execution_required),
+                ))
+
+        field = getattr(wm, "goal_field", GoalField())
+        gradient = self.pick(wm, adapter, phase=phase, obligations=obligations)
+        field.last_gradient = gradient.label()
+        return BeliefSnapshot(
+            active_goal=str(getattr(wm, "goal", "") or "")[:220],
+            stage=phase.stage,
+            slots=slots,
+            obligations=obligations,
+            phase=phase.phase,
+            last_critique=getattr(field, "last_critique", ""),
+            friction=dict(sorted(getattr(field, "friction", {}).items(), key=lambda kv: kv[1], reverse=True)[:8]),
+            gradient=gradient,
+        )
+
+    def pick(
+        self,
+        wm: "WorkingMemory",
+        adapter: CargoDomainAdapter,
+        *,
+        phase: Optional[PhaseDecision] = None,
+        obligations: Optional[List[BeliefObligation]] = None,
+    ) -> GradientDirective:
+        field = getattr(wm, "goal_field", GoalField())
+        if any(v >= 3 for v in (getattr(field, "recent_failures", {}) or {}).values()):
+            return GradientDirective("ESCALATE", reason="friction_threshold")
+
+        phase = phase or PhaseEngine().decide(wm, adapter)
+        if getattr(wm, "task_completed", False) or phase.phase == "WRAP":
+            return GradientDirective("RESPOND", reason="task_complete_or_wrap")
+        state = getattr(wm, "task_state", None)
+        if state is not None and getattr(state, "terminal_status", ""):
+            return GradientDirective("RESPOND", target=str(state.terminal_status), reason="terminal_status")
+
+        obligations = obligations if obligations is not None else []
+        ready_writes = [
+            o for o in obligations
+            if o.is_write and not o.blocked_by and o.status in {"open", "ready"}
+        ]
+        if phase.phase == "COMMIT" or (phase.stage and normalize_key(phase.stage) in self.WRITE_STAGES and ready_writes):
+            target = ready_writes[0].obligation_id if ready_writes else phase.stage
+            return GradientDirective("COMMIT", target=target, reason="ready_write")
+
+        if getattr(wm, "pending_commit_signature", "") and not getattr(wm, "confirmed_commit_signature", ""):
+            return GradientDirective("CONFIRM", target=getattr(wm, "pending_commit_summary", "")[:80], reason="awaiting_confirmation")
+
+        open_slots: List[str] = []
+        for obligation in obligations:
+            open_slots.extend(sorted(obligation.blocked_by or set()))
+        if open_slots:
+            return GradientDirective("GROUND_SLOT", target=open_slots[0], reason="open_required_slot")
+
+        if state is not None:
+            for candidate_set in (getattr(state, "candidate_sets", {}) or {}).values():
+                if len(getattr(candidate_set, "candidates", []) or []) > 1 and not getattr(candidate_set, "selected_candidate_id", ""):
+                    return GradientDirective("RESOLVE_CANDIDATES", target=candidate_set.set_id, reason="ambiguous_candidate_set")
+
+        if getattr(wm, "semantic_slots", {}) or getattr(wm, "auth_user_id", ""):
+            return GradientDirective("RESPOND" if not obligations else "GROUND_SLOT", reason="state_has_goal_frame")
+        return GradientDirective("ASK_USER", reason="insufficient_goal_frame")
+
+    def score_alignment(self, action: ProposedAction, gradient: GradientDirective) -> float:
+        kind = normalize_key(gradient.kind)
+        name = normalize_key(action.name)
+        if kind == "commit":
+            return 1.2 if action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE) else -0.7
+        if kind == "confirm":
+            return 0.9 if action.declared_class == RiskClass.ASK_USER else -0.4
+        if kind in {"ground_slot", "resolve_candidates"}:
+            if action.declared_class == RiskClass.READ or name.startswith(("get_", "find_", "list_", "search_")):
+                return 1.0
+            if action.declared_class == RiskClass.ASK_USER:
+                return 0.2 if kind == "ground_slot" else -0.3
+            return -0.6
+        if kind == "respond":
+            return 0.8 if action.declared_class == RiskClass.FINAL else -0.2
+        if kind == "ask_user":
+            return 0.7 if action.declared_class == RiskClass.ASK_USER else 0.0
+        if kind == "escalate":
+            if name in {"transfer_to_human_agents", "transfer_to_agent"}:
+                return 1.0
+            return 0.4 if action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL) else -0.2
+        return 0.0
+
+
 class DecisionEngine:
     """Small domain-neutral facade for deterministic decisions."""
 
     def __init__(self) -> None:
         self.constraints = ConstraintPriorityEngine()
         self.goal_router = SoftGoalFieldRouter()
+        self.gradient_scheduler = PredictiveGradientScheduler()
         self.phase_engine = PhaseEngine()
         self.precommit_verifier = PreCommitVerifier()
 
@@ -1301,7 +1563,7 @@ class SoftGoalFieldRouter:
         field = self._field(wm)
         sig = action.signature()
         reason = getattr(gate, "reason", "") or "gate_failure"
-        field.record_friction(sig, 1.0, reason)
+        field.record_critique(sig, getattr(gate, "gate", "") or "gate_failure", reason)
         if reason in {
             "repeated_action_signature",
             "user_profile_already_cached",
@@ -1341,13 +1603,18 @@ class SoftGoalFieldRouter:
         adapter: CargoDomainAdapter,
     ) -> GoalFieldDecision:
         field = self._field(wm)
+        field.tick_friction_blacklist()
         field.sync_from_memory(wm)
         field.active_stage = self._adapter_stage(adapter, wm)
+        scheduler = PredictiveGradientScheduler()
+        snapshot = scheduler.snapshot(wm, adapter)
+        gradient = snapshot.gradient
+        field.last_gradient = gradient.label()
         scored: List[GoalActionCandidate] = []
         for idx, candidate in enumerate(candidates):
             if candidate is None or candidate.action is None:
                 continue
-            candidate.score = self._score_candidate(candidate, wm, adapter, idx)
+            candidate.score = self._score_candidate(candidate, wm, adapter, idx, gradient, scheduler)
             scored.append(candidate)
         if not scored:
             raise ValueError("SoftGoalFieldRouter.choose requires at least one candidate")
@@ -1358,6 +1625,8 @@ class SoftGoalFieldRouter:
             "selected": selected.signature(),
             "source": selected.source,
             "score": round(selected.score, 3),
+            "gradient": gradient.label(),
+            "belief": snapshot.render_compact(max_chars=420),
             "alternatives": [
                 {"signature": c.signature(), "source": c.source, "score": round(c.score, 3)}
                 for c in scored[1:4]
@@ -1375,16 +1644,21 @@ class SoftGoalFieldRouter:
         wm: "WorkingMemory",
         adapter: CargoDomainAdapter,
         index: int,
+        gradient: Optional[GradientDirective] = None,
+        scheduler: Optional[PredictiveGradientScheduler] = None,
     ) -> float:
         field = self._field(wm)
         action = candidate.action
         sig = action.signature()
+        scheduler = scheduler or PredictiveGradientScheduler()
+        gradient = gradient or scheduler.pick(wm, adapter)
         score = (
             float(candidate.progress)
             + float(candidate.uncertainty_reduction)
             + float(candidate.completion)
             + float(candidate.frame_match)
             + min(2.0, field.momentum * 0.08)
+            + scheduler.score_alignment(action, gradient)
         )
         if action.declared_class == RiskClass.READ:
             score += 0.35
@@ -1402,6 +1676,8 @@ class SoftGoalFieldRouter:
             score -= 2.0
         if getattr(wm, "failed_without_new_evidence", lambda _s: False)(sig):
             score -= 2.5
+        if sig in getattr(field, "friction_blacklist", {}):
+            score -= 2.2
         score -= min(4.0, field.friction.get(sig, 0.0))
         if action.name == "get_user_details":
             uid = str(action.args.get("user_id") or "").strip()
