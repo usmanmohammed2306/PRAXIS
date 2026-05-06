@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from .config import RexConfig
+from .decision_retrieval import OperationalDecisionRetriever, extract_operational_context
 from .experience import (
     ExperienceRetriever,
     load_experience_cards,
@@ -23,6 +24,7 @@ from .pipeline import refresh_playbook
 from .playbook import synthesize_playbook
 from .retrieval import HybridRetriever, build_query
 from .retrieval_logging import RetrievalLogger
+from .state_graph import OperationalStateGraph, TransitionOutcome
 
 
 def _system_prompt(task: Dict[str, Any], brief: str, startup: str = "") -> str:
@@ -132,6 +134,17 @@ def run_rex(
     except Exception:
         hybrid = None
 
+    # Initialize operational decision retriever
+    operational_retriever: Optional[OperationalDecisionRetriever] = None
+    try:
+        if process_cards:
+            operational_retriever = OperationalDecisionRetriever(process_cards)
+    except Exception:
+        operational_retriever = None
+
+    # Initialize operational state graph
+    state_graph = OperationalStateGraph() if operational_retriever else None
+
     logger = retrieval_logger or RetrievalLogger(config=cfg)
 
     if hybrid and hybrid.num_cards:
@@ -191,28 +204,54 @@ def run_rex(
                 refresh_every
                 and step_idx > 0
                 and step_idx % refresh_every == 0
-                and hybrid
-                and hybrid.num_cards
             ):
-                playbook, result, _state = refresh_playbook(
-                    retriever=hybrid,
-                    initial_user=user_turn,
-                    messages=messages,
-                    environment="ace",
-                    benchmark="ACEBench",
-                    controller="rex",
-                    step_index=step_idx,
-                    config=cfg,
-                    logger=logger,
-                    task_id=str(task.get("id") or task.get("task_id") or "0"),
-                    trial=0,
-                )
-                refreshes += 1
-                for c in result.cards:
-                    if c.card_id not in cards_used_ids:
-                        cards_used_ids.append(c.card_id)
-                if messages and messages[0].get("role") == "system":
-                    messages[0]["content"] = _system_prompt(task, playbook.body, startup)
+                # Try operational state graph retrieval first if available
+                new_brief = ""
+                new_cards = []
+                if state_graph and operational_retriever:
+                    try:
+                        retrieved_cards = operational_retriever.retrieve_for_phase(state_graph, top_k=3)
+                        if retrieved_cards:
+                            brief_parts = []
+                            for card in retrieved_cards:
+                                if card.recommended_next_tools:
+                                    brief_parts.append(
+                                        f"Next: {', '.join(card.recommended_next_tools)}"
+                                    )
+                                if card.common_trap:
+                                    brief_parts.append(f"Caution: {card.common_trap}")
+                            if brief_parts:
+                                new_brief = "\n".join(brief_parts)
+                                new_cards = retrieved_cards
+                    except Exception:
+                        pass
+
+                # Fall back to hybrid retrieval if operational failed
+                if not new_brief and hybrid and hybrid.num_cards:
+                    playbook, result, _state = refresh_playbook(
+                        retriever=hybrid,
+                        initial_user=user_turn,
+                        messages=messages,
+                        environment="ace",
+                        benchmark="ACEBench",
+                        controller="rex",
+                        step_index=step_idx,
+                        config=cfg,
+                        logger=logger,
+                        task_id=str(task.get("id") or task.get("task_id") or "0"),
+                        trial=0,
+                    )
+                    new_brief = playbook.body
+                    new_cards = result.cards
+
+                if new_brief:
+                    refreshes += 1
+                    for c in new_cards:
+                        cid = getattr(c, "card_id", "")
+                        if cid and cid not in cards_used_ids:
+                            cards_used_ids.append(cid)
+                    if messages and messages[0].get("role") == "system":
+                        messages[0]["content"] = _system_prompt(task, new_brief, startup)
 
             resp = client.chat.completions.create(
                 model=model,
@@ -231,30 +270,49 @@ def run_rex(
                 "note": "ACEBench tool results are evaluated offline.",
             })
             for tc in tcs:
-                tool_calls_made.append(tc.function.name)
+                tool_name = tc.function.name
+                tool_calls_made.append(tool_name)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": getattr(tc, "id", f"rex_ace_{len(tool_calls_made)}"),
-                    "name": tc.function.name,
+                    "name": tool_name,
                     "content": stub,
                 })
+
+                # Update operational state graph
+                if state_graph:
+                    state_graph.record_tool_execution(
+                        tool_name,
+                        TransitionOutcome.SUCCESS,
+                        evidence_produced=["simulated_result"],
+                    )
     except Exception as exc:  # noqa: BLE001
         status = "error"
         error = f"{exc.__class__.__name__}: {exc}"
+
+    stats_dict = {
+        "cards_loaded": len(legacy_cards),
+        "cards_used": cards_used_ids,
+        "startup_analysis": bool(startup),
+        "retrieval_refreshes": refreshes,
+        "retrieval_backend": "hybrid" if hybrid else "legacy",
+        "operational_retrieval_enabled": operational_retriever is not None,
+        "playbook_chars": len(brief),
+    }
+
+    # Add operational state graph to stats if available
+    if state_graph:
+        try:
+            stats_dict["operational_state_graph"] = state_graph.to_dict()
+        except Exception:
+            pass
 
     return {
         "status": status,
         "error": error,
         "messages": messages,
         "tool_calls_made": tool_calls_made,
-        "rex_stats": {
-            "cards_loaded": len(legacy_cards),
-            "cards_used": cards_used_ids,
-            "startup_analysis": bool(startup),
-            "retrieval_refreshes": refreshes,
-            "retrieval_backend": "hybrid" if hybrid else "legacy",
-            "playbook_chars": len(brief),
-        },
+        "rex_stats": stats_dict,
     }
 
 

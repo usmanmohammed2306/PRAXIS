@@ -44,6 +44,7 @@ except Exception:  # pragma: no cover - exercised in minimal test envs
 
 from ..common.openai_client import get_client
 from .config import RexConfig
+from .decision_retrieval import OperationalDecisionRetriever, extract_operational_context
 from .experience import (
     ExperienceRetriever,
     load_experience_cards,
@@ -55,6 +56,7 @@ from .pipeline import refresh_playbook
 from .playbook import synthesize_playbook
 from .retrieval import HybridRetriever, build_query
 from .retrieval_logging import RetrievalLogger
+from .state_graph import OperationalStateGraph, TransitionOutcome
 from .working_state import working_state_for_messages
 
 
@@ -229,6 +231,19 @@ class RexAgent(Agent):  # type: ignore[misc]
         except Exception:
             # If embedding setup fails for any reason, fall back to legacy retrieval.
             self.hybrid_retriever = None
+
+        # ------------------------------------------------------------------
+        # Operational decision retriever (Phase 3 upgrade)
+        # Uses operational state graph instead of similarity matching
+        # ------------------------------------------------------------------
+        try:
+            self.operational_retriever: Optional[OperationalDecisionRetriever] = (
+                OperationalDecisionRetriever(process_cards)
+            )
+            self.enable_operational_retrieval = True
+        except Exception:
+            self.operational_retriever = None
+            self.enable_operational_retrieval = False
 
         self.retrieval_logger = retrieval_logger or RetrievalLogger(config=self.config)
         self.enable_startup_analysis = bool(self.config.startup_analysis)
@@ -435,6 +450,41 @@ class RexAgent(Agent):  # type: ignore[misc]
             parts.append(last_tool_obs[:240])
         return redact_text(" ".join(p for p in parts if p))
 
+    def _refresh_brief_with_state_graph(
+        self,
+        state_graph: OperationalStateGraph,
+    ) -> tuple[str, List[Any]]:
+        """Retrieve using operational state graph (decision-conditioned).
+
+        Returns ``(brief, card_objs)`` based on current operational phase.
+        Falls back to empty if operational retriever is not available.
+        """
+        if not self.operational_retriever or not state_graph:
+            return "", []
+
+        try:
+            # Retrieve cards conditioned on operational phase
+            cards = self.operational_retriever.retrieve_for_phase(state_graph, top_k=3)
+            brief_parts = []
+            for card in cards:
+                if card.recommended_next_tools:
+                    brief_parts.append(
+                        f"Next steps for {card.task_category}: {', '.join(card.recommended_next_tools)}"
+                    )
+                if card.common_trap:
+                    brief_parts.append(f"Caution: {card.common_trap}")
+                if card.recovery_heuristics:
+                    brief_parts.append(f"Recovery: {'; '.join(card.recovery_heuristics[:2])}")
+
+            if brief_parts:
+                brief = "\n".join(brief_parts)
+            else:
+                brief = "Continue with current approach based on operational state."
+
+            return brief, cards
+        except Exception:
+            return "", []
+
     def _refresh_brief(
         self,
         initial_user: str,
@@ -469,6 +519,48 @@ class RexAgent(Agent):  # type: ignore[misc]
         query = self._retrieval_query(initial_user, messages)
         selected = self.retriever.search(query, k=3)
         return render_experience_brief(selected), selected
+
+    def _update_operational_state(
+        self,
+        state_graph: OperationalStateGraph,
+        messages: List[Dict[str, Any]],
+        last_tool_called: Optional[str],
+        last_tool_args: Optional[Dict[str, Any]],
+        tool_result: Optional[str],
+        tool_result_name: Optional[str],
+    ) -> None:
+        """Update operational state graph with latest tool execution."""
+        if not state_graph or not last_tool_called:
+            return
+
+        # Record tool execution outcome
+        outcome_str = tool_result or ""
+        is_error = any(
+            k in (outcome_str or "").lower()
+            for k in ("error", "not found", "invalid", "failed", "denied", "unavailable")
+        )
+
+        # Determine outcome type
+        if is_error:
+            state_graph.record_tool_execution(
+                last_tool_called,
+                TransitionOutcome.FAILURE,
+                error_type="tool_error",
+            )
+            state_graph.record_failure(
+                last_tool_called,
+                error_type="tool_error",
+                error_detail=outcome_str[:200] if outcome_str else None,
+            )
+        else:
+            state_graph.record_tool_execution(
+                last_tool_called,
+                TransitionOutcome.SUCCESS,
+                evidence_produced=[outcome_str[:200]] if outcome_str else [],
+            )
+
+        # Record transition if we know the next tool (from messages)
+        # For now, we just track the execution
 
     def _replace_system_prompt(
         self,
@@ -508,6 +600,9 @@ class RexAgent(Agent):  # type: ignore[misc]
         if initial_user:
             messages.append({"role": "user", "content": initial_user})
 
+        # Initialize operational state graph for decision-conditioned retrieval
+        state_graph = OperationalStateGraph() if self.enable_operational_retrieval else None
+
         cards_used_ids: List[str] = list(initial_card_ids)
         stats: Dict[str, Any] = {
             "controller": "rex",
@@ -521,6 +616,7 @@ class RexAgent(Agent):  # type: ignore[misc]
             "mutating_tool_calls": 0,
             "retrieval_refreshes": 0,
             "retrieval_backend": "hybrid" if self.hybrid_retriever else "legacy",
+            "operational_retrieval_enabled": self.enable_operational_retrieval,
             "playbook_chars": len(brief),
         }
         reward: float = 0.0
@@ -530,27 +626,61 @@ class RexAgent(Agent):  # type: ignore[misc]
         done = False
 
         effective_steps = 0
+        last_tool_called: Optional[str] = None
+        last_tool_args: Optional[Dict[str, Any]] = None
         for _ in range(max_num_steps):
             if (
                 self.retrieval_refresh_every
                 and effective_steps > 0
                 and effective_steps % self.retrieval_refresh_every == 0
             ):
-                new_brief, new_selected = self._refresh_brief(
-                    initial_user,
-                    messages,
-                    step_index=effective_steps,
-                    task_id=task_index if task_index is not None else "",
-                    trial=0,
-                )
-                self._replace_system_prompt(messages, new_brief, startup)
-                stats["retrieval_refreshes"] += 1
-                stats["playbook_chars"] = len(new_brief)
-                for c in new_selected:
-                    cid = getattr(c, "card_id", "")
-                    if cid and cid not in cards_used_ids:
-                        cards_used_ids.append(cid)
-                stats["cards_used"] = cards_used_ids
+                # Try operational state graph retrieval first if enabled
+                if state_graph and self.enable_operational_retrieval:
+                    new_brief, new_selected = self._refresh_brief_with_state_graph(state_graph)
+                    if new_brief:
+                        self._replace_system_prompt(messages, new_brief, startup)
+                        stats["retrieval_refreshes"] += 1
+                        stats["playbook_chars"] = len(new_brief)
+                        for c in new_selected:
+                            cid = getattr(c, "card_id", "")
+                            if cid and cid not in cards_used_ids:
+                                cards_used_ids.append(cid)
+                        stats["cards_used"] = cards_used_ids
+                    else:
+                        # Fall back to hybrid retrieval if operational retrieval fails
+                        new_brief, new_selected = self._refresh_brief(
+                            initial_user,
+                            messages,
+                            step_index=effective_steps,
+                            task_id=task_index if task_index is not None else "",
+                            trial=0,
+                        )
+                        if new_brief:
+                            self._replace_system_prompt(messages, new_brief, startup)
+                            stats["retrieval_refreshes"] += 1
+                            stats["playbook_chars"] = len(new_brief)
+                            for c in new_selected:
+                                cid = getattr(c, "card_id", "")
+                                if cid and cid not in cards_used_ids:
+                                    cards_used_ids.append(cid)
+                            stats["cards_used"] = cards_used_ids
+                else:
+                    # Use traditional hybrid retrieval
+                    new_brief, new_selected = self._refresh_brief(
+                        initial_user,
+                        messages,
+                        step_index=effective_steps,
+                        task_id=task_index if task_index is not None else "",
+                        trial=0,
+                    )
+                    self._replace_system_prompt(messages, new_brief, startup)
+                    stats["retrieval_refreshes"] += 1
+                    stats["playbook_chars"] = len(new_brief)
+                    for c in new_selected:
+                        cid = getattr(c, "card_id", "")
+                        if cid and cid not in cards_used_ids:
+                            cards_used_ids.append(cid)
+                    stats["cards_used"] = cards_used_ids
 
             try:
                 resp = self.client.chat.completions.create(
@@ -611,12 +741,28 @@ class RexAgent(Agent):  # type: ignore[misc]
                             break
                         raise
                     stats["tool_calls_executed"] += 1
+                    tool_result = _obs_text(env_resp)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": getattr(tc, "id", f"rex_{stats['tool_calls_executed']}"),
                         "name": name,
-                        "content": _obs_text(env_resp),
+                        "content": tool_result,
                     })
+
+                    # Update operational state graph with tool execution result
+                    if state_graph:
+                        self._update_operational_state(
+                            state_graph,
+                            messages,
+                            name,
+                            kwargs,
+                            tool_result,
+                            name,
+                        )
+                        # Track last tool for next iteration
+                        last_tool_called = name
+                        last_tool_args = kwargs
+
                     reward = _float(getattr(env_resp, "reward", reward), reward)
                     info = getattr(env_resp, "info", info) or info
                     done = bool(getattr(env_resp, "done", False))
@@ -655,6 +801,13 @@ class RexAgent(Agent):  # type: ignore[misc]
             stats["working_state"] = final_state.to_dict()
         except Exception:
             pass
+
+        # Add operational state graph to diagnostics if available
+        if state_graph:
+            try:
+                stats["operational_state_graph"] = state_graph.to_dict()
+            except Exception:
+                pass
 
         info = dict(info) if info else {}
         if step_error:
