@@ -6,6 +6,9 @@ This note records the redesign direction after the latest full tau-bench runs:
 
 - Retail `metrics (56)`: 200 trajectories, success `0.01`, `2966` abstains, `2044` retry repairs, `752` finalize repairs, `1602` actions executed.
 - Airline `metrics (57)`: 200 trajectories, success `0.04`, `4107` abstains, `2614` retry repairs, `1313` finalize repairs, `1612` actions executed.
+- Airline `metrics (59)`: 200 trajectories, success `0.23`, `3118` abstains, `1958` retry repairs, `1006` finalize repairs, `1431` actions executed.
+- Retail `metrics (60)`: 200 trajectories, success `0.065`, `2461` abstains, `1619` retry repairs, `817` finalize repairs, `1236` actions executed.
+- ACEBench `metrics (58)`: 30 tasks, completion `1.0`, average `1.43` tool calls and `3.27` steps.
 - ACEBench remains healthy in prior smoke runs, so the fix should target tau-bench continuity without making the generic core domain-specific.
 
 The dominant failure is not basic tool availability. The traces show useful retrieval followed by unsafe or unproductive control transitions:
@@ -33,7 +36,8 @@ The spine is now:
 2. Maintain compact task state and candidate sets.
 3. Use a phase-aware deterministic controller before gates:
    `AUTHENTICATE -> DISCOVER -> CONFIRM -> COMMIT -> WRAP`.
-4. Keep the soft goal-field router as a candidate scorer, not as a planner.
+4. Render a CARGO-N-lite belief snapshot and choose a deterministic progress
+   gradient before the soft goal-field router scores candidates.
 5. Run a cheap deterministic pre-commit verifier only on `WRITE`/`IRREVERSIBLE`.
 6. Keep commit certificates as final safety evidence for now, not as the planner.
 
@@ -62,6 +66,18 @@ The spine is now:
   - treats `latest_search_result` reservation reads in booking tasks as drift
   - suppresses direct-search replays when recorded evidence already proves no viable direct option
   - ranks only viable itineraries before applying cheapest-price preference
+- Added CARGO-N-lite belief/gradient hardening:
+  - `BeliefSnapshot`, `BeliefSlot`, `BeliefObligation`, `CritiqueResidual`,
+    and `GradientDirective` in the generic core
+  - `PredictiveGradientScheduler` selects `GROUND_SLOT`,
+    `RESOLVE_CANDIDATES`, `CONFIRM`, `COMMIT`, `ASK_USER`, `RESPOND`, or
+    `ESCALATE`
+  - gate failures inject a compact critique into the goal field
+  - repeated failed signatures enter a short friction blacklist
+  - router scores include gradient alignment before existing gates run
+- Added `tests/fixtures/cargo_n_corpus_cases.json` with 400 generated cases
+  mined from the latest 800 tau trajectories: 220 airline, 160 retail, and
+  20 cross-domain/core.
 
 ## Test Coverage Added
 
@@ -87,6 +103,14 @@ The spine is now:
 - direct-flight preference survives a later one-stop allowance
 - semantic `none` values are not treated as ID placeholders, while nested ID placeholders still block
 - retail placeholder-email and generic-ask loops use known name/ZIP/order state
+- compact belief snapshot rendering stays under a small-model budget
+- friction blacklists repeated non-progress after repeated critiques
+- generated 400-case corpus regressions cover airline known-user ask loops,
+  cached profile re-fetch, reservation drift, malformed reservation lookup,
+  city canonicalization, search exhaustion, booking/update progression,
+  retail auth/order recovery, mixed catalog/account goals, hard-constraint
+  ranking, post-write termination, placeholders, and core pre-commit/belief
+  invariants
 
 Existing tests for read-permissive behavior, write completeness, active task-frame isolation, commit certificates, soft goal-field routing, and synthetic smoke remain part of the suite.
 
@@ -123,9 +147,10 @@ Run:
 
 ```bash
 python3 -m unittest tests.test_cargo -q
+python3 -m unittest tests.test_cargo tests.test_cargo_corpus -q
 python3 -m compileall src tests scripts -q
 bash run_project.sh --dry-run
-python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_v2_broad_corpus.json
+python3 scripts/run_smoke.py --target all --json-out outputs/smoke/smoke_summary_cargo_n_corpus.json
 ```
 
 Live tau/ACE reruns require a model endpoint. The shell scripts are intentionally unchanged in this patch.
