@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..baselines.ace_loops import run_baseline_style
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 from ..common.openai_client import get_client
+from ..rex.experience import promote_trajectories
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +47,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-concurrency", type=int, default=1)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--output-dir", required=True)
+    p.add_argument(
+        "--promote-runtime-memory",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help=(
+            "After the run completes, distill emitted trajectories into the REx "
+            "runtime memory bank under $REX_RUNTIME_DIR (auto = promote)."
+        ),
+    )
+    p.add_argument(
+        "--runtime-dir",
+        default="",
+        help="Override REX_RUNTIME_DIR for this run; empty falls back to the env var.",
+    )
     return p.parse_args()
 
 
@@ -351,9 +366,59 @@ def main() -> int:
     }
     summary["status"] = "ok"
     summary["metrics"] = metrics
+
+    # Promote trajectories into the REx runtime memory bank under the "ace"
+    # domain. ACE has no live reward, so we synthesize one from tool coverage
+    # (when ground-truth is available) or from "tools were called at all" so
+    # genuinely no-op runs are excluded.
+    promotion = _promote_ace_records(ns, records)
+    summary["runtime_memory_promotion"] = promotion
     write_json(os.path.join(ns.output_dir, "metrics.json"), summary)
     print(json.dumps(metrics, indent=2))
     return 0
+
+
+def _promote_ace_records(
+    ns: argparse.Namespace,
+    records: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Distill ACE trajectories into the runtime memory bank for the ace domain."""
+    mode = (ns.promote_runtime_memory or "auto").lower()
+    if mode == "never":
+        return {"status": "skipped", "reason": "promote_runtime_memory=never"}
+    runtime_dir = Path(ns.runtime_dir) if ns.runtime_dir else None
+
+    enriched: List[Dict[str, Any]] = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        coverage = r.get("tool_coverage")
+        if isinstance(coverage, (int, float)):
+            reward = float(coverage)
+        elif r.get("actual_tools"):
+            reward = 0.5
+        else:
+            reward = 0.0
+        enriched.append({
+            "task_id": r.get("index"),
+            "trial": 0,
+            "reward": reward,
+            "info": {"controller": r.get("controller", ns.agent)},
+            "messages": r.get("messages") or [],
+            "status": r.get("status", "ok"),
+            "error": r.get("error", ""),
+        })
+    try:
+        manifest = promote_trajectories(
+            enriched,
+            domain="ace",
+            runtime_dir=runtime_dir,
+            allow_test_split=mode == "always",
+        )
+        manifest["status"] = "ok"
+        return manifest
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
 
 
 if __name__ == "__main__":

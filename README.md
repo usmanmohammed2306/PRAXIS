@@ -26,16 +26,51 @@ Each card is redacted and audited before use. Cards teach process, not arguments
 
 ## Architecture
 
-At task start, REx:
+REx is a continually-improving process-memory agent. Each run produces
+trajectories; each trajectory is distilled into a procedural lesson; the next
+run retrieves those lessons and uses them to choose the next tool call.
 
-1. Builds or loads `outputs/experience_bank/{retail,airline,ace}.jsonl`.
-2. Retrieves the top 3 similar process cards with a tiny stdlib BM25-style retriever.
-3. Renders an experience brief with an explicit “never copy IDs” guard.
-4. Runs one short no-tools startup analysis.
-5. Executes the task with native OpenAI-compatible function calling.
-6. Runs same-model SABER-style reflection only before mutating tau-bench tools.
+**Two memory banks, one retriever:**
 
-Reads are never blocked by REx. If a write lacks policy support or user confirmation, REx asks a precise question instead of executing the write.
+* **Seed memory** (`outputs/experience_bank/{retail,airline,ace}.jsonl`) — built
+  from allowed support data only (retail train/dev splits, policy-derived
+  airline cards, ACE schema cards). Never includes prior eval trajectories or
+  test-split answers.
+* **Runtime memory** (`$REX_RUNTIME_DIR`, default `outputs/experience_runtime/`)
+  — append-only, deduplicated, persisted across runs. Populated automatically
+  at the end of every non-test run by `promote_trajectories`.
+
+**The full learning loop:**
+
+```
+saved trajectories
+  → process memory distillation (distill_trajectory)
+  → persistent memory bank (outputs/experience_runtime/)
+  → retrieval at runtime (load_experience_cards merges seed + runtime)
+  → short playbook synthesis (render_experience_brief)
+  → next tool call decision
+  → tool execution
+  → new trajectory
+  → distill again
+```
+
+**At each step in a trajectory, REx:**
+
+1. Builds a stateful retrieval query from `(initial_user, latest_user_reply,
+   latest_tool_name, latest_tool_observation)` — retrieval evolves with the
+   conversation, it is not a one-shot lookup at task start.
+2. Refreshes the experience brief in the system prompt every
+   `REX_RETRIEVAL_REFRESH_EVERY` (default 2) effective steps.
+3. Executes the next tool call with native OpenAI-compatible function calling.
+4. Runs same-model SABER-style reflection only before mutating tau-bench tools.
+
+**Leakage boundary.** Cards store *process* (intent, sequence, evidence
+required, confirmation point, common trap) — never IDs, emails, payment
+methods, dates, or argument values. Promotion is gated: by default, test-split
+runs are blocked from writing to runtime memory.
+
+Reads are never blocked by REx. If a write lacks policy support or user
+confirmation, REx asks a precise question instead of executing the write.
 
 ## Run
 

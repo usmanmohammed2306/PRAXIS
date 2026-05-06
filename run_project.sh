@@ -788,8 +788,18 @@ export OPENAI_API_BASE="$OPENAI_BASE_URL"
 # Build the REx procedural-memory bank from allowed support data only. This is
 # fast, deterministic, and explicitly avoids prior eval trajectories.
 export REX_EXPERIENCE_DIR="${REX_EXPERIENCE_DIR:-${OUTPUTS_DIR}/experience_bank}"
+# Runtime memory accumulates lessons distilled from saved trajectories across
+# runs. Default to a stable path under outputs/ so the bank persists between
+# invocations of this script. Override REX_RUNTIME_DIR to share between
+# checkouts (e.g. point at a scratch volume).
+export REX_RUNTIME_DIR="${REX_RUNTIME_DIR:-${OUTPUTS_DIR}/experience_runtime}"
+mkdir -p "$REX_RUNTIME_DIR"
+# Stateful re-retrieval cadence: refresh the playbook every N effective steps.
+# 0 disables (only the initial brief is used).
+export REX_RETRIEVAL_REFRESH_EVERY="${REX_RETRIEVAL_REFRESH_EVERY:-2}"
 if [[ "$CONTROLLERS_OPT" == *"rex"* ]]; then
-  log "Building REx experience bank: $REX_EXPERIENCE_DIR"
+  log "Building REx seed experience bank:    $REX_EXPERIENCE_DIR"
+  log "Using REx runtime memory directory:   $REX_RUNTIME_DIR"
   python -m src.rex.experience --output-dir "$REX_EXPERIENCE_DIR" \
     || log "WARNING: REx experience bank build failed; controller will fall back to built-in policy cards"
 fi

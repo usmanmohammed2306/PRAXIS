@@ -158,6 +158,7 @@ class RexAgent(Agent):  # type: ignore[misc]
         env_hint: str = "",
         client: Any = None,
         bank_dir: Optional[Path] = None,
+        runtime_dir: Optional[Path] = None,
     ) -> None:
         self.tools_info = tools_info or []
         self.wiki = wiki or ""
@@ -168,10 +169,17 @@ class RexAgent(Agent):  # type: ignore[misc]
         self.client = client or get_client()
         default_bank = Path(os.environ.get("REX_EXPERIENCE_DIR", str(Path.cwd() / "outputs" / "experience_bank")))
         self.bank_dir = bank_dir or default_bank
-        self.cards = load_experience_cards(self._experience_domain(), self.bank_dir)
+        # Runtime memory dir: auto-resolves to ${REX_RUNTIME_DIR} env or default.
+        self.runtime_dir = runtime_dir
+        self.cards = load_experience_cards(
+            self._experience_domain(), self.bank_dir, runtime_dir=self.runtime_dir,
+        )
         self.retriever = ExperienceRetriever(self.cards)
         self.enable_startup_analysis = os.environ.get("REX_STARTUP_ANALYSIS", "1") != "0"
         self.enable_reflection = os.environ.get("REX_MUTATION_REFLECTION", "1") != "0"
+        # Stateful re-retrieval: refresh the playbook every N effective steps.
+        # 0 disables (only the initial brief is used).
+        self.retrieval_refresh_every = int(os.environ.get("REX_RETRIEVAL_REFRESH_EVERY", "2") or 0)
 
     def _infer_domain(self) -> str:
         names = set(_tool_names(self.tools_info))
@@ -291,6 +299,62 @@ class RexAgent(Agent):  # type: ignore[misc]
         )
         return False, question[:RESPOND_MAX_CHARS]
 
+    def _retrieval_query(
+        self,
+        initial_user: str,
+        messages: List[Dict[str, Any]],
+    ) -> str:
+        """Build a stateful retrieval query.
+
+        The query evolves with the trajectory: it includes the initial user
+        request, the latest user reply, the most recent tool name, and a
+        truncated snippet of its observation. This is the architectural
+        change that turns retrieval from a one-shot thing into a stateful
+        process: cards retrieved at step 5 reflect what we've already
+        learned, not what the user said at step 0.
+        """
+        parts: List[str] = [initial_user or ""]
+        last_user = ""
+        last_tool_name = ""
+        last_tool_obs = ""
+        for m in messages:
+            role = m.get("role")
+            if role == "user" and m.get("content"):
+                last_user = str(m.get("content"))
+            elif role == "tool":
+                last_tool_name = str(m.get("name") or "")
+                last_tool_obs = str(m.get("content") or "")
+        if last_user and last_user != initial_user:
+            parts.append(last_user)
+        if last_tool_name:
+            parts.append(last_tool_name)
+        if last_tool_obs:
+            parts.append(last_tool_obs[:240])
+        return redact_text(" ".join(p for p in parts if p))
+
+    def _refresh_brief(
+        self,
+        initial_user: str,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[str, List[Any]]:
+        """Re-run retrieval with the current trajectory state and return the brief."""
+        query = self._retrieval_query(initial_user, messages)
+        selected = self.retriever.search(query, k=3)
+        return render_experience_brief(selected), selected
+
+    def _replace_system_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        new_brief: str,
+        startup_analysis: str,
+    ) -> None:
+        """Mutate ``messages`` in place to replace the system prompt with a fresh brief."""
+        if not messages:
+            return
+        if messages[0].get("role") != "system":
+            messages.insert(0, {"role": "system", "content": ""})
+        messages[0]["content"] = self._system_prompt(new_brief, startup_analysis)
+
     def _trim_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if len(messages) <= 16:
             return messages
@@ -317,16 +381,18 @@ class RexAgent(Agent):  # type: ignore[misc]
         if initial_user:
             messages.append({"role": "user", "content": initial_user})
 
+        cards_used_ids: List[str] = [c.card_id for c in selected]
         stats: Dict[str, Any] = {
             "controller": "rex",
             "cards_loaded": len(self.cards),
-            "cards_used": [c.card_id for c in selected],
+            "cards_used": cards_used_ids,
             "startup_analysis": bool(startup),
             "reflection_calls": 0,
             "reflection_blocks": 0,
             "reflection_errors": 0,
             "tool_calls_executed": 0,
             "mutating_tool_calls": 0,
+            "retrieval_refreshes": 0,
         }
         reward: float = 0.0
         info: Dict[str, Any] = {}
@@ -334,7 +400,26 @@ class RexAgent(Agent):  # type: ignore[misc]
         step_error = ""
         done = False
 
+        effective_steps = 0
         for _ in range(max_num_steps):
+            # Stateful re-retrieval: every N effective steps, regenerate the
+            # experience brief from the current trajectory state. This is the
+            # core architectural change that turns retrieval from "look once"
+            # into "look as the conversation evolves."
+            if (
+                self.retrieval_refresh_every
+                and effective_steps > 0
+                and effective_steps % self.retrieval_refresh_every == 0
+            ):
+                new_brief, new_selected = self._refresh_brief(initial_user, messages)
+                self._replace_system_prompt(messages, new_brief, startup)
+                stats["retrieval_refreshes"] += 1
+                # Track distinct cards seen across refreshes for diagnostics.
+                for c in new_selected:
+                    if c.card_id not in cards_used_ids:
+                        cards_used_ids.append(c.card_id)
+                stats["cards_used"] = cards_used_ids
+
             try:
                 resp = self.client.chat.completions.create(
                     model=self.model,
@@ -408,6 +493,7 @@ class RexAgent(Agent):  # type: ignore[misc]
                 if done:
                     break
                 messages = self._trim_messages(messages)
+                effective_steps += 1
                 continue
 
             content = (getattr(msg, "content", "") or "").strip()
@@ -427,6 +513,7 @@ class RexAgent(Agent):  # type: ignore[misc]
             info = getattr(env_resp, "info", info) or info
             done = bool(getattr(env_resp, "done", False))
             messages = self._trim_messages(messages)
+            effective_steps += 1
             if done:
                 break
 
