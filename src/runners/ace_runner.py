@@ -29,7 +29,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..baselines.ace_loops import run_baseline_style
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 from ..common.openai_client import get_client
+from ..rex.config import RexConfig
 from ..rex.experience import promote_trajectories
+from ..rex.memory_quality import consolidate
+from ..rex.memory_store import MemoryStore
+from ..rex.pipeline import promote_records as pipeline_promote_records
+from ..rex.retrieval_logging import aggregate_logs
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -373,6 +378,14 @@ def main() -> int:
     # genuinely no-op runs are excluded.
     promotion = _promote_ace_records(ns, records)
     summary["runtime_memory_promotion"] = promotion
+
+    # Aggregate retrieval logs (best-effort).
+    try:
+        cfg = RexConfig.from_env()
+        summary["retrieval_logs"] = aggregate_logs(cfg.retrieval_log_dir)
+    except Exception as exc:  # noqa: BLE001
+        summary["retrieval_logs"] = {"error": f"{exc.__class__.__name__}: {exc}"}
+
     write_json(os.path.join(ns.output_dir, "metrics.json"), summary)
     print(json.dumps(metrics, indent=2))
     return 0
@@ -416,6 +429,28 @@ def _promote_ace_records(
             allow_test_split=mode == "always",
         )
         manifest["status"] = "ok"
+        # v2 pipeline (ProcessMemoryCard) — non-fatal on failure.
+        try:
+            v2_runtime = (runtime_dir / "v2") if runtime_dir else None
+            v2_manifest = pipeline_promote_records(
+                enriched,
+                domain="ace",
+                runtime_dir=v2_runtime,
+                allow_test_split=mode == "always",
+            )
+            manifest["v2"] = v2_manifest
+        except Exception as exc:  # noqa: BLE001
+            manifest["v2_error"] = f"{exc.__class__.__name__}: {exc}"
+        # Memory consolidation pass over the v2 ACE store.
+        try:
+            cfg = RexConfig.from_env()
+            v2_runtime_dir = (runtime_dir / "v2") if runtime_dir else cfg.runtime_dir
+            store = MemoryStore(seed_dir=cfg.bank_dir, runtime_dir=v2_runtime_dir, config=cfg)
+            cards = store.load_runtime("ace")
+            if cards:
+                manifest["consolidation"] = consolidate(cards, config=cfg).to_dict()
+        except Exception as exc:  # noqa: BLE001
+            manifest["consolidation_error"] = f"{exc.__class__.__name__}: {exc}"
         return manifest
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}

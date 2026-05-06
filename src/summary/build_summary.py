@@ -29,6 +29,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..common.io_utils import read_json, write_json
 
+try:  # The new architecture provides retrieval-log aggregation.
+    from ..rex.retrieval_logging import aggregate_logs as _aggregate_retrieval_logs
+    from ..rex.config import RexConfig as _RexConfig
+    from ..rex.memory_store import MemoryStore as _MemoryStore
+except Exception:  # pragma: no cover - defensive: summary always renders
+    _aggregate_retrieval_logs = None  # type: ignore[assignment]
+    _RexConfig = None  # type: ignore[assignment]
+    _MemoryStore = None  # type: ignore[assignment]
+
 
 SECTIONS: List[Tuple[str, Dict[str, str]]] = [
     ("tau-bench retail", {
@@ -174,6 +183,8 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
         "served_name": served_name,
         "sections": [],
         "deltas": [],
+        "rex_memory": _build_rex_memory_block(outputs_dir),
+        "retrieval_logs": _build_retrieval_logs_block(outputs_dir),
     }
     for label, subdirs in SECTIONS:
         by_cond = {cond: _load(outputs_dir, subdirs[cond]) for cond in CONDITIONS if cond in subdirs}
@@ -213,6 +224,64 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
         }
         summary["deltas"].append(delta)
     return summary
+
+
+def _build_rex_memory_block(outputs_dir: Path) -> Dict[str, Any]:
+    """Snapshot the seed + v2 runtime memory bank sizes."""
+    if _MemoryStore is None or _RexConfig is None:
+        return {}
+    block: Dict[str, Any] = {}
+    try:
+        cfg = _RexConfig.from_env()
+        # Legacy v1 runtime
+        v1_dir = Path(cfg.runtime_dir)
+        block["seed_dir"] = str(cfg.bank_dir)
+        block["runtime_dir"] = str(v1_dir)
+        block["v1_card_counts"] = _count_jsonl_files(v1_dir)
+        block["seed_card_counts"] = _count_jsonl_files(Path(cfg.bank_dir))
+        # v2 ProcessMemoryCard runtime nests under runtime/v2 in the runners.
+        v2_root = v1_dir / "v2"
+        if v2_root.exists():
+            store = _MemoryStore(seed_dir=cfg.bank_dir, runtime_dir=v2_root, config=cfg)
+            block["v2_memory_statistics"] = store.memory_statistics()
+            block["v2_retrieval_statistics"] = store.retrieval_statistics()
+    except Exception as exc:  # noqa: BLE001
+        block["error"] = f"{exc.__class__.__name__}: {exc}"
+    return block
+
+
+def _count_jsonl_files(path: Path) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    if not path.exists():
+        return out
+    for child in sorted(path.iterdir()):
+        if child.is_file() and child.suffix == ".jsonl":
+            n = 0
+            try:
+                with child.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip():
+                            n += 1
+            except OSError:
+                continue
+            out[child.stem] = n
+    return out
+
+
+def _build_retrieval_logs_block(outputs_dir: Path) -> Dict[str, Any]:
+    """Aggregate retrieval logs under outputs/retrieval_logs."""
+    if _aggregate_retrieval_logs is None:
+        return {}
+    candidate = outputs_dir / "retrieval_logs"
+    if not candidate.exists() and _RexConfig is not None:
+        try:
+            candidate = Path(_RexConfig.from_env().retrieval_log_dir)
+        except Exception:
+            return {}
+    try:
+        return _aggregate_retrieval_logs(candidate)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{exc.__class__.__name__}: {exc}"}
 
 
 def render_markdown(summary: Dict[str, Any]) -> str:
@@ -282,6 +351,64 @@ def render_markdown(summary: Dict[str, Any]) -> str:
             f"{rd.get('tool_calls_executed', 0)} | {rd.get('mutating_tool_calls', 0)} | "
             f"{_num(rd.get('avg_cards_loaded'), 1)} | {_num(rd.get('avg_cards_used'), 1)} |"
         )
+    # ----- REx procedural-memory diagnostics ---------------------------
+    rex_memory = summary.get("rex_memory") or {}
+    if rex_memory:
+        lines.append("")
+        lines.append("## REx procedural-memory bank")
+        lines.append("")
+        seed = rex_memory.get("seed_card_counts") or {}
+        v1 = rex_memory.get("v1_card_counts") or {}
+        if seed:
+            lines.append("**Seed bank** (allowed-only support data):")
+            for d, n in sorted(seed.items()):
+                lines.append(f"- `{d}`: {n} cards")
+        if v1:
+            lines.append("")
+            lines.append("**Runtime bank v1** (legacy ExperienceCard JSONL):")
+            for d, n in sorted(v1.items()):
+                lines.append(f"- `{d}`: {n} cards")
+        v2_mem = rex_memory.get("v2_memory_statistics") or {}
+        if v2_mem and v2_mem.get("by_domain"):
+            lines.append("")
+            lines.append("**Runtime bank v2** (ProcessMemoryCard, deduped seed+runtime):")
+            for d, stats in sorted(v2_mem["by_domain"].items()):
+                lines.append(
+                    f"- `{d}`: seed={stats.get('seed', 0)}, "
+                    f"runtime={stats.get('runtime', 0)}, "
+                    f"combined_dedup={stats.get('combined_dedup', 0)}"
+                )
+        v2_use = rex_memory.get("v2_retrieval_statistics") or {}
+        if v2_use and v2_use.get("by_domain"):
+            lines.append("")
+            lines.append("**v2 usage statistics:**")
+            for d, stats in sorted(v2_use["by_domain"].items()):
+                lines.append(
+                    f"- `{d}`: total_uses={stats.get('total_uses', 0)}, "
+                    f"avg_confidence={stats.get('avg_confidence', 0.0):.2f}"
+                )
+
+    retrieval_logs = summary.get("retrieval_logs") or {}
+    totals = retrieval_logs.get("totals") if isinstance(retrieval_logs, dict) else None
+    if totals:
+        lines.append("")
+        lines.append("## Retrieval diagnostics")
+        lines.append("")
+        lines.append(f"- total events logged: {totals.get('events', 0)}")
+        lines.append(f"- avg corpus size at retrieval time: {totals.get('avg_corpus', 0.0):.1f}")
+        lines.append(f"- avg playbook size: {totals.get('avg_playbook_chars', 0.0):.1f} chars")
+        lines.append(f"- unique cards used across runs: {totals.get('unique_card_ids', 0)}")
+        by_file = retrieval_logs.get("by_file") or {}
+        if by_file:
+            lines.append("")
+            lines.append("Per-(benchmark, env, controller) breakdown:")
+            for fname, stats in sorted(by_file.items()):
+                lines.append(
+                    f"- `{fname}`: events={stats.get('events', 0)}, "
+                    f"avg_corpus={stats.get('avg_corpus', 0.0):.1f}, "
+                    f"avg_playbook={stats.get('avg_playbook_chars', 0.0):.1f}"
+                )
+
     lines.append("")
     lines.append("## Notes")
     lines.append("")

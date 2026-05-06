@@ -1,17 +1,28 @@
 """ACEBench loop for REx-RPE.
 
-ACEBench Agent is scored offline against emitted tool calls. The loop therefore
-uses retrieval and startup analysis, but does not block tool calls with mutation
-reflection because no live state is mutated in this driver.
+Same architecture as :mod:`src.rex.agent`: hybrid retrieval, working-state
+queries, tactical playbook synthesis, and per-step retrieval logging.
+ACEBench is offline-scored — there is no live env to mutate — so mutation
+reflection is a no-op here.
 """
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
-from .experience import ExperienceRetriever, load_experience_cards, render_experience_brief
+from .config import RexConfig
+from .experience import (
+    ExperienceRetriever,
+    load_experience_cards,
+    render_experience_brief,
+)
+from .memory_types import from_experience_card
+from .pipeline import refresh_playbook
+from .playbook import synthesize_playbook
+from .retrieval import HybridRetriever, build_query
+from .retrieval_logging import RetrievalLogger
 
 
 def _system_prompt(task: Dict[str, Any], brief: str, startup: str = "") -> str:
@@ -29,8 +40,8 @@ def _system_prompt(task: Dict[str, Any], brief: str, startup: str = "") -> str:
     return "\n".join(parts)
 
 
-def _startup_analysis(client, model: str, user_turn: str, brief: str) -> str:
-    if os.environ.get("REX_STARTUP_ANALYSIS", "1") == "0":
+def _startup_analysis(client, model: str, user_turn: str, brief: str, *, enabled: bool, max_words: int) -> str:
+    if not enabled:
         return ""
     try:
         resp = client.chat.completions.create(
@@ -38,8 +49,8 @@ def _startup_analysis(client, model: str, user_turn: str, brief: str) -> str:
             messages=[{
                 "role": "system",
                 "content": (
-                    "Return <=100 words: intent, first tool, required parameters, and likely API sequence. "
-                    "Do not call tools.\n\n"
+                    f"Return <={max_words} words: intent, first tool, required parameters, "
+                    "and likely API sequence. Do not call tools.\n\n"
                     f"Experience brief:\n{brief}\n\nUser request:\n{user_turn}"
                 ),
             }],
@@ -69,54 +80,22 @@ def _assistant_message_dict(msg: Any) -> Dict[str, Any]:
     return out
 
 
-def _ace_runtime_dir() -> Path:
-    """Resolve the ACE runtime memory directory (env override > default)."""
-    return Path(
-        os.environ.get(
-            "REX_RUNTIME_DIR",
-            str(Path.cwd() / "outputs" / "experience_runtime"),
-        )
-    )
+def _ace_runtime_dir(config: Optional[RexConfig] = None) -> Path:
+    if config:
+        return Path(config.runtime_dir)
+    env_dir = os.environ.get("REX_RUNTIME_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path.cwd() / "outputs" / "experience_runtime"
 
 
-def _ace_bank_dir() -> Path:
-    return Path(
-        os.environ.get(
-            "REX_EXPERIENCE_DIR",
-            str(Path.cwd() / "outputs" / "experience_bank"),
-        )
-    )
-
-
-def _load_ace_cards() -> List[Any]:
-    return load_experience_cards("ace", _ace_bank_dir(), runtime_dir=_ace_runtime_dir())
-
-
-def _tool_brief_cards(tool_specs: Sequence[Dict[str, Any]], user_turn: str) -> List[Any]:
-    cards = _load_ace_cards()
-    return ExperienceRetriever(cards).search(
-        user_turn + " " + " ".join(_tool_names(tool_specs)), k=3,
-    )
-
-
-def _stateful_retrieval_query(
-    user_turn: str,
-    tool_specs: Sequence[Dict[str, Any]],
-    messages: Sequence[Dict[str, Any]],
-) -> str:
-    """Build a retrieval query that incorporates the latest tool result."""
-    parts: List[str] = [user_turn or "", " ".join(_tool_names(tool_specs))]
-    last_tool = ""
-    last_obs = ""
-    for m in messages:
-        if m.get("role") == "tool":
-            last_tool = str(m.get("name") or "")
-            last_obs = str(m.get("content") or "")
-    if last_tool:
-        parts.append(last_tool)
-    if last_obs:
-        parts.append(last_obs[:240])
-    return " ".join(p for p in parts if p)
+def _ace_bank_dir(config: Optional[RexConfig] = None) -> Path:
+    if config:
+        return Path(config.bank_dir)
+    env_dir = os.environ.get("REX_EXPERIENCE_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path.cwd() / "outputs" / "experience_bank"
 
 
 def _tool_names(tool_specs: Sequence[Dict[str, Any]]) -> List[str]:
@@ -137,18 +116,69 @@ def run_rex(
     user_turn: str,
     max_num_steps: int,
     temperature: float,
+    config: Optional[RexConfig] = None,
+    retrieval_logger: Optional[RetrievalLogger] = None,
 ) -> Dict[str, Any]:
-    cards = _load_ace_cards()
-    retriever = ExperienceRetriever(cards)
-    selected = retriever.search(user_turn + " " + " ".join(_tool_names(tool_specs)), k=3)
-    brief = render_experience_brief(selected)
-    startup = _startup_analysis(client, model, user_turn, brief)
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": _system_prompt(task, brief, startup)}]
+    cfg = config or RexConfig.from_env()
+    bank_dir = _ace_bank_dir(cfg)
+    runtime_dir = _ace_runtime_dir(cfg)
+    legacy_cards = load_experience_cards("ace", bank_dir, runtime_dir=runtime_dir)
+    legacy_retriever = ExperienceRetriever(legacy_cards)
+    process_cards = [from_experience_card(c) for c in legacy_cards]
+
+    hybrid: Optional[HybridRetriever]
+    try:
+        hybrid = HybridRetriever(process_cards, config=cfg) if process_cards else None
+    except Exception:
+        hybrid = None
+
+    logger = retrieval_logger or RetrievalLogger(config=cfg)
+
+    if hybrid and hybrid.num_cards:
+        # Use hybrid pipeline for the initial brief.
+        query = build_query(
+            initial_user=user_turn,
+            messages=[],
+            environment="ace",
+            benchmark="ACEBench",
+            controller="rex",
+            step_index=0,
+            top_k=cfg.top_k,
+        )
+        result = hybrid.search(query)
+        playbook = synthesize_playbook(result.cards, config=cfg)
+        brief = playbook.body
+        cards_used_ids: List[str] = result.card_ids()
+        logger.log(
+            benchmark="ACEBench",
+            environment="ace",
+            controller="rex",
+            task_id=str(task.get("id") or task.get("task_id") or "0"),
+            trial=0,
+            step_index=0,
+            query=query,
+            result=result,
+            playbook=playbook,
+        )
+    else:
+        selected = legacy_retriever.search(
+            user_turn + " " + " ".join(_tool_names(tool_specs)), k=cfg.top_k,
+        )
+        brief = render_experience_brief(selected)
+        cards_used_ids = [c.card_id for c in selected]
+
+    startup = _startup_analysis(
+        client, model, user_turn, brief,
+        enabled=bool(cfg.startup_analysis),
+        max_words=int(cfg.startup_analysis_max_words),
+    )
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": _system_prompt(task, brief, startup)},
+    ]
     if user_turn:
         messages.append({"role": "user", "content": user_turn})
 
-    cards_used_ids: List[str] = [c.card_id for c in selected]
-    refresh_every = int(os.environ.get("REX_RETRIEVAL_REFRESH_EVERY", "2") or 0)
+    refresh_every = int(cfg.retrieval_refresh_every or 0)
     refreshes = 0
 
     tool_calls_made: List[str] = []
@@ -156,22 +186,33 @@ def run_rex(
     error = ""
     try:
         for step_idx in range(max_num_steps):
-            # Stateful re-retrieval: refresh the brief based on latest tool obs.
+            # Stateful re-retrieval mid-trajectory.
             if (
                 refresh_every
                 and step_idx > 0
                 and step_idx % refresh_every == 0
+                and hybrid
+                and hybrid.num_cards
             ):
-                query = _stateful_retrieval_query(user_turn, tool_specs, messages)
-                new_selected = retriever.search(query, k=3)
+                playbook, result, _state = refresh_playbook(
+                    retriever=hybrid,
+                    initial_user=user_turn,
+                    messages=messages,
+                    environment="ace",
+                    benchmark="ACEBench",
+                    controller="rex",
+                    step_index=step_idx,
+                    config=cfg,
+                    logger=logger,
+                    task_id=str(task.get("id") or task.get("task_id") or "0"),
+                    trial=0,
+                )
                 refreshes += 1
-                for c in new_selected:
+                for c in result.cards:
                     if c.card_id not in cards_used_ids:
                         cards_used_ids.append(c.card_id)
                 if messages and messages[0].get("role") == "system":
-                    messages[0]["content"] = _system_prompt(
-                        task, render_experience_brief(new_selected), startup,
-                    )
+                    messages[0]["content"] = _system_prompt(task, playbook.body, startup)
 
             resp = client.chat.completions.create(
                 model=model,
@@ -207,10 +248,12 @@ def run_rex(
         "messages": messages,
         "tool_calls_made": tool_calls_made,
         "rex_stats": {
-            "cards_loaded": len(cards),
+            "cards_loaded": len(legacy_cards),
             "cards_used": cards_used_ids,
             "startup_analysis": bool(startup),
             "retrieval_refreshes": refreshes,
+            "retrieval_backend": "hybrid" if hybrid else "legacy",
+            "playbook_chars": len(brief),
         },
     }
 
