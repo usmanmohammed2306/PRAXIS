@@ -30,13 +30,24 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _infer_domain_from_path(path: Path) -> str | None:
-    """Extract domain from path like outputs/tau_airline_rex or outputs/ace_retail_react."""
+    """Extract domain from path like outputs/tau_airline_rex or outputs/ace_retail_react.
+
+    Expected naming conventions (set by run_project.sh):
+      * tau_<env>_<controller>  → domain = tau_<env>
+        Examples: tau_airline_baseline, tau_retail_rex
+      * ace_*  → domain = ace
+        Examples: ace_en, ace_results
+
+    Returns None if the path doesn't match known patterns.
+    """
     name = path.name
     if name.startswith("tau_"):
         parts = name.split("_")
         if len(parts) >= 3:
             env = parts[1]  # e.g., "airline", "retail"
             return f"tau_{env}"
+        # Path starts with tau_ but lacks the _controller suffix
+        return None
     if name.startswith("ace_"):
         return "ace"
     return None
