@@ -148,7 +148,15 @@ class WorkingMemory:
     # affirmative user reply confirms exactly that signature.
     pending_commit_signature: str = ""
     pending_commit_summary: str = ""
+    pending_commit_action: Dict[str, Any] = field(default_factory=dict)
     confirmed_commit_signature: str = ""
+    # Last successful mutation and observation, kept for evidence-aware
+    # closure.  A generic "done" message is often insufficient for tau-bench:
+    # the user simulator may ask whether the chosen variants satisfy the
+    # original constraints, and the controller should answer from evidence.
+    last_write_action: Dict[str, Any] = field(default_factory=dict)
+    last_write_observation: str = ""
+    post_write_followup_answered: bool = False
     # Soft goal field used by the router.  This compact state tracks momentum,
     # friction, active task frame, and tiny live hypotheses without turning
     # CARGO into a planner or tree search.
@@ -379,7 +387,12 @@ class WorkingMemory:
     def phase_locked(self, phase: str) -> bool:
         return bool(self.phase_locks.get(str(phase or "").strip().lower()))
 
-    def stage_commit_confirmation(self, signature: str, summary: str = "") -> None:
+    def stage_commit_confirmation(
+        self,
+        signature: str,
+        summary: str = "",
+        action: Optional[Dict[str, Any]] = None,
+    ) -> None:
         sig = str(signature or "").strip()
         if not sig:
             return
@@ -387,6 +400,8 @@ class WorkingMemory:
             self.pending_commit_signature = sig
             self.confirmed_commit_signature = ""
         self.pending_commit_summary = str(summary or "")[:400]
+        if action:
+            self.pending_commit_action = dict(action)
 
     def commit_confirmed(self, signature: str) -> bool:
         sig = str(signature or "").strip()

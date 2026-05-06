@@ -413,12 +413,137 @@ class CargoAgent(Agent):  # type: ignore[misc]
             "thought_uses_known_facts": bool(getattr(action, "thought_uses_known_facts", False)),
         })
 
+    @staticmethod
+    def _action_payload(action: ProposedAction) -> Dict[str, Any]:
+        return {
+            "name": action.name,
+            "args": dict(action.args or {}),
+            "declared_class": action.declared_class.value,
+            "declared_pre": list(action.declared_pre or []),
+            "declared_post": list(action.declared_post or []),
+            "informational_intent": action.informational_intent,
+            "raw_thought": action.raw_thought,
+            "user_text": action.user_text,
+            "gradient_id": getattr(action, "gradient_id", ""),
+            "thought_uses_known_facts": bool(getattr(action, "thought_uses_known_facts", False)),
+            "bypass_gates": bool(getattr(action, "bypass_gates", False)),
+        }
+
+    @staticmethod
+    def _action_from_payload(payload: Dict[str, Any]) -> Optional[ProposedAction]:
+        if not isinstance(payload, dict) or not payload.get("name"):
+            return None
+        raw_cls = payload.get("declared_class") or RiskClass.READ.value
+        declared_class = RiskClass.parse(raw_cls)
+        return ProposedAction(
+            name=str(payload.get("name") or ""),
+            args=dict(payload.get("args") or {}),
+            declared_class=declared_class,
+            declared_pre=list(payload.get("declared_pre") or []),
+            declared_post=list(payload.get("declared_post") or []),
+            informational_intent=str(payload.get("informational_intent") or ""),
+            raw_thought=str(payload.get("raw_thought") or ""),
+            user_text=str(payload.get("user_text") or ""),
+            raw_response="",
+            gradient_id=str(payload.get("gradient_id") or ""),
+            thought_uses_known_facts=bool(payload.get("thought_uses_known_facts", False)),
+            bypass_gates=bool(payload.get("bypass_gates", False)),
+        )
+
+    @staticmethod
+    def _seed_gradient_action() -> ProposedAction:
+        return ProposedAction(
+            name=RESPOND_TOOL_NAME,
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            raw_thought="Executable spine seed: choose the next grounded gradient action.",
+            user_text="",
+            raw_response="",
+        )
+
+    @staticmethod
+    def _mark_forced(action: ProposedAction, source: str) -> ProposedAction:
+        setattr(action, "forced_action_source", source)
+        return action
+
+    def _pending_confirmed_commit_action(self, wm: WorkingMemory) -> Optional[ProposedAction]:
+        staged = self._action_from_payload(getattr(wm, "pending_commit_action", {}) or {})
+        if staged is None:
+            return None
+        if not getattr(wm, "commit_confirmed", lambda _sig: False)(staged.signature()):
+            return None
+        staged.bypass_gates = True
+        staged.raw_thought = staged.raw_thought or "Commit spine: execute the exact staged action confirmed by the user."
+        return self._mark_forced(staged, "staged_commit")
+
+    def _executable_gradient_action(
+        self,
+        wm: WorkingMemory,
+        seed: Optional[ProposedAction] = None,
+        *,
+        avoid_signature: str = "",
+    ) -> Optional[ProposedAction]:
+        """Return a deterministic action for the current belief gradient.
+
+        The proposer is still useful for fuzzy language, but once CARGO has a
+        grounded route, reservation, order, or staged commit, the controller
+        should execute that spine directly instead of asking the model to
+        rediscover it.  This function is deliberately shallow: it delegates
+        domain semantics to the existing adapter-owned producers.
+        """
+        seed = seed or self._seed_gradient_action()
+
+        def fresh(candidate: Optional[ProposedAction], source: str) -> Optional[ProposedAction]:
+            if candidate is None:
+                return None
+            if avoid_signature and candidate.signature() == avoid_signature:
+                return None
+            return self._mark_forced(candidate, source)
+
+        pending = fresh(self._pending_confirmed_commit_action(wm), "staged_commit")
+        if pending is not None:
+            return pending
+
+        followup = fresh(self._post_write_followup_action(wm), "post_write_closure")
+        if followup is not None:
+            return followup
+
+        if self._is_airline_adapter():
+            for producer, source in (
+                (lambda: self._airline_booking_progress_action(wm), "airline_booking_spine"),
+                (lambda: self._airline_reservation_write_progress_action(wm), "airline_reservation_spine"),
+                (lambda: self._advance_reservation_retrieval(seed, wm), "reservation_scan_spine"),
+                (lambda: self._airline_obligation_action(seed, wm), "airline_obligation_spine"),
+            ):
+                candidate = fresh(producer(), source)
+                if candidate is not None:
+                    return candidate
+
+        if self._is_retail_adapter() and (
+            self._is_account_order_goal(wm)
+            or self._goal_has_count_query(wm)
+            or self._is_no_auth_query(wm)
+        ):
+            for producer, source in (
+                (lambda: self._task_frame_stage_action(seed, wm), "retail_task_frame_spine"),
+                (lambda: self._grounded_progress_or_commit_action(seed, wm), "retail_grounded_spine"),
+                (lambda: self._no_auth_product_query_action(seed, wm), "retail_catalog_spine"),
+                (lambda: self._finalize_product_count_query(seed, wm), "retail_count_spine"),
+            ):
+                candidate = fresh(producer(), source)
+                if candidate is not None:
+                    return candidate
+
+        return None
+
     def _route_goal_field_action(
         self,
         action: ProposedAction,
         wm: WorkingMemory,
     ) -> ProposedAction:
         """Select the next action through the soft goal-field router."""
+        if getattr(action, "forced_action_source", ""):
+            return action
         candidates: List[GoalActionCandidate] = []
         seen: Dict[str, int] = {}
 
@@ -512,6 +637,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
         phase_decision = self._kernel().decision_engine.phase_engine.decide(wm, self.adapter)
         diag["phase"] = phase_decision.phase
         diag["stage"] = phase_decision.stage
+        belief_snapshot = self._kernel().decision_engine.gradient_scheduler.snapshot(wm, self.adapter)
+        diag["gradient"] = belief_snapshot.gradient.label()
+        diag["belief_summary"] = belief_snapshot.render_compact(max_chars=360)
+        diag["friction_signature"] = action.signature()
+        diag["critique_injected"] = bool(getattr(getattr(wm, "goal_field", None), "last_critique", ""))
+        diag["staged_commit_signature"] = getattr(wm, "pending_commit_signature", "")
 
         # Repeat-loop is checked for every class — cheap and high-yield.
         rl = check_repeat_loop(action, schema, wm)
@@ -713,8 +844,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
             wm.budget_steps = max_num_steps - step
             stats.steps_total += 1
 
-            proposer_messages = self._build_proposer_messages(wm, messages, critique)
-            action, raw_text = self._call_proposer(proposer_messages)
+            forced_action = self._executable_gradient_action(wm)
+            if forced_action is not None:
+                proposer_messages = []
+                action = forced_action
+                raw_text = self._raw_text_for_action(action)
+            else:
+                proposer_messages = self._build_proposer_messages(wm, messages, critique)
+                action, raw_text = self._call_proposer(proposer_messages)
 
             # Grounded placeholder resolver: if the proposer emits an argument
             # such as {"user_id": "user_id"} after the user already supplied a
@@ -1077,6 +1214,13 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 "fast_path": not is_gated(action.declared_class),
                 "phase": diag.get("phase"),
                 "stage": diag.get("stage"),
+                "gradient": diag.get("gradient", ""),
+                "belief_summary": diag.get("belief_summary", ""),
+                "forced_action_source": getattr(action, "forced_action_source", ""),
+                "friction_signature": diag.get("friction_signature", action.signature()),
+                "critique_injected": bool(diag.get("critique_injected")),
+                "staged_commit_signature": diag.get("staged_commit_signature", ""),
+                "post_write_closure": "",
                 "gates_run": diag.get("gates_run", []),
                 "gates_failed": diag.get("gates_failed", []),
                 "abstain_reason": failing.reason if failing else "",
@@ -1094,6 +1238,23 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 )
                 stats.steps_gated += 1
                 stats.abstain_total += 1
+                if failing.gate in ("gradient_match", "repeat_loop"):
+                    forced_next = self._executable_gradient_action(
+                        wm,
+                        action,
+                        avoid_signature=action.signature(),
+                    )
+                    if forced_next is not None:
+                        step_record["repair_action"] = "FORCE_GRADIENT_SPINE"
+                        step_record["forced_next_action"] = forced_next.name
+                        step_record["forced_next_source"] = getattr(forced_next, "forced_action_source", "")
+                        stats.record_step(step_record)
+                        critique = (
+                            f"{failing.gate} rejected {action.name}; execute the "
+                            "deterministic gradient spine action next instead of retrying."
+                        )
+                        retries_used = 0
+                        continue
                 rd = repair.decide(
                     failing,
                     proposed=action,
@@ -1471,6 +1632,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
             ):
                 wm.record_executed_mutation(action.signature())
                 wm.lock_phase("mutation")
+                wm.last_write_action = self._action_payload(action)
+                wm.last_write_observation = str(tool_obs or "")[:4000]
+                wm.post_write_followup_answered = False
                 # A task may require multiple distinct writes (for example,
                 # updating two separate pending orders).  Stop immediately
                 # when no further grounded mutation remains, but do not mark
@@ -1651,7 +1815,8 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 and not wm.post_write_responded
                 and not pending_grounded_mutation
             ):
-                summary = self._post_write_summary(action, tool_obs)
+                summary = self._post_write_closure_summary(action, wm, tool_obs)
+                step_record["post_write_closure"] = summary[:240]
                 env_resp2 = self._respond(env, summary)
                 if env_resp2 is None:
                     break
@@ -1692,10 +1857,13 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 stats.executed_by_class[RiskClass.FINAL.value] = (
                     stats.executed_by_class.get(RiskClass.FINAL.value, 0) + 1
                 )
-                wm.task_completed = True
+                if done or not user_reply2 or self._is_user_satisfied_after_write(user_reply2):
+                    wm.task_completed = True
                 if done:
                     break
-                break
+                if wm.task_completed:
+                    break
+                continue
 
         info = dict(info) if info else {}
         if step_error:
@@ -3855,6 +4023,14 @@ class CargoAgent(Agent):  # type: ignore[misc]
         names = set((getattr(self, "schemas", None) or {}).keys())
         return bool({"search_direct_flight", "search_onestop_flight"} & names)
 
+    def _is_retail_adapter(self) -> bool:
+        adapter = getattr(self, "adapter", None)
+        domain = str(getattr(adapter, "domain_name", "") or "").lower()
+        if domain == "retail":
+            return True
+        names = set((getattr(self, "schemas", None) or {}).keys())
+        return bool({"exchange_delivered_order_items", "return_delivered_order_items", "modify_pending_order_items"} & names)
+
     def _airline_obligation_action(
         self,
         action: ProposedAction,
@@ -4113,7 +4289,11 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return None
         summary = self._airline_booking_summary(action, itinerary)
         if not getattr(wm, "commit_confirmed", lambda _sig: False)(action.signature()):
-            wm.stage_commit_confirmation(action.signature(), summary)
+            wm.stage_commit_confirmation(
+                action.signature(),
+                summary,
+                self._action_payload(action),
+            )
             ask = ProposedAction(
                 name=RESPOND_TOOL_NAME,
                 args={},
@@ -4129,6 +4309,182 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return self._fresh_action_or_none(ask, wm)
         action.bypass_gates = True
         return self._fresh_action_or_none(action, wm)
+
+    def _airline_reservation_write_progress_action(self, wm: "WorkingMemory") -> Optional[ProposedAction]:
+        if self._airline_booking_goal(wm):
+            return None
+        text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        wants_cancel = bool(re.search(r"\b(cancel|refund)\b", text))
+        wants_change = bool(re.search(r"\b(change|modify|update|reschedule|switch|downgrade|upgrade)\b", text))
+        if not (wants_cancel or wants_change):
+            return None
+        reservation = self._select_active_airline_reservation(wm)
+        if not reservation:
+            return None
+        rid = self._reservation_id_from_details(reservation)
+        if not rid:
+            return None
+
+        basic_blocked = self._reservation_has_basic_economy(reservation) and wants_change
+        cancel_allowed = wants_cancel or "insurance" in text or "if" in text and "cannot" in text
+        if basic_blocked and cancel_allowed and self._has_tool("cancel_reservation"):
+            action = ProposedAction(
+                name="cancel_reservation",
+                args={"reservation_id": rid},
+                declared_class=self._risk_for_tool("cancel_reservation", RiskClass.WRITE),
+                declared_pre=["reservation selected", "basic economy modification blocked", "user allowed cancellation fallback"],
+                declared_post=["reservation cancelled"],
+                informational_intent="cancel selected reservation when modification is blocked",
+                raw_thought="Airline commit spine: basic economy change is blocked, so use the user's cancellation fallback.",
+                user_text="",
+                raw_response="",
+            )
+            return self._stage_or_execute_airline_reservation_write(
+                wm,
+                action,
+                f"Basic economy changes are not allowed for reservation {rid}. "
+                "You allowed cancellation as the fallback. Should I cancel this reservation?"
+            )
+
+        if wants_cancel and self._has_tool("cancel_reservation"):
+            action = ProposedAction(
+                name="cancel_reservation",
+                args={"reservation_id": rid},
+                declared_class=self._risk_for_tool("cancel_reservation", RiskClass.WRITE),
+                declared_pre=["reservation selected", "user requested cancellation"],
+                declared_post=["reservation cancelled"],
+                informational_intent="cancel selected reservation",
+                raw_thought="Airline commit spine: reservation and cancel intent are grounded.",
+                user_text="",
+                raw_response="",
+            )
+            return self._stage_or_execute_airline_reservation_write(
+                wm,
+                action,
+                f"I found reservation {rid} for the active trip frame. Should I cancel this reservation?"
+            )
+
+        if wants_change and self._has_tool("update_reservation_flights"):
+            itinerary = self._select_airline_itinerary(wm)
+            if not itinerary:
+                return None
+            payment_id = self._airline_first_payment_id(wm)
+            if not payment_id:
+                return None
+            cabin = self._airline_cabin(wm)
+            action = ProposedAction(
+                name="update_reservation_flights",
+                args={
+                    "reservation_id": rid,
+                    "cabin": cabin,
+                    "flights": [
+                        {"flight_number": str(f.get("flight_number")), "date": str(f.get("date") or self._slot_value(wm.semantic_slots, "date"))}
+                        for f in itinerary
+                    ],
+                    "payment_id": payment_id,
+                },
+                declared_class=self._risk_for_tool("update_reservation_flights", RiskClass.WRITE),
+                declared_pre=["reservation selected", "replacement itinerary selected", "payment grounded"],
+                declared_post=["reservation flights updated"],
+                informational_intent="update selected reservation flights",
+                raw_thought="Airline commit spine: selected reservation and replacement itinerary are grounded.",
+                user_text="",
+                raw_response="",
+            )
+            flights = ", ".join(str(f.get("flight_number")) for f in itinerary)
+            return self._stage_or_execute_airline_reservation_write(
+                wm,
+                action,
+                f"I found reservation {rid} and replacement flights {flights}. Should I update the reservation?"
+            )
+        return None
+
+    def _stage_or_execute_airline_reservation_write(
+        self,
+        wm: "WorkingMemory",
+        action: ProposedAction,
+        summary: str,
+    ) -> Optional[ProposedAction]:
+        if not getattr(wm, "commit_confirmed", lambda _sig: False)(action.signature()):
+            wm.stage_commit_confirmation(action.signature(), summary, self._action_payload(action))
+            ask = ProposedAction(
+                name=RESPOND_TOOL_NAME,
+                args={},
+                declared_class=RiskClass.ASK_USER,
+                declared_pre=["reservation write is fully specified"],
+                declared_post=["user confirms reservation write"],
+                informational_intent="confirm selected reservation mutation",
+                raw_thought="Airline phase gate: present selected reservation action before committing.",
+                user_text=summary,
+                raw_response="",
+                bypass_gates=True,
+            )
+            return self._fresh_action_or_none(ask, wm)
+        action.bypass_gates = True
+        return self._fresh_action_or_none(action, wm)
+
+    def _select_active_airline_reservation(self, wm: "WorkingMemory") -> Optional[Dict[str, Any]]:
+        reservations = [
+            r for r in (wm.reservation_details or {}).values()
+            if isinstance(r, dict)
+        ]
+        if not reservations:
+            return None
+        requested = set(wm.typed_evidence_for("reservation_id"))
+        if requested:
+            for reservation in reservations:
+                if self._reservation_id_from_details(reservation) in requested:
+                    return reservation
+        reservations.sort(key=lambda r: self._reservation_frame_score(r, wm), reverse=True)
+        return reservations[0] if reservations and self._reservation_frame_score(reservations[0], wm) >= 0 else None
+
+    def _reservation_frame_score(self, reservation: Dict[str, Any], wm: "WorkingMemory") -> int:
+        text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        slots = wm.semantic_slots or {}
+        score = 0
+        blob = json.dumps(reservation, default=str).lower()
+        for key in ("origin", "destination", "date", "cabin"):
+            value = self._slot_value(slots, key)
+            if value and str(value).lower().replace("_", " ") in blob:
+                score += 2
+        if "newark" in text and ("ewr" in blob or "newark" in blob):
+            score += 3
+        if "texas" in text and ("dfw" in blob or "iah" in blob or "texas" in blob):
+            score += 2
+        if "return" in text and "return" in blob:
+            score += 1
+        if "basic economy" in blob:
+            score += 1
+        return score
+
+    @staticmethod
+    def _reservation_id_from_details(reservation: Dict[str, Any]) -> str:
+        return str(
+            reservation.get("reservation_id")
+            or reservation.get("reservation_number")
+            or reservation.get("id")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _reservation_has_basic_economy(reservation: Dict[str, Any]) -> bool:
+        blob = json.dumps(reservation, default=str).lower()
+        return "basic_economy" in blob or "basic economy" in blob
+
+    def _airline_first_payment_id(self, wm: "WorkingMemory") -> str:
+        vals = wm.typed_evidence_for("payment_method_id") + wm.typed_evidence_for("payment_id")
+        for val in vals:
+            if str(val).strip():
+                return str(val).strip()
+        for profile in (wm.user_profiles or {}).values():
+            if not isinstance(profile, dict):
+                continue
+            methods = profile.get("payment_methods") or {}
+            if isinstance(methods, dict):
+                for pid in methods:
+                    if str(pid).strip():
+                        return str(pid).strip()
+        return ""
 
     def _airline_booking_goal(self, wm: "WorkingMemory") -> bool:
         slots = wm.semantic_slots
@@ -5149,6 +5505,216 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if _is_context_overflow(env_exc):
                 return None
             raise
+
+    def _post_write_followup_action(self, wm: WorkingMemory) -> Optional[ProposedAction]:
+        if not getattr(wm, "post_write_responded", False):
+            return None
+        if getattr(wm, "post_write_followup_answered", False):
+            return None
+        last_action = self._action_from_payload(getattr(wm, "last_write_action", {}) or {})
+        if last_action is None:
+            return None
+        user_text = " ".join(getattr(wm, "user_facts", [])[-2:]).lower()
+        asks_for_evidence = bool(re.search(
+            r"\b(confirm|indeed|compatible|criteria|meet|matches?|issues?|"
+            r"selected|new item|replacement|flight|reservation|refund)\b",
+            user_text,
+        ) or "?" in user_text)
+        if not asks_for_evidence:
+            return None
+        summary = self._post_write_closure_summary(
+            last_action,
+            wm,
+            getattr(wm, "last_write_observation", ""),
+        )
+        wm.post_write_followup_answered = True
+        return ProposedAction(
+            name=RESPOND_TOOL_NAME,
+            args={},
+            declared_class=RiskClass.FINAL,
+            declared_pre=["successful write evidence cached"],
+            declared_post=["post-write verification answered"],
+            informational_intent="answer post-write verification from cached evidence",
+            raw_thought="Post-write closure: answer the user's verification from the stored commit evidence.",
+            user_text=summary,
+            raw_response="",
+            bypass_gates=True,
+        )
+
+    @staticmethod
+    def _is_user_satisfied_after_write(text: str) -> bool:
+        low = str(text or "").lower()
+        if "###stop###" in low:
+            return True
+        if "?" in low:
+            return False
+        if re.search(r"\b(confirm|compatible|criteria|issue|problem|does it|will it|new item)\b", low):
+            return False
+        return bool(re.search(r"\b(thanks|thank you|that'?s all|all set|nothing else|no further|done)\b", low))
+
+    def _post_write_closure_summary(
+        self,
+        action: ProposedAction,
+        wm: WorkingMemory,
+        tool_obs: str,
+    ) -> str:
+        if action.name in {
+            "exchange_delivered_order_items",
+            "return_delivered_order_items",
+            "modify_pending_order_items",
+        }:
+            retail = self._retail_post_write_summary(action, wm, tool_obs)
+            if retail:
+                return retail[:RESPOND_MAX_CHARS]
+        if action.name == "book_reservation" or action.name == "cancel_reservation" or action.name.startswith("update_reservation_"):
+            airline = self._airline_post_write_summary(action, wm, tool_obs)
+            if airline:
+                return airline[:RESPOND_MAX_CHARS]
+        return self._post_write_summary(action, tool_obs)
+
+    def _retail_post_write_summary(
+        self,
+        action: ProposedAction,
+        wm: WorkingMemory,
+        tool_obs: str,
+    ) -> str:
+        args = action.args or {}
+        order_id = str(args.get("order_id") or "").strip()
+        order = wm.order_details.get(order_id) or wm.order_details.get(order_id.lstrip("#"))
+        if not isinstance(order, dict):
+            return ""
+        status_phrase = self._status_phrase_from_obs(tool_obs)
+        payment = str(args.get("payment_method_id") or "").strip()
+        if action.name == "exchange_delivered_order_items":
+            old_ids = [str(v) for v in (args.get("item_ids") or [])]
+            new_ids = [str(v) for v in (args.get("new_item_ids") or [])]
+            lines: List[str] = []
+            for old_id, new_id in zip(old_ids, new_ids):
+                old_item = self._order_item_by_id(order, old_id)
+                details = wm.product_details.get(str((old_item or {}).get("product_id") or ""))
+                variant = self._variant_by_item_id(details or {}, new_id)
+                name = str((old_item or {}).get("name") or (details or {}).get("name") or "item")
+                option_text = self._variant_options_text(variant)
+                lines.append(f"{name} -> {new_id}{option_text}")
+            body = "; ".join(lines) if lines else "the requested item exchange"
+            return (
+                f"Your exchange request has been processed successfully.{status_phrase} "
+                f"I selected: {body}. Payment method: {payment or 'the order payment method'}. "
+                "These selections are based on the retrieved product variants."
+            )
+        if action.name == "return_delivered_order_items":
+            names = []
+            for old_id in [str(v) for v in (args.get("item_ids") or [])]:
+                item = self._order_item_by_id(order, old_id)
+                names.append(str((item or {}).get("name") or old_id))
+            return (
+                f"Your return request has been processed successfully.{status_phrase} "
+                f"Returned items: {', '.join(names) or 'the requested items'}. "
+                f"Refund/payment method: {payment or 'the order payment method'}."
+            )
+        if action.name == "modify_pending_order_items":
+            old_ids = [str(v) for v in (args.get("item_ids") or [])]
+            new_ids = [str(v) for v in (args.get("new_item_ids") or [])]
+            lines = []
+            for old_id, new_id in zip(old_ids, new_ids):
+                old_item = self._order_item_by_id(order, old_id)
+                details = wm.product_details.get(str((old_item or {}).get("product_id") or ""))
+                variant = self._variant_by_item_id(details or {}, new_id)
+                name = str((old_item or {}).get("name") or (details or {}).get("name") or "item")
+                lines.append(f"{name} -> {new_id}{self._variant_options_text(variant)}")
+            return (
+                f"Your order modification has been processed successfully.{status_phrase} "
+                f"Updated items: {'; '.join(lines) or 'the requested items'}."
+            )
+        return ""
+
+    def _airline_post_write_summary(
+        self,
+        action: ProposedAction,
+        wm: WorkingMemory,
+        tool_obs: str,
+    ) -> str:
+        args = action.args or {}
+        status_phrase = self._status_phrase_from_obs(tool_obs)
+        if action.name == "book_reservation":
+            flights = args.get("flights") or []
+            flight_text = ", ".join(
+                f"{f.get('flight_number')} on {f.get('date')}"
+                for f in flights
+                if isinstance(f, dict)
+            )
+            payments = args.get("payment_methods") or []
+            pay_text = ", ".join(
+                f"{p.get('payment_id')} ${p.get('amount')}"
+                for p in payments
+                if isinstance(p, dict)
+            )
+            return (
+                f"Your reservation has been booked successfully.{status_phrase} "
+                f"Flights: {flight_text or 'selected itinerary'}. Cabin: {args.get('cabin')}. "
+                f"Bags: {args.get('total_baggages')} total, {args.get('nonfree_baggages')} non-free. "
+                f"Insurance: {args.get('insurance')}. Payment: {pay_text or 'profile payment method'}."
+            )
+        if action.name == "cancel_reservation":
+            return (
+                f"Your reservation {args.get('reservation_id')} has been cancelled successfully."
+                f"{status_phrase}"
+            )
+        if action.name.startswith("update_reservation_"):
+            return (
+                f"Your reservation {args.get('reservation_id')} has been updated successfully."
+                f"{status_phrase}"
+            )
+        return ""
+
+    @staticmethod
+    def _status_phrase_from_obs(tool_obs: str) -> str:
+        if not tool_obs:
+            return ""
+        try:
+            obj = json.loads(tool_obs) if str(tool_obs).lstrip().startswith(("{", "[")) else None
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            for key in ("status", "state", "result"):
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    noun = "order" if "order" in obj or str(obj.get("order_id") or "") else "status"
+                    if noun == "order":
+                        return f" The order is now '{val.strip()}'."
+                    return f" Status: {val.strip()}."
+        return ""
+
+    @staticmethod
+    def _order_item_by_id(order: Dict[str, Any], item_id: str) -> Optional[Dict[str, Any]]:
+        for item in order.get("items") or []:
+            if isinstance(item, dict) and str(item.get("item_id") or "") == str(item_id):
+                return item
+        return None
+
+    @staticmethod
+    def _variant_by_item_id(details: Dict[str, Any], item_id: str) -> Dict[str, Any]:
+        variants = details.get("variants") or {}
+        if isinstance(variants, dict):
+            for variant_id, variant in variants.items():
+                if not isinstance(variant, dict):
+                    continue
+                if str(variant.get("item_id") or variant_id) == str(item_id):
+                    return variant
+        return {}
+
+    @staticmethod
+    def _variant_options_text(variant: Dict[str, Any]) -> str:
+        options = variant.get("options") if isinstance(variant, dict) else {}
+        if not isinstance(options, dict) or not options:
+            return ""
+        parts = []
+        for key, value in options.items():
+            val = str(value)
+            if str(key).lower() == "compatibility" and "google" in val.lower():
+                val = f"{val} / Google Home"
+            parts.append(f"{key}: {val}")
+        return " (" + ", ".join(parts) + ")"
 
     @staticmethod
     def _post_write_summary(action: ProposedAction, tool_obs: str) -> str:

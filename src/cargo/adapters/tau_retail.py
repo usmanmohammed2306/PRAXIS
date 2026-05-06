@@ -112,7 +112,6 @@ class TauRetailAdapter(BaseCargoAdapter):
             selection.ok
             and selection.candidate is not None
             and prefs
-            and selection.fallback_used is None
             and _requires_exact_or_skip(goal)
             and not _matches_all_preferences(selection.candidate.attributes, prefs)
         ):
