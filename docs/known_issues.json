@@ -856,6 +856,17 @@
         "test_v3_latest_respond_schema_has_no_required_content_arg"
       ],
       "status": "verified"
+    },
+    {
+      "id": "cargo_n_v3_forced_action_queue_airline_recovery",
+      "invariant": "Runs 66/67 show the latest remaining issue is airline recovery, not retail: after a rejected generic ask, the deterministic spine action must be queued and executed before the next proposer call; forced confirmation asks must not be blocked as repeated questions; booking/change tasks without user_id must ask identity before search; refund-method wording during downgrade must not imply cancellation.",
+      "tests": [
+        "test_v3_latest_profile_generic_failure_queues_reservation_scan",
+        "test_v3_latest_forced_confirmation_bypasses_repeated_ask_state_gate",
+        "test_v3_latest_airline_booking_without_identity_asks_before_search",
+        "test_v3_latest_airline_refund_method_does_not_mean_cancel_when_downgrading"
+      ],
+      "status": "verified"
     }
   ]
 }

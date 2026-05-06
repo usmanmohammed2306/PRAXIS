@@ -108,6 +108,13 @@ class WorkingMemory:
     # prevent state loss after large observations evict prompt-facing db_facts.
     user_profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     reservation_details: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Deterministic recovery queue.  When a gate rejects a model action and
+    # the executable spine already knows the next grounded action, store it
+    # here so the next loop executes it directly instead of merely asking the
+    # model to comply with a critique.  This is intentionally single-slot:
+    # each forced action must earn fresh state before another one is queued.
+    queued_forced_action: Dict[str, Any] = field(default_factory=dict)
+    queued_forced_source: str = ""
     # Track the last respond/FINAL message we emitted so the controller can
     # detect a "same FINAL on every step" infinite loop and break out.
     last_final_text: str = ""

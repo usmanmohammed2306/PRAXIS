@@ -427,6 +427,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             "gradient_id": getattr(action, "gradient_id", ""),
             "thought_uses_known_facts": bool(getattr(action, "thought_uses_known_facts", False)),
             "bypass_gates": bool(getattr(action, "bypass_gates", False)),
+            "forced_action_source": getattr(action, "forced_action_source", ""),
         }
 
     @staticmethod
@@ -435,7 +436,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return None
         raw_cls = payload.get("declared_class") or RiskClass.READ.value
         declared_class = RiskClass.parse(raw_cls)
-        return ProposedAction(
+        action = ProposedAction(
             name=str(payload.get("name") or ""),
             args=dict(payload.get("args") or {}),
             declared_class=declared_class,
@@ -449,6 +450,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
             thought_uses_known_facts=bool(payload.get("thought_uses_known_facts", False)),
             bypass_gates=bool(payload.get("bypass_gates", False)),
         )
+        source = str(payload.get("forced_action_source") or "")
+        if source:
+            setattr(action, "forced_action_source", source)
+        return action
 
     @staticmethod
     def _seed_gradient_action() -> ProposedAction:
@@ -465,6 +470,22 @@ class CargoAgent(Agent):  # type: ignore[misc]
     def _mark_forced(action: ProposedAction, source: str) -> ProposedAction:
         setattr(action, "forced_action_source", source)
         return action
+
+    def _queue_forced_action(self, wm: WorkingMemory, action: ProposedAction) -> None:
+        wm.queued_forced_action = self._action_payload(action)
+        wm.queued_forced_source = str(getattr(action, "forced_action_source", "") or "executable_spine")
+
+    def _pop_queued_forced_action(self, wm: WorkingMemory) -> Optional[ProposedAction]:
+        queued = self._action_from_payload(getattr(wm, "queued_forced_action", {}) or {})
+        if queued is None:
+            wm.queued_forced_action = {}
+            wm.queued_forced_source = ""
+            return None
+        source = getattr(queued, "forced_action_source", "") or getattr(wm, "queued_forced_source", "")
+        wm.queued_forced_action = {}
+        wm.queued_forced_source = ""
+        queued.bypass_gates = True
+        return self._mark_forced(queued, source or "executable_spine")
 
     def _pending_confirmed_commit_action(self, wm: WorkingMemory) -> Optional[ProposedAction]:
         staged = self._action_from_payload(getattr(wm, "pending_commit_action", {}) or {})
@@ -499,6 +520,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
             if avoid_signature and candidate.signature() == avoid_signature:
                 return None
             return self._mark_forced(candidate, source)
+
+        queued = self._pop_queued_forced_action(wm)
+        if queued is not None and (not avoid_signature or queued.signature() != avoid_signature):
+            return queued
 
         pending = fresh(self._pending_confirmed_commit_action(wm), "staged_commit")
         if pending is not None:
@@ -753,7 +778,28 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return None, diag
 
         # 4a. Pre-conditions
-        pc = check_preconditions(action, schema, wm)
+        pre_action = action
+        if (
+            getattr(action, "bypass_gates", False)
+            and getattr(action, "forced_action_source", "") == "staged_commit"
+            and action.declared_class in (RiskClass.WRITE, RiskClass.IRREVERSIBLE)
+            and action.declared_pre
+        ):
+            pre_action = ProposedAction(
+                name=action.name,
+                args=dict(action.args or {}),
+                declared_class=action.declared_class,
+                declared_pre=[],
+                declared_post=list(action.declared_post or []),
+                informational_intent=action.informational_intent,
+                raw_thought=action.raw_thought,
+                user_text=action.user_text,
+                raw_response=action.raw_response,
+                gradient_id=getattr(action, "gradient_id", ""),
+                thought_uses_known_facts=bool(getattr(action, "thought_uses_known_facts", False)),
+                bypass_gates=bool(getattr(action, "bypass_gates", False)),
+            )
+        pc = check_preconditions(pre_action, schema, wm)
         diag["gates_run"].append("preconditions")
         stats.record_gate(pc)
         if not pc.ok:
@@ -1253,6 +1299,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
                         avoid_signature=action.signature(),
                     )
                     if forced_next is not None:
+                        self._queue_forced_action(wm, forced_next)
                         step_record["repair_action"] = "FORCE_GRADIENT_SPINE"
                         step_record["forced_next_action"] = forced_next.name
                         step_record["forced_next_source"] = getattr(forced_next, "forced_action_source", "")
@@ -3800,6 +3847,17 @@ class CargoAgent(Agent):  # type: ignore[misc]
                     "user_profile_already_cached",
                     user_id=uid,
                 )
+        if (
+            getattr(action, "bypass_gates", False)
+            and getattr(action, "forced_action_source", "")
+            and action.declared_class in (RiskClass.ASK_USER, RiskClass.FINAL)
+            and name in (RESPOND_TOOL_NAME, "respond", "send_user", "finish", "final", "answer")
+        ):
+            return GateResult.passing(
+                "state_validity",
+                skipped="forced_executable_spine_response",
+                source=getattr(action, "forced_action_source", ""),
+            )
 
         return self._kernel().validate_action(action, self._schema_for(action), wm)
 
@@ -4059,6 +4117,22 @@ class CargoAgent(Agent):  # type: ignore[misc]
             ask = self._airline_user_id_request(action, wm)
             if ask is not None:
                 return ask
+            text = (
+                "I need your airline user ID before I can access or change "
+                "reservations for this request."
+            )
+            return ProposedAction(
+                name=RESPOND_TOOL_NAME,
+                args={"content": text},
+                declared_class=RiskClass.FINAL,
+                declared_pre=["airline identity required"],
+                declared_post=["user informed identity is required"],
+                informational_intent="block airline account task without identity",
+                raw_thought="Decision engine: airline account task cannot proceed without user_id.",
+                user_text=text,
+                raw_response="",
+                bypass_gates=True,
+            )
 
         if user_id and self._has_tool("get_user_details") and user_id not in wm.user_profiles:
             candidate = ProposedAction(
@@ -4227,9 +4301,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
             return None
         if wm.auth_ask_count >= _MAX_AUTH_ASKS:
             return None
+        text = "Please provide your airline user ID so I can access the relevant profile or reservation."
         ask = ProposedAction(
             name=RESPOND_TOOL_NAME,
-            args={},
+            args={"content": text},
             declared_class=RiskClass.ASK_USER,
             declared_pre=["airline task requires account identity"],
             declared_post=["user provides airline user_id"],
@@ -4239,15 +4314,12 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 "profile, reservation, or booking work; ask precisely instead "
                 "of a generic clarification."
             ),
-            user_text="Please provide your airline user ID so I can access the relevant profile or reservation.",
+            user_text=text,
             raw_response="",
             bypass_gates=True,
         )
-        fresh = self._fresh_action_or_none(ask, wm)
-        if fresh is not None:
-            wm.auth_ask_count += 1
-            return fresh
-        return None
+        wm.auth_ask_count += 1
+        return ask
 
     @staticmethod
     def _airline_task_needs_identity(wm: "WorkingMemory") -> bool:
@@ -4333,8 +4405,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
         if self._airline_booking_goal(wm):
             return None
         text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
-        wants_cancel = bool(re.search(r"\b(cancel|refund)\b", text))
         wants_change = bool(re.search(r"\b(change|modify|update|reschedule|switch|downgrade|upgrade)\b", text))
+        wants_cancel = bool(re.search(r"\b(cancel|cancellation)\b", text)) or (
+            bool(re.search(r"\brefund\b", text)) and not wants_change
+        )
         if not (wants_cancel or wants_change):
             return None
         reservation = self._select_active_airline_reservation(wm)
