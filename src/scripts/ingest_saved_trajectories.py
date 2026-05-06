@@ -108,11 +108,15 @@ def main() -> int:
         print("(This is normal on first run; no prior trajectories to backfill)")
         return 0
 
+    # Build config with overrides (RexConfig is frozen, so use with_overrides).
     cfg = default_config()
+    overrides = {}
     if ns.bank_dir:
-        cfg.bank_dir = Path(ns.bank_dir)
+        overrides["bank_dir"] = Path(ns.bank_dir)
     if ns.runtime_dir:
-        cfg.runtime_dir = Path(ns.runtime_dir)
+        overrides["runtime_dir"] = Path(ns.runtime_dir)
+    if overrides:
+        cfg = cfg.with_overrides(**overrides)
 
     # Collect all trajectories grouped by domain.
     by_domain = _collect_trajectory_files(outputs_dir)
