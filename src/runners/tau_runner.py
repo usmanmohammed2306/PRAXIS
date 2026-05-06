@@ -8,13 +8,8 @@ varies between them is the agent class instantiated per task:
   * ``act``      — :class:`baselines.ActAgent` (no reasoning prose, action-only)
   * ``react``    — :class:`baselines.ReActAgent` (one-line Thought before each
     Action)
-  * ``cargo``    — :class:`cargo.cargo_agent.CargoAgent` (Calibrated
-    Action-Risk Gating with Outcome-rollouts: a JSON-emitting proposer
-    declares a risk class + pre/post-conditions for each step; deterministic
-    gates check argument grounding and pre-conditions, and a calibrated
-    self-consistency vote (+ counterfactual rollout for IRREVERSIBLE / FINAL)
-    decides whether to commit, retry with a critique, ask the user, or
-    finalize. Mutations only execute after every gate passes.)
+  * ``rex``      — :class:`rex.agent.RexAgent` (leakage-safe experience
+    retrieval + native function calling + write-only SABER-style reflection).
 
 Sharing the loop guarantees the gap between conditions is due to the
 controller and not divergent control flow / tool-result formatting.
@@ -39,7 +34,7 @@ from typing import Any, Dict, List, Tuple
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 
 
-AGENT_CHOICES = ["baseline", "act", "react", "cargo"]
+AGENT_CHOICES = ["baseline", "act", "react", "rex"]
 
 
 def _try_install_litellm_patch() -> None:
@@ -85,9 +80,9 @@ def _resolve_agent_cls(kind: str):
     if kind == "react":
         from ..baselines.agents import ReActAgent
         return ReActAgent
-    if kind == "cargo":
-        from ..cargo.cargo_agent import CargoAgent
-        return CargoAgent
+    if kind == "rex":
+        from ..rex.agent import RexAgent
+        return RexAgent
     raise ValueError(f"Unknown agent kind: {kind}")
 
 
@@ -129,25 +124,25 @@ def _compute_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             step_counts.append(float(len(msgs)))
     info_errors = sum(1 for r in records if isinstance(r.get("info"), dict) and r["info"].get("error"))
 
-    # Aggregate CARGO diagnostics if present.
-    abstain_total = 0
-    repair_retry = 0
-    repair_ask = 0
-    repair_final = 0
-    json_parse_failures = 0
-    actions_executed = 0
-    n_with_stats = 0
+    # Aggregate REx diagnostics if present.
+    rex_n = 0
+    rex_reflections = 0
+    rex_blocks = 0
+    rex_tools = 0
+    rex_mutations = 0
+    rex_cards_loaded = 0
+    rex_cards_used = 0
     for r in records:
         info = r.get("info") or {}
-        cs = info.get("cargo_stats") if isinstance(info, dict) else None
-        if isinstance(cs, dict):
-            n_with_stats += 1
-            abstain_total += int(cs.get("abstain_total") or 0)
-            repair_retry += int(cs.get("repair_retry") or 0)
-            repair_ask += int(cs.get("repair_ask_user") or 0)
-            repair_final += int(cs.get("repair_finalize") or 0)
-            json_parse_failures += int(cs.get("json_parse_failures") or 0)
-            actions_executed += int(cs.get("actions_executed") or 0)
+        rs = info.get("rex_stats") if isinstance(info, dict) else None
+        if isinstance(rs, dict):
+            rex_n += 1
+            rex_reflections += int(rs.get("reflection_calls") or 0)
+            rex_blocks += int(rs.get("reflection_blocks") or 0)
+            rex_tools += int(rs.get("tool_calls_executed") or 0)
+            rex_mutations += int(rs.get("mutating_tool_calls") or 0)
+            rex_cards_loaded += int(rs.get("cards_loaded") or 0)
+            rex_cards_used += len(rs.get("cards_used") or [])
     out: Dict[str, Any] = {
         "num_tasks": len(records),
         "success_rate": safe_mean(successes),
@@ -155,15 +150,15 @@ def _compute_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "avg_trajectory_messages": safe_mean(step_counts),
         "error_tasks": info_errors,
     }
-    if n_with_stats:
-        out["cargo_diagnostics"] = {
-            "trajectories_with_stats": n_with_stats,
-            "abstain_total": abstain_total,
-            "repair_retry": repair_retry,
-            "repair_ask_user": repair_ask,
-            "repair_finalize": repair_final,
-            "json_parse_failures": json_parse_failures,
-            "actions_executed": actions_executed,
+    if rex_n:
+        out["rex_diagnostics"] = {
+            "trajectories_with_stats": rex_n,
+            "reflection_calls": rex_reflections,
+            "reflection_blocks": rex_blocks,
+            "tool_calls_executed": rex_tools,
+            "mutating_tool_calls": rex_mutations,
+            "avg_cards_loaded": rex_cards_loaded / max(1, rex_n),
+            "avg_cards_used": rex_cards_used / max(1, rex_n),
         }
     return out
 
@@ -200,7 +195,7 @@ def _solve_one(
         provider=ns.model_provider,
         temperature=float(ns.temperature),
     )
-    if ns.agent == "cargo":
+    if ns.agent == "rex":
         agent_kwargs["env_hint"] = ns.env
     agent = AgentCls(**agent_kwargs)
     try:

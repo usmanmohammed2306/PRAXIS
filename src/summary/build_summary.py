@@ -5,22 +5,17 @@ Renders a four-way comparison across the same fixed base model:
   1. baseline — vanilla tool-calling (minimal system prompt)
   2. act      — Act (Yao et al. 2022): action-only, no reasoning prose
   3. react    — ReAct (Yao et al. 2022): one-line Thought before each Action
-  4. cargo    — CARGO (this project's contribution): Calibrated Action-Risk
-                Gating with Outcome-rollouts. A JSON-emitting proposer
-                declares a risk class + pre/post-conditions for each step;
-                deterministic gates check argument grounding and
-                pre-conditions, and a calibrated self-consistency vote
-                (+ counterfactual rollout for IRREVERSIBLE / FINAL) decides
-                whether to commit, retry with a critique, ask the user, or
-                finalize. Mutations execute only after every gate passes.
+  4. rex      — REx-RPE (this project's contribution): leakage-safe
+                experience retrieval, native tool calling, and write-only
+                SABER-style mutation reflection.
 
 Each section renders a row per metric for all four conditions. Missing runs
 are reported as ``status=missing`` so the table never collapses on partial
 data.
 
-The summary also computes a ``deltas`` block per benchmark — CARGO minus
-the strongest non-CARGO controller on the headline metric (success rate
-for tau-bench, completion rate for ACEBench) and CARGO vs. baseline — to
+The summary also computes a ``deltas`` block per benchmark — REx-RPE minus
+the strongest non-REx controller on the headline metric (success rate
+for tau-bench, completion rate for ACEBench) and REx-RPE vs. baseline — to
 make the wins immediately visible.
 """
 from __future__ import annotations
@@ -40,31 +35,31 @@ SECTIONS: List[Tuple[str, Dict[str, str]]] = [
         "baseline": "tau_retail_baseline",
         "act": "tau_retail_act",
         "react": "tau_retail_react",
-        "cargo": "tau_retail_cargo",
+        "rex": "tau_retail_rex",
     }),
     ("tau-bench airline", {
         "baseline": "tau_airline_baseline",
         "act": "tau_airline_act",
         "react": "tau_airline_react",
-        "cargo": "tau_airline_cargo",
+        "rex": "tau_airline_rex",
     }),
     ("ACEBench Agent", {
         "baseline": "acebench_agent_baseline",
         "act": "acebench_agent_act",
         "react": "acebench_agent_react",
-        "cargo": "acebench_agent_cargo",
+        "rex": "acebench_agent_rex",
     }),
 ]
 
-CONDITIONS: List[str] = ["baseline", "act", "react", "cargo"]
+CONDITIONS: List[str] = ["baseline", "act", "react", "rex"]
 CONDITION_LABELS: Dict[str, str] = {
     "baseline": "Vanilla TC",
     "act": "Act",
     "react": "ReAct",
-    "cargo": "CARGO (ours)",
+    "rex": "REx-RPE (ours)",
 }
 
-OURS = "cargo"
+OURS = "rex"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -148,7 +143,7 @@ def _headline_metric_key(label: str) -> str:
 
 
 def _strongest_baseline(by_cond: Dict[str, Dict[str, Any]], key: str) -> Tuple[Optional[str], Optional[float]]:
-    """Return (condition_name, value) for the best non-CARGO controller on ``key``."""
+    """Return (condition_name, value) for the best non-REx controller on ``key``."""
     best_cond: Optional[str] = None
     best_val: Optional[float] = None
     for c in ("baseline", "act", "react"):
@@ -203,7 +198,7 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
             "metric": key,
             "best_baseline": best_cond,
             "best_baseline_value": best_val,
-            "cargo_value": ours_val_f,
+            "rex_value": ours_val_f,
             "baseline_value": baseline_val_f,
             "delta_vs_best_baseline": (
                 ours_val_f - best_val
@@ -222,7 +217,7 @@ def build(outputs_dir: Path, active_model: str, served_name: str) -> Dict[str, A
 
 def render_markdown(summary: Dict[str, Any]) -> str:
     lines: List[str] = []
-    lines.append("# Vanilla / Act / ReAct / CARGO — Comparison Summary")
+    lines.append("# Vanilla / Act / ReAct / REx-RPE — Comparison Summary")
     lines.append("")
     lines.append(f"- Active model: `{summary.get('active_model') or '(unknown)'}`")
     lines.append(f"- Served name:  `{summary.get('served_name') or '(unknown)'}`")
@@ -232,24 +227,20 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         "Vanilla TC = minimal system prompt with native function-calling. "
         "Act = action-only, no reasoning prose (Yao et al. 2022). "
         "ReAct = one-line Thought before each Action (Yao et al. 2022). "
-        "CARGO = Calibrated Action-Risk Gating with Outcome-rollouts: a "
-        "JSON-emitting proposer declares a risk class + pre/post-conditions "
-        "for each step; deterministic gates check argument grounding and "
-        "pre-conditions, and a calibrated self-consistency vote "
-        "(+ counterfactual rollout for IRREVERSIBLE / FINAL) decides whether "
-        "to commit, retry with a critique, ask the user, or finalize. "
-        "Mutations execute only after every gate passes."
+        "REx-RPE = leakage-safe experience retrieval from allowed support "
+        "data, native tool calling, brief startup analysis, and write-only "
+        "SABER-style mutation reflection."
     )
     lines.append("")
-    lines.append("## Headline deltas (CARGO vs. best of vanilla / Act / ReAct, and vs. baseline)")
+    lines.append("## Headline deltas (REx-RPE vs. best of vanilla / Act / ReAct, and vs. baseline)")
     lines.append("")
-    lines.append("| Benchmark | Metric | Best baseline | Best baseline val | CARGO | Δ vs best | Δ vs baseline |")
+    lines.append("| Benchmark | Metric | Best baseline | Best baseline val | REx-RPE | Δ vs best | Δ vs baseline |")
     lines.append("|---|---|---|---|---|---|---|")
     for d in summary.get("deltas", []):
         bb = d.get("best_baseline") or "n/a"
         bb_label = CONDITION_LABELS.get(bb, bb)
         bbv = d.get("best_baseline_value")
-        cgv = d.get("cargo_value")
+        cgv = d.get("rex_value")
         dv = d.get("delta_vs_best_baseline")
         dvb = d.get("delta_vs_baseline")
         is_pct_metric = d.get("metric") in ("success_rate", "completion_rate", "tool_name_coverage")
@@ -275,22 +266,21 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         else:
             lines.extend(_ace_rows(label, by_cond))
         lines.append("")
-    # CARGO-specific diagnostics block.
-    lines.append("## CARGO diagnostics")
+    # REx-specific diagnostics block.
+    lines.append("## REx diagnostics")
     lines.append("")
-    lines.append("| Benchmark | Trajectories w/ stats | Abstain | Retry | AskUser | Finalize | JSON parse fail | Actions executed |")
+    lines.append("| Benchmark | Trajectories w/ stats | Reflection calls | Reflection blocks | Tool calls executed | Mutating calls | Avg cards loaded | Avg cards used |")
     lines.append("|---|---|---|---|---|---|---|---|")
     for section in summary["sections"]:
         label = section["label"]
         by_cond = section.get("by_condition") or {}
-        cargo_data = (by_cond.get(OURS) or {}).get("metrics") or {}
-        cd = cargo_data.get("cargo_diagnostics") or {}
+        rex_data = (by_cond.get(OURS) or {}).get("metrics") or {}
+        rd = rex_data.get("rex_diagnostics") or {}
         lines.append(
-            f"| {label} | {cd.get('trajectories_with_stats', 0)} | "
-            f"{cd.get('abstain_total', 0)} | {cd.get('repair_retry', 0)} | "
-            f"{cd.get('repair_ask_user', 0)} | {cd.get('repair_finalize', 0)} | "
-            f"{cd.get('json_parse_failures', 0)} | "
-            f"{cd.get('actions_executed', 0)} |"
+            f"| {label} | {rd.get('trajectories_with_stats', 0)} | "
+            f"{rd.get('reflection_calls', 0)} | {rd.get('reflection_blocks', 0)} | "
+            f"{rd.get('tool_calls_executed', 0)} | {rd.get('mutating_tool_calls', 0)} | "
+            f"{_num(rd.get('avg_cards_loaded'), 1)} | {_num(rd.get('avg_cards_used'), 1)} |"
         )
     lines.append("")
     lines.append("## Notes")
@@ -305,26 +295,20 @@ def render_markdown(summary: Dict[str, Any]) -> str:
     lines.append("## Method notes")
     lines.append("- Same fixed base model, same temperature, same max-steps, same "
                  "truncation budget across all four controllers. Baselines call the "
-                 "raw tool surface; CARGO replaces native function-calling with a "
-                 "JSON proposer + risk-typed verification stack but executes the "
-                 "same benchmark tools.")
+                 "raw tool surface; REx-RPE keeps native function-calling but adds "
+                 "leakage-safe procedural retrieval and write-only reflection.")
     lines.append("- Vanilla TC: minimal role + policy in the system prompt; native "
                  "function-calling does the rest.")
     lines.append("- Act: prompt instructs the model to emit tool calls only, no "
                  "reasoning prose.")
     lines.append("- ReAct: prompt requires one short `Thought:` line before each tool "
                  "call (capped to ~20 words to keep prompt growth bounded).")
-    lines.append("- CARGO: per-step proposer call returns "
-                 "`{thought, action:{name, args, declared_class, declared_pre, "
-                 "declared_post, informational_intent, user_text}}`. READ tools take "
-                 "the fast path and execute immediately. WRITE / IRREVERSIBLE / FINAL "
-                 "tools pass through repeat-loop, pre-condition (declared NL + "
-                 "required-args) and argument-grounding (regex-checked ID values must "
-                 "appear in `user_facts ∪ db_facts ∪ last_obs`) gates, then a "
-                 "calibrated self-consistency vote (k=3 samples at T=0.7), then a "
-                 "counterfactual rollout for IRREVERSIBLE / FINAL only. On ABSTAIN, "
-                 "a deterministic repair policy chooses RETRY (with critique), "
-                 "ASK_USER (clarifying question), or FINALIZE_GENERIC.")
+    lines.append("- REx-RPE: retrieves top procedural experience cards from an "
+                 "audited bank built from allowed support data, renders them as "
+                 "process guidance with explicit no-copy-ID rules, runs one brief "
+                 "no-tools startup analysis, then uses native tool calls. Only "
+                 "mutating tau-bench tools trigger same-model SABER-style reflection; "
+                 "reads are never blocked by the REx layer.")
     lines.append("- ACEBench metrics here are diagnostic. For the official score, "
                  "re-run upstream `score_agent.py` against the saved trajectories.")
     return "\n".join(lines) + "\n"

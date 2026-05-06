@@ -1,13 +1,9 @@
-"""ACEBench Agent runner — vanilla / Act / ReAct / CARGO.
+"""ACEBench Agent runner — vanilla / Act / ReAct / REx.
 
 ACEBench's Agent split is scored offline against the saved trajectory.
 Tools cannot be executed live in this driver, so per-step tool results are
 stubbed; what we measure here is the *sequence of tool calls* the agent
-chooses to issue. The four controllers share an offline-stub loop and only
-differ in their system prompt or (for CARGO) in the calibrated risk-typed
-gate that runs deterministic checks (argument grounding, pre-conditions,
-self-consistency, optional counterfactual rollout) before each emitted
-tool call.
+chooses to issue.
 
 Outputs:
 
@@ -37,7 +33,7 @@ from ..common.openai_client import get_client
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ACE_REPO = REPO_ROOT / "external" / "ACEBench"
-AGENT_CHOICES = ["baseline", "act", "react", "cargo"]
+AGENT_CHOICES = ["baseline", "act", "react", "rex"]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -232,17 +228,16 @@ def _make_run_fn(agent_kind: str):
             )
         return run_fn
 
-    if agent_kind == "cargo":
-        from ..cargo.ace_loop import run_cargo
+    if agent_kind == "rex":
+        from ..rex.ace_loop import run_rex
 
         def run_fn(*, client, model, task, max_num_steps, temperature):
-            return run_cargo(
+            return run_rex(
                 client=client,
                 model=model,
                 task=task,
                 tool_specs=_extract_tool_specs(task),
                 user_turn=_extract_user_turn(task),
-                system_prompt=_system_prompt_for_task(task),
                 max_num_steps=max_num_steps,
                 temperature=temperature,
             )
@@ -321,7 +316,7 @@ def main() -> int:
             "tool_coverage": coverage,
             "num_steps": sum(1 for m in res.get("messages", []) if m.get("role") == "assistant"),
             "messages": res.get("messages", []),
-            "cargo_stats": res.get("cargo_stats"),
+            "rex_stats": res.get("rex_stats"),
         }
 
     write_lock = threading.Lock()

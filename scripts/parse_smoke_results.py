@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize CARGO smoke outputs without claiming unavailable live metrics."""
+"""Summarize REx smoke outputs without claiming unavailable live metrics."""
 from __future__ import annotations
 
 import argparse
