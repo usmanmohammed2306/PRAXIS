@@ -1,73 +1,834 @@
 {
   "source_runs": [
-    {"run": "metrics (24)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 35.0, "abstains": 71, "retries": 40, "ask_user_repairs": 17, "finalize_repairs": 14, "actions_executed": 21},
-    {"run": "metrics (25)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 37.8, "abstains": 76, "retries": 45, "ask_user_repairs": 13, "finalize_repairs": 18, "actions_executed": 24},
-    {"run": "metrics (26)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 38.0, "abstains": 75, "retries": 45, "ask_user_repairs": 7, "finalize_repairs": 23, "actions_executed": 25},
-    {"run": "metrics (27)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 40.6, "abstains": 73, "retries": 34, "ask_user_repairs": 18, "finalize_repairs": 21, "actions_executed": 27},
-    {"run": "metrics (28)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 26.8, "abstains": 36, "retries": 20, "ask_user_repairs": 9, "finalize_repairs": 7, "actions_executed": 24},
-    {"run": "metrics (29)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 16.2, "abstains": 6, "retries": 4, "ask_user_repairs": 1, "finalize_repairs": 1, "actions_executed": 21},
-    {"run": "metrics (30)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 39.8, "abstains": 94, "retries": 17, "ask_user_repairs": 69, "finalize_repairs": 8, "actions_executed": 6},
-    {"run": "metrics (31)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 16.6, "abstains": 1, "retries": 1, "ask_user_repairs": 0, "finalize_repairs": 0, "actions_executed": 24},
-    {"run": "metrics (32)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 32.8, "abstains": 94, "retries": 52, "ask_user_repairs": 14, "finalize_repairs": 28, "actions_executed": 6},
-    {"run": "metrics (33)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 22.6, "abstains": 31, "retries": 19, "ask_user_repairs": 2, "finalize_repairs": 10, "actions_executed": 20},
-    {"run": "metrics (34)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 35.4, "abstains": 79, "retries": 54, "ask_user_repairs": 2, "finalize_repairs": 23, "actions_executed": 21},
-    {"run": "metrics (35)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 35.4, "abstains": 79, "retries": 54, "ask_user_repairs": 2, "finalize_repairs": 23, "actions_executed": 21},
-    {"run": "metrics (36)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 33.2, "abstains": 65, "retries": 43, "ask_user_repairs": 0, "finalize_repairs": 22, "actions_executed": 23},
-    {"run": "metrics (37)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 39.4, "abstains": 68, "retries": 45, "ask_user_repairs": 1, "finalize_repairs": 22, "actions_executed": 32},
-    {"run": "metrics (38)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 28.4, "abstains": 18, "retries": 15, "ask_user_repairs": 1, "finalize_repairs": 2, "actions_executed": 37},
-    {"run": "metrics (39)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 39.2, "abstains": 72, "retries": 42, "ask_user_repairs": 8, "finalize_repairs": 22, "actions_executed": 28},
-    {"run": "metrics (40)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 28.2, "abstains": 16, "retries": 15, "ask_user_repairs": 0, "finalize_repairs": 1, "actions_executed": 38},
-    {"run": "metrics (41)", "benchmark": "ACEBench", "domain": "agent", "controller": "cargo", "completion_rate": 1.0, "avg_tool_calls": 1.0, "avg_steps": 2.0, "error_tasks": 0},
-    {"run": "metrics (42)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 49.8, "abstains": 39, "retries": 22, "ask_user_repairs": 7, "finalize_repairs": 10, "actions_executed": 61},
-    {"run": "metrics (43)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 28.2, "abstains": 17, "retries": 14, "ask_user_repairs": 1, "finalize_repairs": 2, "actions_executed": 37},
-    {"run": "metrics (44)", "benchmark": "ACEBench", "domain": "agent", "controller": "cargo", "completion_rate": 1.0, "avg_tool_calls": 1.0, "avg_steps": 2.0, "error_tasks": 0},
-    {"run": "metrics (45)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 47.4, "abstains": 46, "retries": 27, "ask_user_repairs": 6, "finalize_repairs": 13, "actions_executed": 54},
-    {"run": "metrics (46)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 33.6, "abstains": 27, "retries": 22, "ask_user_repairs": 0, "finalize_repairs": 5, "actions_executed": 42},
-    {"run": "metrics (47)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 50.2, "abstains": 37, "retries": 22, "ask_user_repairs": 5, "finalize_repairs": 10, "actions_executed": 63},
-    {"run": "metrics (48)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 32.6, "abstains": 23, "retries": 19, "ask_user_repairs": 0, "finalize_repairs": 4, "actions_executed": 42},
-    {"run": "metrics (49)", "benchmark": "ACEBench", "domain": "agent", "controller": "cargo", "completion_rate": 1.0, "avg_tool_calls": 1.0, "avg_steps": 2.0, "error_tasks": 0},
-    {"run": "metrics (50)", "benchmark": "ACEBench", "domain": "agent", "controller": "cargo", "completion_rate": 1.0, "avg_tool_calls": 1.0, "avg_steps": 2.0, "error_tasks": 0},
-    {"run": "metrics (51)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 40.2, "abstains": 66, "retries": 43, "ask_user_repairs": 2, "finalize_repairs": 21, "actions_executed": 34},
-    {"run": "metrics (52)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 27.2, "abstains": 18, "retries": 13, "ask_user_repairs": 0, "finalize_repairs": 5, "actions_executed": 35},
-    {"run": "metrics (53)", "benchmark": "ACEBench", "domain": "agent", "controller": "cargo", "completion_rate": 1.0, "avg_tool_calls": 1.0, "avg_steps": 2.0, "error_tasks": 0},
-    {"run": "metrics (54)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 43.2, "abstains": 57, "retries": 37, "ask_user_repairs": 4, "finalize_repairs": 16, "actions_executed": 43},
-    {"run": "metrics (55)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.0, "avg_reward": 0.0, "avg_trajectory_messages": 27.2, "abstains": 18, "retries": 13, "ask_user_repairs": 0, "finalize_repairs": 5, "actions_executed": 35},
-    {"run": "metrics (56)", "benchmark": "tau-bench", "domain": "retail", "controller": "cargo", "success_rate": 0.01, "avg_reward": 0.01, "avg_trajectory_messages": 45.195, "abstains": 2966, "retries": 2044, "ask_user_repairs": 173, "finalize_repairs": 752, "actions_executed": 1602},
-    {"run": "metrics (57)", "benchmark": "tau-bench", "domain": "airline", "controller": "cargo", "success_rate": 0.04, "avg_reward": 0.04, "avg_trajectory_messages": 54.175, "abstains": 4107, "retries": 2614, "ask_user_repairs": 180, "finalize_repairs": 1313, "actions_executed": 1612}
+    {
+      "run": "metrics (24)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 35.0,
+      "abstains": 71,
+      "retries": 40,
+      "ask_user_repairs": 17,
+      "finalize_repairs": 14,
+      "actions_executed": 21
+    },
+    {
+      "run": "metrics (25)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 37.8,
+      "abstains": 76,
+      "retries": 45,
+      "ask_user_repairs": 13,
+      "finalize_repairs": 18,
+      "actions_executed": 24
+    },
+    {
+      "run": "metrics (26)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 38.0,
+      "abstains": 75,
+      "retries": 45,
+      "ask_user_repairs": 7,
+      "finalize_repairs": 23,
+      "actions_executed": 25
+    },
+    {
+      "run": "metrics (27)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 40.6,
+      "abstains": 73,
+      "retries": 34,
+      "ask_user_repairs": 18,
+      "finalize_repairs": 21,
+      "actions_executed": 27
+    },
+    {
+      "run": "metrics (28)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 26.8,
+      "abstains": 36,
+      "retries": 20,
+      "ask_user_repairs": 9,
+      "finalize_repairs": 7,
+      "actions_executed": 24
+    },
+    {
+      "run": "metrics (29)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 16.2,
+      "abstains": 6,
+      "retries": 4,
+      "ask_user_repairs": 1,
+      "finalize_repairs": 1,
+      "actions_executed": 21
+    },
+    {
+      "run": "metrics (30)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 39.8,
+      "abstains": 94,
+      "retries": 17,
+      "ask_user_repairs": 69,
+      "finalize_repairs": 8,
+      "actions_executed": 6
+    },
+    {
+      "run": "metrics (31)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 16.6,
+      "abstains": 1,
+      "retries": 1,
+      "ask_user_repairs": 0,
+      "finalize_repairs": 0,
+      "actions_executed": 24
+    },
+    {
+      "run": "metrics (32)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 32.8,
+      "abstains": 94,
+      "retries": 52,
+      "ask_user_repairs": 14,
+      "finalize_repairs": 28,
+      "actions_executed": 6
+    },
+    {
+      "run": "metrics (33)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 22.6,
+      "abstains": 31,
+      "retries": 19,
+      "ask_user_repairs": 2,
+      "finalize_repairs": 10,
+      "actions_executed": 20
+    },
+    {
+      "run": "metrics (34)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 35.4,
+      "abstains": 79,
+      "retries": 54,
+      "ask_user_repairs": 2,
+      "finalize_repairs": 23,
+      "actions_executed": 21
+    },
+    {
+      "run": "metrics (35)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 35.4,
+      "abstains": 79,
+      "retries": 54,
+      "ask_user_repairs": 2,
+      "finalize_repairs": 23,
+      "actions_executed": 21
+    },
+    {
+      "run": "metrics (36)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 33.2,
+      "abstains": 65,
+      "retries": 43,
+      "ask_user_repairs": 0,
+      "finalize_repairs": 22,
+      "actions_executed": 23
+    },
+    {
+      "run": "metrics (37)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 39.4,
+      "abstains": 68,
+      "retries": 45,
+      "ask_user_repairs": 1,
+      "finalize_repairs": 22,
+      "actions_executed": 32
+    },
+    {
+      "run": "metrics (38)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 28.4,
+      "abstains": 18,
+      "retries": 15,
+      "ask_user_repairs": 1,
+      "finalize_repairs": 2,
+      "actions_executed": 37
+    },
+    {
+      "run": "metrics (39)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 39.2,
+      "abstains": 72,
+      "retries": 42,
+      "ask_user_repairs": 8,
+      "finalize_repairs": 22,
+      "actions_executed": 28
+    },
+    {
+      "run": "metrics (40)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 28.2,
+      "abstains": 16,
+      "retries": 15,
+      "ask_user_repairs": 0,
+      "finalize_repairs": 1,
+      "actions_executed": 38
+    },
+    {
+      "run": "metrics (41)",
+      "benchmark": "ACEBench",
+      "domain": "agent",
+      "controller": "cargo",
+      "completion_rate": 1.0,
+      "avg_tool_calls": 1.0,
+      "avg_steps": 2.0,
+      "error_tasks": 0
+    },
+    {
+      "run": "metrics (42)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 49.8,
+      "abstains": 39,
+      "retries": 22,
+      "ask_user_repairs": 7,
+      "finalize_repairs": 10,
+      "actions_executed": 61
+    },
+    {
+      "run": "metrics (43)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 28.2,
+      "abstains": 17,
+      "retries": 14,
+      "ask_user_repairs": 1,
+      "finalize_repairs": 2,
+      "actions_executed": 37
+    },
+    {
+      "run": "metrics (44)",
+      "benchmark": "ACEBench",
+      "domain": "agent",
+      "controller": "cargo",
+      "completion_rate": 1.0,
+      "avg_tool_calls": 1.0,
+      "avg_steps": 2.0,
+      "error_tasks": 0
+    },
+    {
+      "run": "metrics (45)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 47.4,
+      "abstains": 46,
+      "retries": 27,
+      "ask_user_repairs": 6,
+      "finalize_repairs": 13,
+      "actions_executed": 54
+    },
+    {
+      "run": "metrics (46)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 33.6,
+      "abstains": 27,
+      "retries": 22,
+      "ask_user_repairs": 0,
+      "finalize_repairs": 5,
+      "actions_executed": 42
+    },
+    {
+      "run": "metrics (47)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 50.2,
+      "abstains": 37,
+      "retries": 22,
+      "ask_user_repairs": 5,
+      "finalize_repairs": 10,
+      "actions_executed": 63
+    },
+    {
+      "run": "metrics (48)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 32.6,
+      "abstains": 23,
+      "retries": 19,
+      "ask_user_repairs": 0,
+      "finalize_repairs": 4,
+      "actions_executed": 42
+    },
+    {
+      "run": "metrics (49)",
+      "benchmark": "ACEBench",
+      "domain": "agent",
+      "controller": "cargo",
+      "completion_rate": 1.0,
+      "avg_tool_calls": 1.0,
+      "avg_steps": 2.0,
+      "error_tasks": 0
+    },
+    {
+      "run": "metrics (50)",
+      "benchmark": "ACEBench",
+      "domain": "agent",
+      "controller": "cargo",
+      "completion_rate": 1.0,
+      "avg_tool_calls": 1.0,
+      "avg_steps": 2.0,
+      "error_tasks": 0
+    },
+    {
+      "run": "metrics (51)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 40.2,
+      "abstains": 66,
+      "retries": 43,
+      "ask_user_repairs": 2,
+      "finalize_repairs": 21,
+      "actions_executed": 34
+    },
+    {
+      "run": "metrics (52)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 27.2,
+      "abstains": 18,
+      "retries": 13,
+      "ask_user_repairs": 0,
+      "finalize_repairs": 5,
+      "actions_executed": 35
+    },
+    {
+      "run": "metrics (53)",
+      "benchmark": "ACEBench",
+      "domain": "agent",
+      "controller": "cargo",
+      "completion_rate": 1.0,
+      "avg_tool_calls": 1.0,
+      "avg_steps": 2.0,
+      "error_tasks": 0
+    },
+    {
+      "run": "metrics (54)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 43.2,
+      "abstains": 57,
+      "retries": 37,
+      "ask_user_repairs": 4,
+      "finalize_repairs": 16,
+      "actions_executed": 43
+    },
+    {
+      "run": "metrics (55)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.0,
+      "avg_reward": 0.0,
+      "avg_trajectory_messages": 27.2,
+      "abstains": 18,
+      "retries": 13,
+      "ask_user_repairs": 0,
+      "finalize_repairs": 5,
+      "actions_executed": 35
+    },
+    {
+      "run": "metrics (56)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.01,
+      "avg_reward": 0.01,
+      "avg_trajectory_messages": 45.195,
+      "abstains": 2966,
+      "retries": 2044,
+      "ask_user_repairs": 173,
+      "finalize_repairs": 752,
+      "actions_executed": 1602
+    },
+    {
+      "run": "metrics (57)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.04,
+      "avg_reward": 0.04,
+      "avg_trajectory_messages": 54.175,
+      "abstains": 4107,
+      "retries": 2614,
+      "ask_user_repairs": 180,
+      "finalize_repairs": 1313,
+      "actions_executed": 1612
+    },
+    {
+      "run": "metrics (58)",
+      "benchmark": "ACEBench",
+      "domain": "agent",
+      "controller": "cargo",
+      "completion_rate": 1.0,
+      "avg_tool_calls": 1.4333333333333333,
+      "avg_steps": 3.2666666666666666,
+      "error_tasks": 0
+    },
+    {
+      "run": "metrics (59)",
+      "benchmark": "tau-bench",
+      "domain": "airline",
+      "controller": "cargo",
+      "success_rate": 0.23,
+      "avg_reward": 0.23,
+      "avg_trajectory_messages": 44.82,
+      "abstains": 3118,
+      "retries": 1958,
+      "ask_user_repairs": 154,
+      "finalize_repairs": 1006,
+      "actions_executed": 1431
+    },
+    {
+      "run": "metrics (60)",
+      "benchmark": "tau-bench",
+      "domain": "retail",
+      "controller": "cargo",
+      "success_rate": 0.065,
+      "avg_reward": 0.065,
+      "avg_trajectory_messages": 36.785,
+      "abstains": 2461,
+      "retries": 1619,
+      "ask_user_repairs": 25,
+      "finalize_repairs": 817,
+      "actions_executed": 1236
+    }
   ],
   "issues": [
-    {"id": "generic_id_vs_literal_grounding", "invariant": "Only adapter-declared ID fields require opaque ID grounding; semantic literals are not IDs.", "tests": ["test_iso_date_argument_is_not_treated_as_opaque_id", "test_adapter_declares_non_id_fields_for_grounding"], "status": "verified"},
-    {"id": "state_binding_user_text", "invariant": "User-provided facts bind immediately into typed state and semantic slots.", "tests": ["test_absorb_user_message_binds_airline_semantic_slots"], "status": "verified"},
-    {"id": "db_confirmed_precedence", "invariant": "Tool-confirmed facts outrank later weaker user claims and conflicts are recorded.", "tests": ["test_db_confirmed_semantic_slot_outranks_later_user_claim", "test_generic_kernel_records_conflict_without_overwriting_confirmed_fact"], "status": "verified"},
-    {"id": "auth_phase_reentry", "invariant": "Completed phases are locked and cannot be re-entered.", "tests": ["test_i1_completed_auth_phase_blocks_auth_tool_reentry"], "status": "verified"},
-    {"id": "hard_constraints_before_preferences", "invariant": "Hard constraints filter candidates before preferences or fallbacks rank them.", "tests": ["test_tau_retail_adapter_keeps_hard_constraints_separate_from_preferences", "test_g1_exchange_constraints_are_hard_filters"], "status": "verified"},
-    {"id": "partial_write_blocking", "invariant": "WRITE actions require task-level completeness and may not complete only a fragment.", "tests": ["test_h1_partial_write_is_blocked_by_completeness_gate", "test_i3_booking_write_requires_complete_slots"], "status": "verified"},
-    {"id": "global_constraint_decoy_rejection", "invariant": "Candidates that pass local constraints but fail global constraints are rejected.", "tests": ["test_acebench_adapter_rejects_local_pass_global_fail_decoy"], "status": "verified"},
-    {"id": "post_write_single_shot", "invariant": "Successful state-changing actions are recorded, duplicate writes are blocked, and the trajectory terminates when no fresh mutation remains.", "tests": ["test_f5_completed_mutation_gate_blocks_reexecution"], "status": "verified"},
-    {"id": "read_permissive_commit_strict", "invariant": "READ actions may retrieve grounded evidence while state is incomplete; semantic completeness is enforced only for WRITE/IRREVERSIBLE/FINAL.", "tests": ["test_read_permissive_allows_grounded_product_retrieval_with_incomplete_state", "test_i2_state_gate_blocks_search_conflicting_with_bound_date"], "status": "verified"},
-    {"id": "obligation_guided_airline_progress", "invariant": "Bound airline route/date/cabin facts create open obligations that pivot repeated ASK_USER/FINAL proposals into grounded READ actions.", "tests": ["test_airline_adapter_binds_booking_intent_and_open_obligation", "test_i2b_airline_ask_loop_pivots_to_bound_flight_search", "test_i2c_repeated_direct_search_pivots_to_onestop_when_allowed"], "status": "verified"},
-    {"id": "tool_observation_ids_are_not_semantic_constraints", "invariant": "Opaque IDs returned by tools remain grounded facts/typed evidence and do not become semantic-slot constraints that block later retrieval.", "tests": ["test_tool_observation_ids_do_not_become_semantic_slots"], "status": "verified"},
-    {"id": "v4_constraint_priority_decision_engine", "invariant": "Deterministic candidate selection filters hard constraints and availability before preferences or fallback rules.", "tests": ["test_v4_constraint_priority_selects_full_size_clicky_fallback", "test_v4_retail_adapter_rejects_wrong_keyboard_variant_from_latest_logs", "test_v4_retail_two_item_exchange_uses_deterministic_selected_candidates"], "status": "verified"},
-    {"id": "v4_candidate_set_search_exhaustion", "invariant": "READ results are stored as candidate sets with empty/exhausted status so identical failed searches do not loop.", "tests": ["test_v4_candidate_set_memory_records_empty_search_exhaustion", "test_v4_airline_exhausted_searches_finalize_instead_of_looping"], "status": "verified"},
-    {"id": "v4_pipeline_ask_policy", "invariant": "ASK_USER questions are allowed only for current-stage user-only slots; payment/certificate asks are premature before flight selection.", "tests": ["test_v4_airline_blocks_premature_payment_questions"], "status": "verified"},
-    {"id": "v4_forced_id_shape", "invariant": "Adapter-declared ID fields require typed evidence or an ID-looking grounded value; ordinary words cannot fill ID fields.", "tests": ["test_v4_forced_id_fields_reject_plain_words"], "status": "verified"},
-    {"id": "v4_retail_product_scoped_constraints", "invariant": "Retail adapter constraints are scoped to option keys present on the current product, and tau-retail adapter selection is authoritative over the legacy heuristic fallback.", "tests": ["test_v4_retail_adapter_rejects_wrong_keyboard_variant_from_latest_logs", "test_v4_retail_adapter_skips_keyboard_when_exact_spec_unavailable_and_user_says_other_only", "test_v4_retail_two_item_exchange_uses_deterministic_selected_candidates", "test_v4_retail_exact_keyboard_unavailable_commits_thermostat_only_when_requested"], "status": "verified"},
-    {"id": "v4_airline_identity_stage", "invariant": "Airline account/reservation tasks ask a precise user-id question before profile, reservation, search, or booking actions when identity is missing.", "tests": ["test_v4_airline_missing_user_id_asks_precisely_before_search"], "status": "verified"},
-    {"id": "v4_airline_airport_arg_canonicalization", "invariant": "Airline adapters translate user-facing city/location text into tool-native airport codes while semantic state validation accepts city/code equivalence; ambiguous regions match DB airport evidence without becoming guessed search args.", "tests": ["test_v4_airline_search_uses_airport_codes_but_matches_bound_city_state", "test_v4_airline_region_word_matches_db_airport_without_canonicalizing_search_to_guess"], "status": "verified"},
-    {"id": "v4_adapter_id_backstop", "invariant": "Adapter-declared ID fields reject ordinary words even when a synthesized tool schema omitted ID metadata.", "tests": ["test_v4_adapter_id_backstop_rejects_plain_word_when_schema_is_missing"], "status": "verified"},
-    {"id": "v4_structured_payment_id_evidence", "invariant": "Payment, card, and certificate IDs from structured order/profile caches are typed evidence for grounding.", "tests": ["test_h2_complete_canonical_write_passes_completeness_gate"], "status": "verified"},
-    {"id": "active_task_frame_quarantine", "invariant": "User-bound task-frame slots stay anchored; conflicting cached airline route/date/cabin/insurance/payment facts are evidence only and cannot overwrite the active goal.", "tests": ["test_tool_observation_does_not_overwrite_user_bound_task_frame", "test_v4_booking_goal_does_not_scan_unrelated_reservations"], "status": "verified"},
-    {"id": "booking_vs_reservation_stage_split", "invariant": "Airline booking goals search flights instead of scanning unrelated reservations; modify/cancel reservation goals scan only grounded reservation IDs.", "tests": ["test_v4_booking_goal_does_not_scan_unrelated_reservations", "test_v4_reservation_scan_skips_plain_words_and_none"], "status": "verified"},
-    {"id": "no_auth_catalog_stage_machine", "invariant": "Pure product/count goals route through catalog and product-detail READs before authentication and terminate after the computed answer.", "tests": ["test_v4_task_frame_routes_no_auth_product_query_before_auth", "test_v4_task_frame_fetches_product_details_after_catalog"], "status": "verified"},
-    {"id": "post_write_terminal_respond", "invariant": "Successful state-changing actions emit the terminal respond expected by the benchmark and stop when no fresh mutation remains.", "tests": ["test_v4_successful_write_emits_terminal_respond", "test_f5_completed_mutation_gate_blocks_reexecution"], "status": "verified"},
-    {"id": "v4_airline_task_frame_isolation", "invariant": "Reservation/profile/search observations are evidence and do not overwrite user-bound booking route/date/cabin slots.", "tests": ["test_v4_airline_reservation_obs_does_not_overwrite_booking_anchor", "test_tool_observation_does_not_overwrite_user_bound_date"], "status": "verified"},
-    {"id": "v4_airline_booking_skips_reservation_scan", "invariant": "New booking intent suppresses reservation scanning and keeps the pipeline on grounded flight search.", "tests": ["test_v4_booking_task_does_not_scan_reservations_before_search"], "status": "verified"},
-    {"id": "v4_no_auth_catalog_query", "invariant": "Pure catalog/count goals route to no-auth catalog READ actions before identity collection.", "tests": ["test_v4_no_auth_product_query_routes_to_catalog_read"], "status": "verified"},
-    {"id": "v4_post_write_terminal_respond", "invariant": "Successful state-changing actions emit a post-write respond before terminal completion unless another distinct grounded mutation remains.", "tests": ["test_solve_emits_auto_respond_after_write", "test_solve_post_write_responded_flag_set"], "status": "verified"},
-    {"id": "proof_carrying_commit_certificate", "invariant": "WRITE/IRREVERSIBLE/FINAL transitions carry adapter-verifiable proof obligations before commit; retail proofs cover active goal identity/order anchoring, full requested-item coverage, deterministic candidate selection, and payment grounding.", "tests": ["test_v4_retail_commit_certificate_blocks_partial_exchange", "test_v4_retail_commit_certificate_accepts_complete_exchange", "test_v4_write_gate_requires_commit_certificate"], "status": "verified"},
-    {"id": "soft_goal_field_router", "invariant": "A compact goal field tracks active goal, stage, task frame, live hypotheses, momentum, and friction so repeated non-progress is downweighted while grounded progress candidates remain live.", "tests": ["test_goal_field_momentum_updates_deterministically", "test_repeated_non_progress_raises_friction_and_changes_selection", "test_generic_ask_suppressed_when_goal_slots_known", "test_wrong_retail_zip_recenters_but_preserves_order_branch", "test_airline_cached_profile_is_not_selected_over_progress", "test_goal_field_render_stays_compact_for_small_models"], "status": "verified"},
-    {"id": "cargo_v2_phase_precommit_spine", "invariant": "Account mutations pass through phase-aware authentication/discovery/confirmation/commit boundaries; deterministic pre-commit checks block pseudo-writes and placeholders; grounded airline booking candidates are assembled from profile and search evidence.", "tests": ["test_v2_repeat_window_tracks_eight_signatures", "test_v2_precommit_blocks_placeholder_and_pseudo_write", "test_v2_retail_account_task_authenticates_before_order_lookup", "test_v2_retail_order_recovery_stays_live_after_failed_identity", "test_v2_nested_airline_itinerary_candidate_set_is_recorded", "test_v2_airline_presents_grounded_itinerary_before_booking", "test_v2_airline_builds_complete_book_action_after_confirmation"], "status": "verified"},
-    {"id": "latest_result_corpus_regressions", "invariant": "Regression tests are derived from the latest shared full-result corpus: airline city names are canonicalized before search execution, placeholder reservation reads recenter to grounded booking progress, repeated direct rechecks reuse search evidence, cheapest invalid itineraries are rejected before preferences rank, and retail name+ZIP+order tasks authenticate before order reads.", "tests": ["test_v2_latest_airline_city_name_search_is_canonicalized", "test_v2_latest_airline_placeholder_reservation_read_recenters_to_booking", "test_v2_latest_airline_direct_recheck_uses_existing_search_evidence", "test_v2_latest_airline_selects_cheapest_valid_not_cheapest_invalid", "test_v2_latest_retail_name_zip_order_uses_auth_before_order_read", "test_v2_known_issue_corpus_tracks_all_latest_result_runs"], "status": "verified"},
-    {"id": "broad_400_trajectory_regressions", "invariant": "The 400 latest retail/airline trajectories are mined for repeated profile loops, malformed reservation lookups, ambiguous route searches, generic asks after known slots, pseudo cost writes, semantic none over-blocking, and retail auth loops; each cluster has an offline regression.", "tests": ["test_v2_corpus_cached_airline_profile_routes_to_search_not_refetch", "test_v2_corpus_booking_reservation_scan_routes_to_flight_search", "test_v2_corpus_calculate_cost_routes_to_grounded_booking_summary", "test_v2_corpus_generic_ask_after_booking_evidence_uses_summary", "test_v2_corpus_direct_viable_beats_onestop_when_direct_preferred", "test_v2_corpus_malformed_reservation_lookup_scans_profile_ids", "test_v2_corpus_ambiguous_region_search_scans_reservations_first", "test_v2_corpus_retail_placeholder_email_with_name_zip_uses_name_zip", "test_v2_corpus_retail_generic_ask_with_credentials_authenticates", "test_v2_corpus_retail_cached_profile_fetches_order_not_profile_loop", "test_v2_corpus_precommit_blocks_nested_id_none_but_allows_semantic_none", "test_v2_corpus_precommit_blocks_nested_latest_placeholder", "test_v2_corpus_goal_field_downweights_repeated_profile_against_search"], "status": "verified"}
+    {
+      "id": "generic_id_vs_literal_grounding",
+      "invariant": "Only adapter-declared ID fields require opaque ID grounding; semantic literals are not IDs.",
+      "tests": [
+        "test_iso_date_argument_is_not_treated_as_opaque_id",
+        "test_adapter_declares_non_id_fields_for_grounding"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "state_binding_user_text",
+      "invariant": "User-provided facts bind immediately into typed state and semantic slots.",
+      "tests": [
+        "test_absorb_user_message_binds_airline_semantic_slots"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "db_confirmed_precedence",
+      "invariant": "Tool-confirmed facts outrank later weaker user claims and conflicts are recorded.",
+      "tests": [
+        "test_db_confirmed_semantic_slot_outranks_later_user_claim",
+        "test_generic_kernel_records_conflict_without_overwriting_confirmed_fact"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "auth_phase_reentry",
+      "invariant": "Completed phases are locked and cannot be re-entered.",
+      "tests": [
+        "test_i1_completed_auth_phase_blocks_auth_tool_reentry"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "hard_constraints_before_preferences",
+      "invariant": "Hard constraints filter candidates before preferences or fallbacks rank them.",
+      "tests": [
+        "test_tau_retail_adapter_keeps_hard_constraints_separate_from_preferences",
+        "test_g1_exchange_constraints_are_hard_filters"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "partial_write_blocking",
+      "invariant": "WRITE actions require task-level completeness and may not complete only a fragment.",
+      "tests": [
+        "test_h1_partial_write_is_blocked_by_completeness_gate",
+        "test_i3_booking_write_requires_complete_slots"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "global_constraint_decoy_rejection",
+      "invariant": "Candidates that pass local constraints but fail global constraints are rejected.",
+      "tests": [
+        "test_acebench_adapter_rejects_local_pass_global_fail_decoy"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "post_write_single_shot",
+      "invariant": "Successful state-changing actions are recorded, duplicate writes are blocked, and the trajectory terminates when no fresh mutation remains.",
+      "tests": [
+        "test_f5_completed_mutation_gate_blocks_reexecution"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "read_permissive_commit_strict",
+      "invariant": "READ actions may retrieve grounded evidence while state is incomplete; semantic completeness is enforced only for WRITE/IRREVERSIBLE/FINAL.",
+      "tests": [
+        "test_read_permissive_allows_grounded_product_retrieval_with_incomplete_state",
+        "test_i2_state_gate_blocks_search_conflicting_with_bound_date"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "obligation_guided_airline_progress",
+      "invariant": "Bound airline route/date/cabin facts create open obligations that pivot repeated ASK_USER/FINAL proposals into grounded READ actions.",
+      "tests": [
+        "test_airline_adapter_binds_booking_intent_and_open_obligation",
+        "test_i2b_airline_ask_loop_pivots_to_bound_flight_search",
+        "test_i2c_repeated_direct_search_pivots_to_onestop_when_allowed"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "tool_observation_ids_are_not_semantic_constraints",
+      "invariant": "Opaque IDs returned by tools remain grounded facts/typed evidence and do not become semantic-slot constraints that block later retrieval.",
+      "tests": [
+        "test_tool_observation_ids_do_not_become_semantic_slots"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_constraint_priority_decision_engine",
+      "invariant": "Deterministic candidate selection filters hard constraints and availability before preferences or fallback rules.",
+      "tests": [
+        "test_v4_constraint_priority_selects_full_size_clicky_fallback",
+        "test_v4_retail_adapter_rejects_wrong_keyboard_variant_from_latest_logs",
+        "test_v4_retail_two_item_exchange_uses_deterministic_selected_candidates"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_candidate_set_search_exhaustion",
+      "invariant": "READ results are stored as candidate sets with empty/exhausted status so identical failed searches do not loop.",
+      "tests": [
+        "test_v4_candidate_set_memory_records_empty_search_exhaustion",
+        "test_v4_airline_exhausted_searches_finalize_instead_of_looping"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_pipeline_ask_policy",
+      "invariant": "ASK_USER questions are allowed only for current-stage user-only slots; payment/certificate asks are premature before flight selection.",
+      "tests": [
+        "test_v4_airline_blocks_premature_payment_questions"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_forced_id_shape",
+      "invariant": "Adapter-declared ID fields require typed evidence or an ID-looking grounded value; ordinary words cannot fill ID fields.",
+      "tests": [
+        "test_v4_forced_id_fields_reject_plain_words"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_retail_product_scoped_constraints",
+      "invariant": "Retail adapter constraints are scoped to option keys present on the current product, and tau-retail adapter selection is authoritative over the legacy heuristic fallback.",
+      "tests": [
+        "test_v4_retail_adapter_rejects_wrong_keyboard_variant_from_latest_logs",
+        "test_v4_retail_adapter_skips_keyboard_when_exact_spec_unavailable_and_user_says_other_only",
+        "test_v4_retail_two_item_exchange_uses_deterministic_selected_candidates",
+        "test_v4_retail_exact_keyboard_unavailable_commits_thermostat_only_when_requested"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_airline_identity_stage",
+      "invariant": "Airline account/reservation tasks ask a precise user-id question before profile, reservation, search, or booking actions when identity is missing.",
+      "tests": [
+        "test_v4_airline_missing_user_id_asks_precisely_before_search"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_airline_airport_arg_canonicalization",
+      "invariant": "Airline adapters translate user-facing city/location text into tool-native airport codes while semantic state validation accepts city/code equivalence; ambiguous regions match DB airport evidence without becoming guessed search args.",
+      "tests": [
+        "test_v4_airline_search_uses_airport_codes_but_matches_bound_city_state",
+        "test_v4_airline_region_word_matches_db_airport_without_canonicalizing_search_to_guess"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_adapter_id_backstop",
+      "invariant": "Adapter-declared ID fields reject ordinary words even when a synthesized tool schema omitted ID metadata.",
+      "tests": [
+        "test_v4_adapter_id_backstop_rejects_plain_word_when_schema_is_missing"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_structured_payment_id_evidence",
+      "invariant": "Payment, card, and certificate IDs from structured order/profile caches are typed evidence for grounding.",
+      "tests": [
+        "test_h2_complete_canonical_write_passes_completeness_gate"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "active_task_frame_quarantine",
+      "invariant": "User-bound task-frame slots stay anchored; conflicting cached airline route/date/cabin/insurance/payment facts are evidence only and cannot overwrite the active goal.",
+      "tests": [
+        "test_tool_observation_does_not_overwrite_user_bound_task_frame",
+        "test_v4_booking_goal_does_not_scan_unrelated_reservations"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "booking_vs_reservation_stage_split",
+      "invariant": "Airline booking goals search flights instead of scanning unrelated reservations; modify/cancel reservation goals scan only grounded reservation IDs.",
+      "tests": [
+        "test_v4_booking_goal_does_not_scan_unrelated_reservations",
+        "test_v4_reservation_scan_skips_plain_words_and_none"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "no_auth_catalog_stage_machine",
+      "invariant": "Pure product/count goals route through catalog and product-detail READs before authentication and terminate after the computed answer.",
+      "tests": [
+        "test_v4_task_frame_routes_no_auth_product_query_before_auth",
+        "test_v4_task_frame_fetches_product_details_after_catalog"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "post_write_terminal_respond",
+      "invariant": "Successful state-changing actions emit the terminal respond expected by the benchmark and stop when no fresh mutation remains.",
+      "tests": [
+        "test_v4_successful_write_emits_terminal_respond",
+        "test_f5_completed_mutation_gate_blocks_reexecution"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_airline_task_frame_isolation",
+      "invariant": "Reservation/profile/search observations are evidence and do not overwrite user-bound booking route/date/cabin slots.",
+      "tests": [
+        "test_v4_airline_reservation_obs_does_not_overwrite_booking_anchor",
+        "test_tool_observation_does_not_overwrite_user_bound_date"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_airline_booking_skips_reservation_scan",
+      "invariant": "New booking intent suppresses reservation scanning and keeps the pipeline on grounded flight search.",
+      "tests": [
+        "test_v4_booking_task_does_not_scan_reservations_before_search"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_no_auth_catalog_query",
+      "invariant": "Pure catalog/count goals route to no-auth catalog READ actions before identity collection.",
+      "tests": [
+        "test_v4_no_auth_product_query_routes_to_catalog_read"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "v4_post_write_terminal_respond",
+      "invariant": "Successful state-changing actions emit a post-write respond before terminal completion unless another distinct grounded mutation remains.",
+      "tests": [
+        "test_solve_emits_auto_respond_after_write",
+        "test_solve_post_write_responded_flag_set"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "proof_carrying_commit_certificate",
+      "invariant": "WRITE/IRREVERSIBLE/FINAL transitions carry adapter-verifiable proof obligations before commit; retail proofs cover active goal identity/order anchoring, full requested-item coverage, deterministic candidate selection, and payment grounding.",
+      "tests": [
+        "test_v4_retail_commit_certificate_blocks_partial_exchange",
+        "test_v4_retail_commit_certificate_accepts_complete_exchange",
+        "test_v4_write_gate_requires_commit_certificate"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "soft_goal_field_router",
+      "invariant": "A compact goal field tracks active goal, stage, task frame, live hypotheses, momentum, and friction so repeated non-progress is downweighted while grounded progress candidates remain live.",
+      "tests": [
+        "test_goal_field_momentum_updates_deterministically",
+        "test_repeated_non_progress_raises_friction_and_changes_selection",
+        "test_generic_ask_suppressed_when_goal_slots_known",
+        "test_wrong_retail_zip_recenters_but_preserves_order_branch",
+        "test_airline_cached_profile_is_not_selected_over_progress",
+        "test_goal_field_render_stays_compact_for_small_models"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "cargo_v2_phase_precommit_spine",
+      "invariant": "Account mutations pass through phase-aware authentication/discovery/confirmation/commit boundaries; deterministic pre-commit checks block pseudo-writes and placeholders; grounded airline booking candidates are assembled from profile and search evidence.",
+      "tests": [
+        "test_v2_repeat_window_tracks_eight_signatures",
+        "test_v2_precommit_blocks_placeholder_and_pseudo_write",
+        "test_v2_retail_account_task_authenticates_before_order_lookup",
+        "test_v2_retail_order_recovery_stays_live_after_failed_identity",
+        "test_v2_nested_airline_itinerary_candidate_set_is_recorded",
+        "test_v2_airline_presents_grounded_itinerary_before_booking",
+        "test_v2_airline_builds_complete_book_action_after_confirmation"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "latest_result_corpus_regressions",
+      "invariant": "Regression tests are derived from the latest shared full-result corpus: airline city names are canonicalized before search execution, placeholder reservation reads recenter to grounded booking progress, repeated direct rechecks reuse search evidence, cheapest invalid itineraries are rejected before preferences rank, and retail name+ZIP+order tasks authenticate before order reads.",
+      "tests": [
+        "test_v2_latest_airline_city_name_search_is_canonicalized",
+        "test_v2_latest_airline_placeholder_reservation_read_recenters_to_booking",
+        "test_v2_latest_airline_direct_recheck_uses_existing_search_evidence",
+        "test_v2_latest_airline_selects_cheapest_valid_not_cheapest_invalid",
+        "test_v2_latest_retail_name_zip_order_uses_auth_before_order_read",
+        "test_v2_known_issue_corpus_tracks_all_latest_result_runs"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "broad_400_trajectory_regressions",
+      "invariant": "The 400 latest retail/airline trajectories are mined for repeated profile loops, malformed reservation lookups, ambiguous route searches, generic asks after known slots, pseudo cost writes, semantic none over-blocking, and retail auth loops; each cluster has an offline regression.",
+      "tests": [
+        "test_v2_corpus_cached_airline_profile_routes_to_search_not_refetch",
+        "test_v2_corpus_booking_reservation_scan_routes_to_flight_search",
+        "test_v2_corpus_calculate_cost_routes_to_grounded_booking_summary",
+        "test_v2_corpus_generic_ask_after_booking_evidence_uses_summary",
+        "test_v2_corpus_direct_viable_beats_onestop_when_direct_preferred",
+        "test_v2_corpus_malformed_reservation_lookup_scans_profile_ids",
+        "test_v2_corpus_ambiguous_region_search_scans_reservations_first",
+        "test_v2_corpus_retail_placeholder_email_with_name_zip_uses_name_zip",
+        "test_v2_corpus_retail_generic_ask_with_credentials_authenticates",
+        "test_v2_corpus_retail_cached_profile_fetches_order_not_profile_loop",
+        "test_v2_corpus_precommit_blocks_nested_id_none_but_allows_semantic_none",
+        "test_v2_corpus_precommit_blocks_nested_latest_placeholder",
+        "test_v2_corpus_goal_field_downweights_repeated_profile_against_search"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "cargo_n_belief_gradient_scheduler",
+      "invariant": "CARGO-N-lite renders a compact typed belief snapshot, chooses a deterministic progress gradient, injects gate critiques into the goal field, blacklists repeated failed signatures, and scores candidates by gradient alignment before existing gates run.",
+      "tests": [
+        "test_goal_field_momentum_updates_deterministically",
+        "test_repeated_non_progress_raises_friction_and_changes_selection",
+        "tests.test_cargo_corpus.CargoNCorpusRegressionTests.test_cn_396_core_friction_gradient",
+        "tests.test_cargo_corpus.CargoNCorpusRegressionTests.test_cn_391_core_belief_compactness"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "cargo_n_800_trajectory_400_regressions",
+      "invariant": "The latest 800 tau trajectories from runs 56/57/59/60 are mined into 400 unittest-visible regression scenarios: 220 airline, 160 retail, and 20 cross-domain/core cases covering generic asks, cached profile re-fetch, reservation drift, search exhaustion, booking/update progression, wrong ZIP recovery, mixed retail goals, hard-constraint ranking, placeholders, compact belief rendering, and friction-driven recentering.",
+      "tests": [
+        "tests.test_cargo_corpus.CargoNCorpusRegressionTests (400 generated methods)",
+        "test_v2_known_issue_corpus_tracks_all_latest_result_runs"
+      ],
+      "status": "verified"
+    }
   ]
 }

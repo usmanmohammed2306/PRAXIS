@@ -9,7 +9,7 @@ and **ACEBench Agent**:
 | 1 | **Vanilla TC** (`baseline`) | Native function-calling, minimal system prompt. |
 | 2 | **Act** (`act`)             | Yao et al. 2022 ablation: action-only, no reasoning prose. |
 | 3 | **ReAct** (`react`)         | Yao et al. 2022: one-line `Thought:` before each Action. |
-| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; a phase-aware CARGO v2 spine keeps account work in AUTHENTICATE/DISCOVER/CONFIRM/COMMIT/WRAP, while the Soft Goal-Field Router ranks model and deterministic candidates before deterministic gates check grounding, task-state validity, semantic completeness, pre-commit safety, proof-carrying commit certificates, and pre-conditions. Calibrated self-consistency plus counterfactual rollout are still reserved for high-risk actions. |
+| 4 | **CARGO** (`cargo`, *ours*) | A JSON-emitting proposer declares a risk class + pre/post-conditions for each step; a phase-aware CARGO v2 spine keeps account work in AUTHENTICATE/DISCOVER/CONFIRM/COMMIT/WRAP. The CARGO-N-lite belief/gradient scheduler renders compact typed state, injects gate critiques, adds friction for repeated non-progress, and lets the Soft Goal-Field Router rank model and deterministic candidates before deterministic gates check grounding, task-state validity, semantic completeness, pre-commit safety, proof-carrying commit certificates, and pre-conditions. Calibrated self-consistency plus counterfactual rollout are still reserved for high-risk actions. |
 
 All four conditions share the **same in-process loop, model,
 temperature, max-steps, and truncation budget**. The only varying axis is
@@ -252,6 +252,33 @@ candidate or next pipeline step. The current decision engine provides:
 - **Termination barrier**: after a successful state-changing action, CARGO
   emits the user-facing `respond` expected by tau-bench and stops if no fresh
   grounded mutation remains.
+
+### CARGO-N-Lite Belief/Gradient Hardening
+
+The latest pass adds a CARGO-N-lite layer without changing shell scripts,
+training, or benchmark plumbing.  It is a deterministic projection of current
+working memory, not a new planner:
+
+- `BeliefSnapshot` renders locked facts, open obligations, stage, last
+  critique, top friction signatures, and the current gradient under a compact
+  character cap for small models.
+- `PredictiveGradientScheduler` chooses one progress target from
+  `GROUND_SLOT`, `RESOLVE_CANDIDATES`, `CONFIRM`, `COMMIT`, `ASK_USER`,
+  `RESPOND`, and `ESCALATE`.
+- Gate failures write a critique into the goal field; repeated failed
+  signatures enter a short friction blacklist so the same generic ask, stale
+  profile read, exhausted search, or placeholder branch cannot keep winning
+  candidate selection.
+- The router adds gradient-alignment score before the existing gates run.
+  READs remain retrieval-permissive; WRITEs and finals still require the
+  strict confirmation, completeness, pre-commit, and commit-certificate gates.
+
+This layer targets the newest tau traces directly: airline run 59 improved to
+`0.23` success but still had `3118` abstains and repeated generic asks after
+profile/search evidence; retail run 60 improved to `0.065` but still had
+`2461` abstains, mixed catalog/account drift, and identity/order recovery
+fragility.  The new 400-case corpus suite turns those clusters into offline
+regressions.
 
 The same class-specific validation remains: READ may retrieve grounded IDs
 from user/tool evidence while state is incomplete; WRITE and FINAL still run
@@ -501,10 +528,10 @@ The architecture is covered by offline unit tests + an integration smoke
 test (no live model needed):
 
 ```bash
-python3 -m unittest tests.test_cargo -v
+python3 -m unittest tests.test_cargo tests.test_cargo_corpus -v
 ```
 
-The suite checks: rule-based risk classification; tool schema caching;
+The base suite checks: rule-based risk classification; tool schema caching;
 working-memory absorption (user text + observation); typed task-state conflict
 handling; generic adapter schema enrichment; retail hard-constraint vs
 preference separation; ACEBench-style local-pass/global-fail decoy rejection;
@@ -518,14 +545,27 @@ spine checks; deterministic airline itinerary/payment/passenger booking
 candidates; proof-carrying commit certificates; post-write terminal response;
 and full agent loop behavior on mock environments.
 
-Latest local verification in this workspace: `308` tests passed, compileall
+The generated corpus suite adds **400 unittest-visible regressions** mined
+from the latest 800 tau trajectories:
+
+- 220 airline cases for generic asks after known user/profile/search evidence,
+  cached profile re-fetch, reservation drift, malformed reservation lookup,
+  city/airport canonicalization, search exhaustion, booking progression,
+  update-reservation writes, and post-search ask loops.
+- 160 retail cases for name+ZIP/email auth progress, wrong ZIP quarantine,
+  order-cache progress, mixed catalog/account tasks, hard constraints before
+  preferences, post-write termination, and placeholder ID blocking.
+- 20 core cases for pre-commit path awareness, compact belief rendering,
+  friction-gradient behavior, and fixture/smoke parsing.
+
+Latest local verification in this workspace: `708` tests passed, compileall
 passed, `git diff --check` passed, `python3 -m pip check` passed, and
 `bash run_project.sh --dry-run` resolved the benchmark configuration.
 Synthetic smoke passed. Classic tau-bench and ACEBench dependencies are
 present, but live tau-bench / ACEBench smoke tests still require either
 `OPENAI_API_KEY` or an OpenAI-compatible `OPENAI_BASE_URL`; without one, the
 smoke helper reports them as blocked and leaves exact rerun commands in
-`outputs/smoke/smoke_summary_v2_broad_corpus.json`.
+`outputs/smoke/smoke_summary_cargo_n_corpus.json`.
 
 The detailed redesign note is in
 [`docs/cargo_v2_redesign_plan.md`](docs/cargo_v2_redesign_plan.md). Current
