@@ -102,17 +102,18 @@ class TauRetailAdapter(BaseCargoAdapter):
                 attributes=attrs,
                 available=bool(variant.get("available", True)),
             ))
+        exact_or_skip = _requires_exact_or_skip(goal)
         selection = ConstraintPriorityEngine().select(
             candidates,
             hard_constraints=hard,
             preferences=prefs,
-            fallback_rules=fallbacks,
+            fallback_rules=[] if exact_or_skip else fallbacks,
         )
         if (
             selection.ok
             and selection.candidate is not None
             and prefs
-            and _requires_exact_or_skip(goal)
+            and exact_or_skip
             and not _matches_all_preferences(selection.candidate.attributes, prefs)
         ):
             return None
