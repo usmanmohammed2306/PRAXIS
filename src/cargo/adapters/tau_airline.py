@@ -98,7 +98,12 @@ class TauAirlineAdapter(BaseCargoAdapter):
         s = str(text or "")
         low = s.lower()
 
-        if re.search(r"\b(book|reserve|purchase)\b", low) and re.search(r"\b(flight|ticket|trip)\b", low):
+        route_like = bool(re.search(r"\bfrom\s+[A-Za-z][A-Za-z .'-]{1,40}?\s+to\s+[A-Za-z]", s, re.I))
+        booking_verb = bool(
+            re.search(r"\b(book|reserve|purchase|fly|flying)\b", low)
+            or re.search(r"\b(?:travel|go)\s+(?:from|to)\b", low)
+        )
+        if booking_verb and (re.search(r"\b(flight|ticket|trip)\b", low) or route_like):
             updates += self._fact(state, "intent", "book_flight")
             _add_requested_operation(state, "book_flight")
         if re.search(r"\b(change|modify|update|reschedule|switch)\b", low) and re.search(r"\b(flight|reservation|trip|ticket)\b", low):
@@ -216,9 +221,13 @@ class TauAirlineAdapter(BaseCargoAdapter):
         intents = _state_values(state, "intent")
         text = " ".join(str(v).lower() for v in intents)
         user_text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
+        route_like = bool(re.search(r"\bfrom\s+[A-Za-z][A-Za-z .'-]{1,40}?\s+to\s+[A-Za-z]", wm.goal + " " + " ".join(wm.user_facts), re.I))
+        booking_verb = bool(
+            re.search(r"\b(book|reserve|purchase|fly|flying)\b", user_text)
+            or re.search(r"\b(?:travel|go)\s+(?:from|to)\b", user_text)
+        )
         if "book_flight" in text or (
-            re.search(r"\b(book|reserve|purchase)\b", user_text)
-            and re.search(r"\b(flight|ticket|trip)\b", user_text)
+            booking_verb and (re.search(r"\b(flight|ticket|trip)\b", user_text) or route_like)
         ):
             required = {"origin", "destination", "date", "cabin"}
             if re.search(r"\bchecked\s+bags?|bags?\b", user_text):

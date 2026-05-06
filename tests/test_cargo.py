@@ -7340,6 +7340,70 @@ class TestSoftGoalFieldRouter(unittest.TestCase):
         self.assertNotEqual(forced.signature(), generic.signature())  # type: ignore[union-attr]
         self.assertIn(getattr(forced, "forced_action_source", ""), {"airline_booking_spine", "staged_commit"})  # type: ignore[union-attr]
 
+    def test_v3_latest_airline_fly_route_fetches_profile_before_search(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "Your user id is mia_li_3668. You want to fly from Denver to "
+            "Las Vegas on May 20 in economy."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        proposal = ProposedAction(
+            name="search_direct_flight",
+            args={"origin": "DEN", "destination": "LAS", "date": "2024-05-20"},
+            declared_class=RiskClass.READ,
+            raw_thought="Search flights first.",
+        )
+
+        self.assertTrue(agent._airline_booking_goal(wm))
+        self.assertTrue(agent._airline_task_needs_identity(wm))
+        action = agent._airline_obligation_action(proposal, wm)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.name, "get_user_details")  # type: ignore[union-attr]
+        self.assertEqual(action.args["user_id"], "mia_li_3668")  # type: ignore[union-attr]
+
+    def test_v3_latest_airline_task_frame_never_uses_retail_auth(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory(
+            goal=(
+                "My name is Olivia Gonzalez and zip is 11430. Change my "
+                "return flight if possible."
+            )
+        )
+        wm.absorb_user_message(wm.goal)
+        proposal = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            raw_thought="Ask for missing identity.",
+            user_text="Please provide your ZIP code.",
+        )
+
+        action = agent._task_frame_stage_action(proposal, wm)
+
+        self.assertIsNone(action)
+
+    def test_v3_latest_forced_respond_bypasses_repeat_loop_gate(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory(goal="No matching flights are available.")
+        action = ProposedAction(
+            name="respond",
+            args={"content": "No matching flights are available."},
+            declared_class=RiskClass.ASK_USER,
+            raw_thought="Airline spine: report the exhausted search.",
+            user_text="No matching flights are available.",
+            bypass_gates=True,
+        )
+        action = agent._mark_forced(action, "airline_obligation_spine")
+        wm.record_action_signature(action.signature())
+
+        failing, diag = agent._run_gates(action, agent._schema_for(action), wm, [], CargoStats())
+
+        self.assertIsNone(failing)
+        self.assertIn("repeat_loop", diag["gates_run"])
+
     def test_v3_retail_exact_or_skip_blocks_weaker_keyboard_fallback(self) -> None:
         adapter = TauRetailAdapter()
         details = {
@@ -7371,6 +7435,51 @@ class TestSoftGoalFieldRouter(unittest.TestCase):
         selected = adapter.select_replacement_variant_id(details, old_item, goal)
 
         self.assertIsNone(selected)
+
+    def test_v3_latest_retail_actual_exact_or_skip_phrase_blocks_no_backlight_fallback(self) -> None:
+        adapter = TauRetailAdapter()
+        details = {
+            "name": "Mechanical Keyboard",
+            "variants": {
+                "old_keyboard": {
+                    "item_id": "old_keyboard",
+                    "available": True,
+                    "options": {"switch type": "tactile", "backlight": "white", "size": "full size"},
+                },
+                "no_backlight_clicky": {
+                    "item_id": "no_backlight_clicky",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "none", "size": "full size"},
+                },
+            },
+        }
+        old_item = {
+            "item_id": "old_keyboard",
+            "name": "Mechanical Keyboard",
+            "options": {"switch type": "tactile", "backlight": "white", "size": "full size"},
+        }
+        goal = (
+            "If there's no full-size keyboard with RGB backlighting and clicky "
+            "switches available, I'd rather only exchange the thermostat."
+        )
+
+        selected = adapter.select_replacement_variant_id(details, old_item, goal)
+
+        self.assertIsNone(selected)
+
+    def test_v3_latest_respond_schema_has_no_required_content_arg(self) -> None:
+        agent = self._make_airline_agent()
+        action = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.FINAL,
+            user_text="The booked itinerary is confirmed.",
+        )
+
+        schema = agent._schema_for(action)
+
+        self.assertEqual(schema.required_params, [])
+        self.assertEqual(schema.arg_id_fields, [])
 
     def test_v3_retail_post_write_summary_includes_variant_evidence(self) -> None:
         agent = self._make_retail_agent()

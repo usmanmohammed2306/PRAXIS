@@ -645,7 +645,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
         diag["staged_commit_signature"] = getattr(wm, "pending_commit_signature", "")
 
         # Repeat-loop is checked for every class — cheap and high-yield.
-        rl = check_repeat_loop(action, schema, wm)
+        # Deterministic executable-spine actions are the exception: once the
+        # controller has staged an exact confirmation/commit/closure, treating
+        # the repeated surface text as another model loop traps the agent after
+        # already-grounded progress.  This was the dominant airline 63 failure.
+        skip_repeat = bool(getattr(action, "bypass_gates", False) and getattr(action, "forced_action_source", ""))
+        if skip_repeat:
+            rl = GateResult.passing("repeat_loop", skipped="forced_executable_spine")
+        else:
+            rl = check_repeat_loop(action, schema, wm)
         diag["gates_run"].append("repeat_loop")
         stats.record_gate(rl)
         if not rl.ok:
@@ -2076,9 +2084,10 @@ class CargoAgent(Agent):  # type: ignore[misc]
         asks for credentials.  Account/order goals still use the normal auth
         and write-gating pipeline.
         """
-        retail_auth = self._retail_auth_phase_action(action, wm)
-        if retail_auth is not None:
-            return retail_auth
+        if self._is_retail_adapter():
+            retail_auth = self._retail_auth_phase_action(action, wm)
+            if retail_auth is not None:
+                return retail_auth
 
         if not self._is_no_auth_query(wm) or self._is_account_order_goal(wm):
             return None
@@ -2970,16 +2979,22 @@ class CargoAgent(Agent):  # type: ignore[misc]
     def _airline_booking_intent(wm: "WorkingMemory") -> bool:
         text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
         slots = wm.semantic_slots
+        has_route = bool(CargoAgent._slot_value(slots, "origin") and CargoAgent._slot_value(slots, "destination"))
         intents = slots.get("intents") or slots.get("intent") or []
         if not isinstance(intents, list):
             intents = [intents]
         intent_text = " ".join(str(v).lower() for v in intents if v)
+        booking_verb = bool(
+            re.search(r"\b(book|reserve|purchase|fly|flying)\b", text)
+            or re.search(r"\b(?:travel|go)\s+(?:from|to)\b", text)
+        )
         return (
             "book_flight" in intent_text
             or (
-                re.search(r"\b(book|reserve|purchase)\b", text)
+                booking_verb
                 and re.search(r"\b(flight|ticket|trip)\b", text)
             )
+            or (has_route and booking_verb)
         )
 
     @staticmethod
@@ -4238,13 +4253,17 @@ class CargoAgent(Agent):  # type: ignore[misc]
     def _airline_task_needs_identity(wm: "WorkingMemory") -> bool:
         text = (wm.goal + " " + " ".join(wm.user_facts)).lower()
         slots = wm.semantic_slots
+        has_route = bool(
+            CargoAgent._slot_value(slots, "origin")
+            and CargoAgent._slot_value(slots, "destination")
+        ) or bool(re.search(r"\bfrom\s+[A-Za-z][A-Za-z .'-]{1,40}?\s+to\s+[A-Za-z]", wm.goal + " " + " ".join(wm.user_facts), re.I))
         intents = slots.get("intents") or slots.get("intent") or []
         if not isinstance(intents, list):
             intents = [intents]
         intent_text = " ".join(str(v).lower() for v in intents if v)
         return bool(
-            re.search(r"\b(book|reserve|purchase|change|modify|update|reschedule|cancel|refund|downgrade|upgrade)\b", text)
-            and re.search(r"\b(flight|ticket|trip|reservation)\b", text)
+            re.search(r"\b(book|reserve|purchase|fly|flying|travel|go|change|modify|update|reschedule|cancel|refund|downgrade|upgrade)\b", text)
+            and (re.search(r"\b(flight|ticket|trip|reservation)\b", text) or has_route)
         ) or bool({"book_flight", "modify_flight"} & set(intent_text.split()))
 
     def _canonical_airport_arg(self, value: str, *, field: str) -> str:
@@ -4296,7 +4315,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             )
             ask = ProposedAction(
                 name=RESPOND_TOOL_NAME,
-                args={},
+                args={"content": summary + " Should I book this itinerary?"},
                 declared_class=RiskClass.ASK_USER,
                 declared_pre=["itinerary selected"],
                 declared_post=["user confirms booking"],
@@ -4306,9 +4325,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 raw_response="",
                 bypass_gates=True,
             )
-            return self._fresh_action_or_none(ask, wm)
+            return ask
         action.bypass_gates = True
-        return self._fresh_action_or_none(action, wm)
+        return action
 
     def _airline_reservation_write_progress_action(self, wm: "WorkingMemory") -> Optional[ProposedAction]:
         if self._airline_booking_goal(wm):
@@ -4409,7 +4428,7 @@ class CargoAgent(Agent):  # type: ignore[misc]
             wm.stage_commit_confirmation(action.signature(), summary, self._action_payload(action))
             ask = ProposedAction(
                 name=RESPOND_TOOL_NAME,
-                args={},
+                args={"content": summary},
                 declared_class=RiskClass.ASK_USER,
                 declared_pre=["reservation write is fully specified"],
                 declared_post=["user confirms reservation write"],
@@ -4419,9 +4438,9 @@ class CargoAgent(Agent):  # type: ignore[misc]
                 raw_response="",
                 bypass_gates=True,
             )
-            return self._fresh_action_or_none(ask, wm)
+            return ask
         action.bypass_gates = True
-        return self._fresh_action_or_none(action, wm)
+        return action
 
     def _select_active_airline_reservation(self, wm: "WorkingMemory") -> Optional[Dict[str, Any]]:
         reservations = [
@@ -4493,10 +4512,15 @@ class CargoAgent(Agent):  # type: ignore[misc]
             intents = [intents]
         text = " ".join(str(v).lower() for v in intents)
         user = (wm.goal + " " + " ".join(wm.user_facts)).lower()
-        return "book_flight" in text or (
-            re.search(r"\b(book|reserve|purchase)\b", user)
-            and re.search(r"\b(flight|ticket|trip)\b", user)
+        has_route = bool(self._slot_value(slots, "origin") and self._slot_value(slots, "destination"))
+        booking_verb = bool(
+            re.search(r"\b(book|reserve|purchase|fly|flying)\b", user)
+            or re.search(r"\b(?:travel|go)\s+(?:from|to)\b", user)
         )
+        return "book_flight" in text or (
+            booking_verb
+            and re.search(r"\b(flight|ticket|trip)\b", user)
+        ) or (has_route and booking_verb)
 
     def _select_airline_itinerary(self, wm: "WorkingMemory") -> List[Dict[str, Any]]:
         slots = wm.semantic_slots
@@ -5478,6 +5502,20 @@ class CargoAgent(Agent):  # type: ignore[misc]
     def _schema_for(self, action: ProposedAction) -> ToolEffectSchema:
         """Return the schema for ``action.name``, synthesising one for unknown
         tools so the gate logic always has something to check."""
+        if action.name.lower() in (RESPOND_TOOL_NAME, "send_user", "finish", "final", "answer"):
+            from .schemas import ToolEffectSchema
+            return ToolEffectSchema(
+                name=RESPOND_TOOL_NAME,
+                cls=action.declared_class,
+                irreversible=is_irreversible_or_final(action.declared_class),
+                preconditions=[],
+                postconditions=[],
+                arg_id_fields=[],
+                arg_semantic_fields=["content"],
+                param_properties={},
+                required_params=[],
+                description="controller/user-facing response",
+            )
         if action.name in self.schemas:
             return self.schemas[action.name]
         # Synthesise a minimal schema using the declared class.
