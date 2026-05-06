@@ -43,7 +43,9 @@ from src.cargo import (  # noqa: E402
     GenericCargoKernel,
     GoalActionCandidate,
     GoalField,
+    Obligation,
     PreCommitVerifier,
+    PredictiveGradientScheduler,
     SoftGoalFieldRouter,
     Preference,
     ProposedAction,
@@ -56,6 +58,7 @@ from src.cargo import (  # noqa: E402
     is_gated,
     is_irreversible_or_final,
     parse_proposer_response,
+    render_proposer_user_message,
     render_tools_block,
     reset_cache,
     run_cargo,
@@ -1021,12 +1024,173 @@ class TestProposerParsing(unittest.TestCase):
         self.assertIsNotNone(action)
         self.assertEqual(action.declared_class, RiskClass.IRREVERSIBLE)
 
+    def test_cargo_n_fields_parse_from_top_level_and_action(self) -> None:
+        text = json.dumps({
+            "thought": "Use known user_id mia_li_3668 to fetch profile.",
+            "gradient_id": "GROUND_SLOT:user_id",
+            "thought_uses_known_facts": True,
+            "action": {
+                "name": "get_user_details",
+                "args": {"user_id": "mia_li_3668"},
+                "declared_class": "READ",
+                "declared_pre": ["user_id known"],
+                "declared_post": ["profile loaded"],
+            },
+        })
+
+        action = parse_proposer_response(text)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.gradient_id, "GROUND_SLOT:user_id")
+        self.assertTrue(action.thought_uses_known_facts)
+
+    def test_cargo_n_fields_parse_from_flat_action_shape(self) -> None:
+        text = json.dumps({
+            "thought": "Known reservation_id RX-883 should be inspected.",
+            "tool": "get_reservation_details",
+            "arguments": {"reservation_id": "RX-883"},
+            "declared_class": "READ",
+            "gradient": "RESOLVE_CANDIDATES:reservation",
+            "thought_uses_known_facts": True,
+        })
+
+        action = parse_proposer_response(text)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.name, "get_reservation_details")
+        self.assertEqual(action.gradient_id, "RESOLVE_CANDIDATES:reservation")
+        self.assertTrue(action.thought_uses_known_facts)
+
 
 class TestSystemPromptShape(unittest.TestCase):
     def test_system_prompt_contains_required_keys(self) -> None:
         for k in ("READ", "WRITE", "IRREVERSIBLE", "FINAL", "ASK_USER",
                   "thought", "action", "declared_class"):
             self.assertIn(k, SYSTEM_PROMPT)
+
+    def test_system_prompt_contains_cargo_n_gradient_contract(self) -> None:
+        for k in (
+            "CARGO-N predictive-coding discipline",
+            "KNOWN FACTS",
+            "CURRENT GRADIENT",
+            "gradient_id",
+            "thought_uses_known_facts",
+        ):
+            self.assertIn(k, SYSTEM_PROMPT)
+
+
+class TestCargoNPredictiveLoop(unittest.TestCase):
+    """Focused tests for the CARGO-N belief/gradient/friction runtime spine."""
+
+    def _airline_booking_memory(self) -> WorkingMemory:
+        wm = WorkingMemory(goal="Book a flight from New York to Seattle on May 20.")
+        text = "My user id is mia_li_3668. Book a flight from New York to Seattle on May 20."
+        wm.absorb_user_message(text)
+        kernel = GenericCargoKernel(TauAirlineAdapter())
+        kernel.observe_user_message(wm, text)
+        wm.auth_user_id = "mia_li_3668"
+        wm.task_state.bind_fact("origin", "JFK", source="user")
+        wm.task_state.bind_fact("destination", "SEA", source="user")
+        wm.task_state.bind_fact("date", "2024-05-20", source="user")
+        wm.task_state.upsert_obligation(Obligation(
+            obligation_id="book_flight",
+            operation_type="book_flight",
+            required_slots={"user_id", "origin", "destination", "date"},
+            confirmation_required=True,
+            execution_required=True,
+        ))
+        return wm
+
+    def test_belief_prompt_view_renders_locked_facts_gradient_and_critique(self) -> None:
+        wm = self._airline_booking_memory()
+        wm.goal_field.record_critique("respond()#generic", "PHASE", "Cannot ask for known route.")
+        snapshot = PredictiveGradientScheduler().snapshot(wm, TauAirlineAdapter())
+        rendered = snapshot.render_prompt_view(max_chars=1800)
+
+        self.assertIn("KNOWN FACTS:", rendered)
+        self.assertIn("user_id = mia_li_3668", rendered)
+        self.assertIn("OPEN OBLIGATIONS:", rendered)
+        self.assertIn("PREDICTION_ERROR_F:", rendered)
+        self.assertIn("GRADIENT THIS TURN:", rendered)
+        self.assertIn("LAST CRITIQUE:", rendered)
+        self.assertLessEqual(len(rendered), 1800)
+
+    def test_scheduler_uses_domain_weights_and_nonzero_prediction_error(self) -> None:
+        wm = self._airline_booking_memory()
+        scheduler = PredictiveGradientScheduler()
+        snapshot = scheduler.snapshot(wm, TauAirlineAdapter())
+
+        self.assertEqual(snapshot.weights["w_obl"], 1.5)
+        self.assertEqual(snapshot.weights["w_grd"], 1.0)
+        self.assertGreater(snapshot.free_energy, 0.0)
+        self.assertIn(snapshot.gradient.kind, {"GROUND_SLOT", "CONFIRM", "COMMIT"})
+
+    def test_gradient_match_blocks_generic_ask_when_goal_frame_is_known(self) -> None:
+        wm = self._airline_booking_memory()
+        action = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="How can I assist you today?",
+            raw_thought="How can I assist you today?",
+        )
+
+        gate = PredictiveGradientScheduler().validate_gradient_match(
+            action,
+            wm,
+            TauAirlineAdapter(),
+        )
+
+        self.assertFalse(gate.ok)
+        self.assertEqual(gate.gate, "gradient_match")
+        self.assertEqual(gate.reason, "generic_ask_does_not_address_gradient")
+
+    def test_gradient_match_is_run_inside_gate_stack(self) -> None:
+        from src.cargo.cargo_agent import CargoAgent
+
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = MockClient([])
+        agent.model = "test"
+        agent.temperature = 0.0
+        agent.adapter = TauAirlineAdapter()
+        agent.kernel = GenericCargoKernel(agent.adapter)
+        agent.calibration = default_calibration()
+        schema = ToolEffectSchema(name="respond", cls=RiskClass.FINAL)
+        agent.schemas = {"respond": schema}
+        wm = self._airline_booking_memory()
+        action = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            user_text="What would you like me to do?",
+            raw_thought="What would you like me to do?",
+        )
+
+        failing, diag = agent._run_gates(action, schema, wm, [], CargoStats())
+
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "gradient_match")
+        self.assertIn("gradient_match", diag["gates_run"])
+        self.assertIn("gradient_match", diag["gates_failed"])
+
+    def test_proposer_user_message_includes_belief_view_before_working_memory(self) -> None:
+        wm = self._airline_booking_memory()
+        snapshot = PredictiveGradientScheduler().snapshot(wm, TauAirlineAdapter())
+        msg = render_proposer_user_message(
+            wm=wm,
+            tools_block="Tools available:\n- respond [FINAL] required=-",
+            belief_view=snapshot.render_prompt_view(max_chars=1200),
+            history_tail="",
+            critique="",
+        )
+
+        self.assertIn("--- CARGO-N belief view ---", msg)
+        self.assertIn("KNOWN FACTS:", msg)
+        self.assertIn("GRADIENT THIS TURN:", msg)
+        self.assertLess(
+            msg.index("--- CARGO-N belief view ---"),
+            msg.index("--- Working memory ---"),
+        )
 
 
 # ---------------------------------------------------------------------------

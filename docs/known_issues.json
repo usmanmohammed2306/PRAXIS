@@ -812,12 +812,27 @@
     },
     {
       "id": "cargo_n_belief_gradient_scheduler",
-      "invariant": "CARGO-N-lite renders a compact typed belief snapshot, chooses a deterministic progress gradient, injects gate critiques into the goal field, blacklists repeated failed signatures, and scores candidates by gradient alignment before existing gates run.",
+      "invariant": "CARGO-N renders a compact typed belief snapshot, chooses a deterministic progress gradient, injects gate critiques into the goal field, blacklists repeated failed signatures, computes a free-energy-style residual, and scores candidates by gradient alignment before existing gates run.",
       "tests": [
         "test_goal_field_momentum_updates_deterministically",
         "test_repeated_non_progress_raises_friction_and_changes_selection",
         "tests.test_cargo_corpus.CargoNCorpusRegressionTests.test_cn_396_core_friction_gradient",
         "tests.test_cargo_corpus.CargoNCorpusRegressionTests.test_cn_391_core_belief_compactness"
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "cargo_n_closed_prompt_gate_loop",
+      "invariant": "The CARGO-N belief/gradient state is consumed by the live proposer prompt and gate stack: compact belief renders before working memory, proposer JSON carries gradient diagnostics, domain weights produce a nonzero prediction-error residual, and clear gradient residuals enter the normal critique/friction path through a conservative gradient_match gate.",
+      "tests": [
+        "test_cargo_n_fields_parse_from_top_level_and_action",
+        "test_cargo_n_fields_parse_from_flat_action_shape",
+        "test_system_prompt_contains_cargo_n_gradient_contract",
+        "test_belief_prompt_view_renders_locked_facts_gradient_and_critique",
+        "test_scheduler_uses_domain_weights_and_nonzero_prediction_error",
+        "test_gradient_match_blocks_generic_ask_when_goal_frame_is_known",
+        "test_gradient_match_is_run_inside_gate_stack",
+        "test_proposer_user_message_includes_belief_view_before_working_memory"
       ],
       "status": "verified"
     },
