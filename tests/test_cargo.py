@@ -4868,6 +4868,17 @@ class TestCargoV4DecisionEngine(unittest.TestCase):
                     "total_baggages", "nonfree_baggages", "insurance",
                 ],
             ),
+            "cancel_reservation": ToolEffectSchema(
+                name="cancel_reservation",
+                cls=RiskClass.WRITE,
+                arg_id_fields=["reservation_id"],
+                required_params=["reservation_id"],
+            ),
+            "update_reservation_flights": ToolEffectSchema(
+                name="update_reservation_flights",
+                cls=RiskClass.WRITE,
+                arg_id_fields=["reservation_id", "payment_id"],
+            ),
             "respond": ToolEffectSchema(name="respond", cls=RiskClass.FINAL),
         }
         return agent
@@ -7060,6 +7071,117 @@ class TestSoftGoalFieldRouter(unittest.TestCase):
             raw_thought=text,
         )
 
+    def _make_retail_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = MockClient(scripts=[])
+        agent.model = "test"
+        agent.temperature = 0.0
+        agent.adapter = TauRetailAdapter()
+        agent.kernel = GenericCargoKernel(agent.adapter)
+        agent.schemas = {
+            "respond": ToolEffectSchema(name="respond", cls=RiskClass.FINAL),
+            "exchange_delivered_order_items": ToolEffectSchema(
+                name="exchange_delivered_order_items",
+                cls=RiskClass.WRITE,
+                arg_id_fields=["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+            ),
+        }
+        return agent
+
+    def _make_airline_agent(self) -> Any:
+        from src.cargo.cargo_agent import CargoAgent
+        agent = CargoAgent.__new__(CargoAgent)
+        agent.client = MockClient(scripts=[])
+        agent.model = "test"
+        agent.temperature = 0.0
+        agent.adapter = TauAirlineAdapter()
+        agent.kernel = GenericCargoKernel(agent.adapter)
+        agent.schemas = {
+            "respond": ToolEffectSchema(name="respond", cls=RiskClass.FINAL),
+            "search_direct_flight": ToolEffectSchema(
+                name="search_direct_flight",
+                cls=RiskClass.READ,
+                arg_semantic_fields=["origin", "destination", "date"],
+            ),
+            "search_onestop_flight": ToolEffectSchema(
+                name="search_onestop_flight",
+                cls=RiskClass.READ,
+                arg_semantic_fields=["origin", "destination", "date"],
+            ),
+            "get_reservation_details": ToolEffectSchema(
+                name="get_reservation_details",
+                cls=RiskClass.READ,
+                arg_id_fields=["reservation_id"],
+            ),
+            "get_user_details": ToolEffectSchema(
+                name="get_user_details",
+                cls=RiskClass.READ,
+                arg_id_fields=["user_id"],
+            ),
+            "book_reservation": ToolEffectSchema(
+                name="book_reservation",
+                cls=RiskClass.WRITE,
+                arg_id_fields=["user_id", "payment_id"],
+            ),
+            "cancel_reservation": ToolEffectSchema(
+                name="cancel_reservation",
+                cls=RiskClass.WRITE,
+                arg_id_fields=["reservation_id"],
+                required_params=["reservation_id"],
+            ),
+        }
+        return agent
+
+    def _seed_mia_booking_trace_state(self, agent: Any) -> WorkingMemory:
+        wm = WorkingMemory()
+        text = (
+            "My user id is mia_li_3668. I want to book a one-way economy flight "
+            "from New York to Seattle on May 20 after 11am. One stopover is okay. "
+            "I have 3 bags, no insurance, and want to use my larger certificate "
+            "then my 7447 card."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.auth_user_id = "mia_li_3668"
+        wm.user_profiles["mia_li_3668"] = {
+            "name": {"first_name": "Mia", "last_name": "Li"},
+            "dob": "1990-04-05",
+            "membership": "gold",
+            "payment_methods": {
+                "certificate_7504069": {"source": "certificate", "amount": 250, "id": "certificate_7504069"},
+                "credit_card_4421486": {"source": "credit_card", "last_four": "7447", "id": "credit_card_4421486"},
+            },
+        }
+        return wm
+
+    def _record_mia_booking_search_results(self, agent: Any, wm: WorkingMemory) -> None:
+        args = {"origin": "JFK", "destination": "SEA", "date": "2024-05-20"}
+        one_obs = [[
+            {
+                "flight_number": "HAT136",
+                "origin": "JFK",
+                "destination": "ATL",
+                "scheduled_departure_time_est": "19:00:00",
+                "status": "available",
+                "available_seats": {"economy": 14},
+                "prices": {"economy": 152},
+                "date": "2024-05-20",
+            },
+            {
+                "flight_number": "HAT039",
+                "origin": "ATL",
+                "destination": "SEA",
+                "scheduled_departure_time_est": "22:00:00",
+                "status": "available",
+                "available_seats": {"economy": 10},
+                "prices": {"economy": 103},
+                "date": "2024-05-20",
+            },
+        ]]
+        wm.absorb_observation(one_obs)
+        agent._kernel().record_action_candidates(wm, "search_onestop_flight", args, one_obs)
+
     def test_goal_field_momentum_updates_deterministically(self) -> None:
         wm = WorkingMemory(goal="Book a flight from New York to Seattle on May 20")
         adapter = TauAirlineAdapter()
@@ -7177,6 +7299,198 @@ class TestSoftGoalFieldRouter(unittest.TestCase):
 
         self.assertLessEqual(len(rendered), 220)
         self.assertIn("momentum=", rendered)
+
+    def test_v3_staged_booking_commit_is_restored_after_confirmation(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        self._record_mia_booking_search_results(agent, wm)
+
+        ask = agent._airline_booking_progress_action(wm)
+        self.assertIsNotNone(ask)
+        self.assertEqual(ask.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertEqual(wm.pending_commit_action["name"], "book_reservation")
+
+        wm.absorb_user_message("Yes, please proceed with that booking.")
+        commit = agent._executable_gradient_action(wm)
+
+        self.assertIsNotNone(commit)
+        self.assertEqual(commit.name, "book_reservation")  # type: ignore[union-attr]
+        self.assertEqual(getattr(commit, "forced_action_source", ""), "staged_commit")  # type: ignore[union-attr]
+        self.assertTrue(commit.bypass_gates)  # type: ignore[union-attr]
+
+    def test_v3_gradient_match_failure_uses_spine_action_not_retry_loop(self) -> None:
+        agent = self._make_airline_agent()
+        wm = self._seed_mia_booking_trace_state(agent)
+        self._record_mia_booking_search_results(agent, wm)
+        generic = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            raw_thought="The user has not provided any specific request yet.",
+            user_text="What specific request would you like help with?",
+        )
+
+        failing, diag = agent._run_gates(generic, agent._schema_for(generic), wm, [], CargoStats())
+        forced = agent._executable_gradient_action(wm, generic, avoid_signature=generic.signature())
+
+        self.assertIsNotNone(failing)
+        self.assertEqual(failing.gate, "gradient_match")  # type: ignore[union-attr]
+        self.assertIn("gradient", diag)
+        self.assertIsNotNone(forced)
+        self.assertNotEqual(forced.signature(), generic.signature())  # type: ignore[union-attr]
+        self.assertIn(getattr(forced, "forced_action_source", ""), {"airline_booking_spine", "staged_commit"})  # type: ignore[union-attr]
+
+    def test_v3_retail_exact_or_skip_blocks_weaker_keyboard_fallback(self) -> None:
+        adapter = TauRetailAdapter()
+        details = {
+            "name": "Mechanical Keyboard",
+            "variants": {
+                "old": {
+                    "item_id": "old_keyboard",
+                    "available": True,
+                    "options": {"switch type": "tactile", "backlight": "white", "size": "full size"},
+                },
+                "fallback": {
+                    "item_id": "fallback_keyboard",
+                    "available": True,
+                    "options": {"switch type": "clicky", "backlight": "none", "size": "full size"},
+                },
+            },
+        }
+        old_item = {
+            "item_id": "old_keyboard",
+            "name": "Mechanical Keyboard",
+            "options": {"switch type": "tactile", "backlight": "white", "size": "full size"},
+        }
+        goal = (
+            "Exchange the mechanical keyboard for clicky switches, RGB backlight, "
+            "and full size. If that exact keyboard is not available, rather only "
+            "exchange the smart thermostat."
+        )
+
+        selected = adapter.select_replacement_variant_id(details, old_item, goal)
+
+        self.assertIsNone(selected)
+
+    def test_v3_retail_post_write_summary_includes_variant_evidence(self) -> None:
+        agent = self._make_retail_agent()
+        wm = WorkingMemory(goal="Exchange keyboard for clicky RGB and thermostat compatible with Google Home.")
+        wm.order_details["#W2378156"] = {
+            "order_id": "#W2378156",
+            "status": "delivered",
+            "items": [
+                {"item_id": "old_keyboard", "name": "Mechanical Keyboard", "product_id": "keyboard"},
+                {"item_id": "old_thermostat", "name": "Smart Thermostat", "product_id": "thermostat"},
+            ],
+        }
+        wm.product_details["keyboard"] = {
+            "name": "Mechanical Keyboard",
+            "variants": {
+                "new_keyboard": {
+                    "item_id": "new_keyboard",
+                    "options": {"switch type": "clicky", "backlight": "RGB", "size": "full size"},
+                }
+            },
+        }
+        wm.product_details["thermostat"] = {
+            "name": "Smart Thermostat",
+            "variants": {
+                "new_thermostat": {
+                    "item_id": "new_thermostat",
+                    "options": {"compatibility": "Google Assistant"},
+                }
+            },
+        }
+        action = ProposedAction(
+            name="exchange_delivered_order_items",
+            args={
+                "order_id": "#W2378156",
+                "item_ids": ["old_keyboard", "old_thermostat"],
+                "new_item_ids": ["new_keyboard", "new_thermostat"],
+                "payment_method_id": "credit_card_9513926",
+            },
+            declared_class=RiskClass.WRITE,
+        )
+
+        summary = agent._post_write_closure_summary(action, wm, '{"status":"exchange requested"}')
+
+        self.assertIn("clicky", summary)
+        self.assertIn("RGB", summary)
+        self.assertIn("Google Home", summary)
+        self.assertIn("credit_card_9513926", summary)
+
+    def test_v3_airline_basic_economy_change_uses_cancel_fallback(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "My user id is olivia_gonzalez_2305. Change my return flight from "
+            "Texas to Newark. If basic economy cannot be changed, cancel it "
+            "using my travel insurance."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.auth_user_id = "olivia_gonzalez_2305"
+        wm.reservation_details["Z7GOZK"] = {
+            "reservation_id": "Z7GOZK",
+            "user_id": "olivia_gonzalez_2305",
+            "cabin": "basic_economy",
+            "trip_type": "round_trip",
+            "flights": [
+                {"flight_number": "HAT111", "origin": "EWR", "destination": "DFW", "date": "2024-05-15"}
+            ],
+            "insurance": "yes",
+        }
+        wm.typed_values["reservation_id"] = ["Z7GOZK"]
+
+        ask = agent._airline_reservation_write_progress_action(wm)
+        self.assertIsNotNone(ask)
+        self.assertEqual(ask.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertEqual(wm.pending_commit_action["name"], "cancel_reservation")
+        self.assertIn("cancel", ask.user_text.lower())  # type: ignore[union-attr]
+
+        wm.absorb_user_message("Yes, cancel it.")
+        commit = agent._executable_gradient_action(wm)
+
+        self.assertIsNotNone(commit)
+        self.assertEqual(commit.name, "cancel_reservation")  # type: ignore[union-attr]
+        self.assertEqual(commit.args, {"reservation_id": "Z7GOZK"})  # type: ignore[union-attr]
+
+    def test_v3_post_write_followup_returns_evidence_response(self) -> None:
+        agent = self._make_retail_agent()
+        wm = WorkingMemory(goal="Exchange the thermostat for Google Home compatibility.")
+        wm.post_write_responded = True
+        wm.last_write_action = {
+            "name": "exchange_delivered_order_items",
+            "args": {
+                "order_id": "#W1",
+                "item_ids": ["old_thermostat"],
+                "new_item_ids": ["new_thermostat"],
+                "payment_method_id": "credit_card_1",
+            },
+            "declared_class": "WRITE",
+        }
+        wm.order_details["#W1"] = {
+            "order_id": "#W1",
+            "status": "delivered",
+            "items": [{"item_id": "old_thermostat", "name": "Smart Thermostat", "product_id": "thermostat"}],
+        }
+        wm.product_details["thermostat"] = {
+            "name": "Smart Thermostat",
+            "variants": {
+                "new_thermostat": {
+                    "item_id": "new_thermostat",
+                    "options": {"compatibility": "Google Assistant"},
+                }
+            },
+        }
+        wm.absorb_user_message("Could you confirm it is compatible with Google Home?")
+
+        action = agent._executable_gradient_action(wm)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.declared_class, RiskClass.FINAL)  # type: ignore[union-attr]
+        self.assertIn("Google Home", action.user_text)  # type: ignore[union-attr]
+        self.assertEqual(getattr(action, "forced_action_source", ""), "post_write_closure")  # type: ignore[union-attr]
 
 if __name__ == "__main__":
     unittest.main()
