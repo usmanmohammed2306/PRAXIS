@@ -102,6 +102,12 @@ def main() -> int:
     ns = _parse_args()
     outputs_dir = Path(ns.outputs_dir)
 
+    # Gracefully handle missing outputs directory (common on first run).
+    if not outputs_dir.exists():
+        print(f"Outputs directory does not exist: {outputs_dir}")
+        print("(This is normal on first run; no prior trajectories to backfill)")
+        return 0
+
     cfg = default_config()
     if ns.bank_dir:
         cfg.bank_dir = Path(ns.bank_dir)
