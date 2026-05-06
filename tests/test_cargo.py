@@ -7364,6 +7364,66 @@ class TestSoftGoalFieldRouter(unittest.TestCase):
         self.assertEqual(action.name, "get_user_details")  # type: ignore[union-attr]
         self.assertEqual(action.args["user_id"], "mia_li_3668")  # type: ignore[union-attr]
 
+    def test_v3_latest_airline_booking_without_identity_asks_before_search(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "I'm looking to book a flight from New York to Seattle on May 20th. "
+            "It should be one way after 11 AM in economy."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        proposal = ProposedAction(
+            name="search_direct_flight",
+            args={"origin": "JFK", "destination": "SEA", "date": "2024-05-20"},
+            declared_class=RiskClass.READ,
+            raw_thought="Search flights first.",
+        )
+
+        action = agent._airline_obligation_action(proposal, wm)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.name, "respond")  # type: ignore[union-attr]
+        self.assertEqual(action.declared_class, RiskClass.ASK_USER)  # type: ignore[union-attr]
+        self.assertIn("user ID", action.user_text)  # type: ignore[union-attr]
+
+    def test_v3_latest_profile_generic_failure_queues_reservation_scan(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "I need to change my return flight from Texas to Newark. My current "
+            "flight leaves at 3 pm, but I'd prefer a later one."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.absorb_user_message("My user ID is olivia_gonzalez_2305.")
+        profile = {
+            "reservations": ["Z7GOZK", "K67C4W"],
+            "payment_methods": {"credit_card_9969263": {"id": "credit_card_9969263"}},
+        }
+        wm.absorb_observation(profile)
+        agent._kernel().observe_tool_result(wm, "get_user_details", profile)
+        wm.user_profiles["olivia_gonzalez_2305"] = profile
+        generic = ProposedAction(
+            name="respond",
+            args={},
+            declared_class=RiskClass.ASK_USER,
+            raw_thought="The user has not provided any specific request yet.",
+            user_text="Hello! How can I assist you today?",
+        )
+
+        failing, _diag = agent._run_gates(generic, agent._schema_for(generic), wm, [], CargoStats())
+        forced = agent._executable_gradient_action(wm, generic, avoid_signature=generic.signature())
+        self.assertIsNotNone(failing)
+        self.assertIsNotNone(forced)
+        agent._queue_forced_action(wm, forced)  # type: ignore[arg-type]
+        queued = agent._executable_gradient_action(wm)
+
+        self.assertIsNotNone(queued)
+        self.assertEqual(queued.name, "get_reservation_details")  # type: ignore[union-attr]
+        self.assertEqual(queued.args["reservation_id"], "Z7GOZK")  # type: ignore[union-attr]
+        self.assertEqual(getattr(queued, "forced_action_source", ""), "reservation_scan_spine")  # type: ignore[union-attr]
+
     def test_v3_latest_airline_task_frame_never_uses_retail_auth(self) -> None:
         agent = self._make_airline_agent()
         wm = WorkingMemory(
@@ -7403,6 +7463,48 @@ class TestSoftGoalFieldRouter(unittest.TestCase):
 
         self.assertIsNone(failing)
         self.assertIn("repeat_loop", diag["gates_run"])
+
+    def test_v3_latest_forced_confirmation_bypasses_repeated_ask_state_gate(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory(goal="Cancel my selected reservation.")
+        text = "I found reservation JG7FMM for the active trip frame. Should I cancel this reservation?"
+        wm.last_final_text = text
+        action = ProposedAction(
+            name="respond",
+            args={"content": text},
+            declared_class=RiskClass.ASK_USER,
+            raw_thought="Airline phase gate: present selected reservation action before committing.",
+            user_text=text,
+            bypass_gates=True,
+        )
+        action = agent._mark_forced(action, "airline_reservation_spine")
+
+        failing, diag = agent._run_gates(action, agent._schema_for(action), wm, [], CargoStats())
+
+        self.assertIsNone(failing)
+        self.assertIn("state_validity", diag["gates_run"])
+
+    def test_v3_latest_airline_refund_method_does_not_mean_cancel_when_downgrading(self) -> None:
+        agent = self._make_airline_agent()
+        wm = WorkingMemory()
+        text = (
+            "I need to change all my upcoming business class flights to economy. "
+            "I'm okay with getting a refund to my original payment method."
+        )
+        wm.absorb_user_message(text)
+        agent._kernel().observe_user_message(wm, text)
+        wm.auth_user_id = "omar_davis_3817"
+        wm.typed_values["reservation_id"] = ["JG7FMM"]
+        wm.reservation_details["JG7FMM"] = {
+            "reservation_id": "JG7FMM",
+            "user_id": "omar_davis_3817",
+            "cabin": "business",
+            "flights": [{"flight_number": "HAT001", "origin": "EWR", "destination": "DFW", "date": "2024-05-20"}],
+        }
+
+        action = agent._airline_reservation_write_progress_action(wm)
+
+        self.assertFalse(action is not None and action.name == "cancel_reservation")
 
     def test_v3_retail_exact_or_skip_blocks_weaker_keyboard_fallback(self) -> None:
         adapter = TauRetailAdapter()
