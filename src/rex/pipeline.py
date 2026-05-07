@@ -168,66 +168,41 @@ def _load_seed_corpus(
     """Read the seed bank and return :class:`ProcessMemoryCard`-shaped cards.
 
     The seed file may be in either schema:
+      * **v2** ``ProcessMemoryCard`` JSONL (produced by build_experience_memory.py)
+      * **Legacy** ``ExperienceCard`` JSONL (lifted automatically)
 
-      * **Legacy** ``ExperienceCard`` JSONL (what ``build_experience_bank``
-        emits today). Each row is lifted to :class:`ProcessMemoryCard`.
-      * **v2** ``ProcessMemoryCard`` JSONL (used by tests / future seed
-        builders).
-
-    If the seed file is absent, the seed bank is built lazily from
-    ``experience.build_experience_bank`` using allowed-only support data.
+    If the seed file is absent, returns an empty list — no cards are
+    auto-generated from benchmark training data or hardcoded policies.
+    REx starts with empty memory on the first run; permanent experience is
+    built explicitly via build_experience_memory.py.
     """
     import json as _json
-
-    from .experience import (
-        _read_cards_jsonl,
-        build_experience_bank,
-        _policy_airline_cards,
-        _ace_schema_cards,
-    )
+    from .experience import _read_cards_jsonl
 
     bank_dir = Path(override_dir) if override_dir else cfg.bank_dir
     bank_path = bank_dir / f"{domain}.jsonl"
+    if not bank_path.exists():
+        return []
 
-    def _read_v2_or_legacy(path: Path) -> List[ProcessMemoryCard]:
-        if not path.exists():
-            return []
-        cards: List[ProcessMemoryCard] = []
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                if not isinstance(data, dict):
-                    continue
-                if "tool_ordering_hints" in data or "task_category" in data:
-                    cards.append(ProcessMemoryCard.from_dict(data))
-                else:
-                    legacy_pmcs = _read_cards_jsonl(path)  # legacy path: read whole file
-                    return [from_experience_card(c) for c in legacy_pmcs]
-        return cards
-
-    cards = _read_v2_or_legacy(bank_path)
-    if cards:
-        return cards
-    # No file or empty: try building the legacy bank.
-    try:
-        build_experience_bank(output_dir=bank_dir)
-    except Exception:
-        pass
-    cards = _read_v2_or_legacy(bank_path)
-    if cards:
-        return cards
-    # Final fallback: in-process seed cards built from policy/schema.
-    if domain == "airline":
-        return [from_experience_card(c) for c in _policy_airline_cards()]
-    if domain == "ace":
-        return [from_experience_card(c) for c in _ace_schema_cards()]
-    return []
+    cards: List[ProcessMemoryCard] = []
+    with bank_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if "tool_ordering_hints" in data or "task_category" in data:
+                cards.append(ProcessMemoryCard.from_dict(data))
+            else:
+                # Legacy ExperienceCard schema — lift the whole file and return
+                legacy_pmcs = _read_cards_jsonl(bank_path)
+                return [from_experience_card(c) for c in legacy_pmcs]
+    return cards
 
 
 # ---------------------------------------------------------------------------
