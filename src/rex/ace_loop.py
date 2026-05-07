@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from .config import RexConfig
-from .decision_retrieval import OperationalDecisionRetriever, extract_operational_context
+from .decision_retrieval import ExperienceConditionedRetriever, extract_operational_context
 from .experience import (
     ExperienceRetriever,
     load_experience_cards,
@@ -134,11 +134,12 @@ def run_rex(
     except Exception:
         hybrid = None
 
-    # Initialize operational decision retriever
-    operational_retriever: Optional[OperationalDecisionRetriever] = None
+    # Experience-conditioned retriever: state-triggered mid-trajectory refresh
+    # Retrieves prior experiences matching the current execution situation
+    operational_retriever: Optional[ExperienceConditionedRetriever] = None
     try:
         if process_cards:
-            operational_retriever = OperationalDecisionRetriever(process_cards)
+            operational_retriever = ExperienceConditionedRetriever(process_cards)
     except Exception:
         operational_retriever = None
 
