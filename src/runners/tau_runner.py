@@ -363,6 +363,14 @@ def _solve_one(
         reward, info, messages, total_cost = 0.0, {"error": str(exc)}, [], 0.0
         status = "error"
         err = f"{exc.__class__.__name__}: {exc}"
+    # Stamp domain/environment into info so trajectory_parser._environment_for()
+    # labels cards as "retail"/"airline" rather than "generic", which activates
+    # the correct domain-specific distillation heuristics.
+    if isinstance(info, dict):
+        info.setdefault("domain", ns.env)
+        info.setdefault("environment", ns.env)
+    else:
+        info = {"domain": ns.env, "environment": ns.env}
     return {
         "task_id": task_index,
         "trial": trial,
