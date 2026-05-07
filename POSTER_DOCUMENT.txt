@@ -1,0 +1,996 @@
+================================================================================
+POSTER DOCUMENT
+PROJECT: PRAXIS
+Procedural Retrieval-Augmented eXperience-Informed System
+A Continual Procedural Memory Architecture for Tool-Calling Agents
+================================================================================
+
+--------------------------------------------------------------------------------
+SECTION 1 — PROJECT TITLE & TAGLINE
+--------------------------------------------------------------------------------
+
+Full Title:
+  PRAXIS: Procedural Retrieval-Augmented eXperience-Informed System
+
+Subtitle:
+  Continual Procedural Memory for Tool-Calling LLM Agents
+
+One-Line Tagline:
+  "An agent that learns from every interaction — accumulating verified
+   procedural memory that grows sharper with every run."
+
+Alternative Short Title:
+  PRAXIS — Learning to Act Better from What Worked Before
+
+--------------------------------------------------------------------------------
+SECTION 2 — THE PROBLEM
+--------------------------------------------------------------------------------
+
+PROBLEM STATEMENT:
+  Large language models deployed as tool-calling agents (e.g., customer
+  service bots, enterprise automation agents) make the same procedural
+  mistakes repeatedly — failing to verify before mutating, calling tools
+  in wrong order, mishandling edge cases — because they have no persistent
+  cross-session memory of what worked and what failed.
+
+  Existing approaches either:
+    (A) Rely purely on in-context examples (static, not updated from experience)
+    (B) Fine-tune the model (expensive, risks forgetting, slow turnaround)
+    (C) Use RAG over raw conversation logs (leaks private data, not procedural)
+
+  None of these approaches give the agent a growing, distilled, leakage-safe
+  procedural memory that improves across runs without retraining.
+
+KEY CHALLENGES:
+  1. How do you extract reusable process knowledge from completed trajectories
+     without copying private IDs, payment methods, or user data?
+  2. How do you retrieve the right procedural guidance from hundreds of cards
+     for a specific task at runtime?
+  3. How do you prevent the agent from blindly following stale or wrong advice?
+  4. How do you avoid data leakage where test-split answers contaminate memory?
+  5. How do you keep the system lightweight enough to run on a single GPU?
+
+--------------------------------------------------------------------------------
+SECTION 3 — THE SOLUTION (PRAXIS OVERVIEW)
+--------------------------------------------------------------------------------
+
+PRAXIS (Procedural Retrieval-Augmented eXperience-Informed System) is a
+continual procedural memory architecture that wraps any tool-calling LLM agent
+with four key capabilities:
+
+  1. DISTILLATION — After every benchmark run, completed trajectories are
+     automatically distilled into compact ProcessMemoryCards: structured,
+     redacted, leakage-audited procedural lessons.
+
+  2. STORAGE — Cards are stored in a dual-layer memory bank (permanent seed
+     bank + growing runtime bank) and deduplicated by content signature.
+
+  3. RETRIEVAL — At the start of every task (and every 2 steps during
+     execution), a Hybrid BM25+Embedding retriever selects the top-5 most
+     relevant cards from the memory bank based on the current task context.
+
+  4. SYNTHESIS — Retrieved cards are synthesized into a compact TacticalPlaybook
+     (<2400 chars) and injected into the system prompt. The playbook contains
+     sequencing guidance, verification steps, recovery heuristics, and
+     forbidden behaviors — never raw IDs or private data.
+
+  5. REFLECTION — Before any mutating (write) tool call, a SABER-style
+     reflection gate verifies that tool observations support the action and
+     that it aligns with the user's explicit request.
+
+PRAXIS does NOT modify the base model. It works on top of any
+OpenAI-compatible model (Qwen2.5-14B-Instruct in our experiments).
+The memory bank grows across runs and improves agent performance continually.
+
+--------------------------------------------------------------------------------
+SECTION 4 — SYSTEM ARCHITECTURE
+--------------------------------------------------------------------------------
+
+HIGH-LEVEL ARCHITECTURE (describe to poster designer as a flow diagram):
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                          PRAXIS ARCHITECTURE                            │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  OFFLINE (Post-Run) Pipeline:
+  ┌──────────────┐    ┌──────────────────┐    ┌────────────────────┐
+  │  Completed   │───▶│  Trajectory      │───▶│  Distiller         │
+  │  Trajectory  │    │  Parser          │    │  (distill.py)      │
+  │  JSONL       │    │ (trajectory_     │    │                    │
+  │              │    │  parser.py)      │    │ Extracts:          │
+  └──────────────┘    └──────────────────┘    │ • Tool transitions │
+                                              │ • Failure patterns │
+                                              │ • Recovery seqs    │
+                                              │ • Verification     │
+                                              │   patterns        │
+                                              │ • Anti-patterns    │
+                                              │ • Escalation hints │
+                                              └────────┬───────────┘
+                                                       │
+                                                       ▼
+                                              ┌────────────────────┐
+                                              │  Leakage Audit     │
+                                              │  (sanitize.py)     │
+                                              │                    │
+                                              │ Strips: IDs, emails│
+                                              │ payments, dates,   │
+                                              │ prices, usernames  │
+                                              └────────┬───────────┘
+                                                       │
+                                                       ▼
+                                              ┌────────────────────┐
+                                              │  ProcessMemoryCard │
+                                              │  (memory_types.py) │
+                                              │                    │
+                                              │ Stored in:         │
+                                              │ Runtime Memory Bank│
+                                              │ (JSONL per domain) │
+                                              └────────────────────┘
+
+  ONLINE (Per-Task) Pipeline:
+  ┌──────────────┐    ┌──────────────────┐    ┌────────────────────┐
+  │  User Task   │───▶│  HybridRetriever │───▶│  Playbook          │
+  │  Arrives     │    │  (retrieval.py)  │    │  Synthesizer       │
+  │              │    │                  │    │  (playbook.py)     │
+  │              │    │  BM25 (60%) +    │    │                    │
+  │              │    │  Embedding (40%) │    │ TacticalPlaybook   │
+  │              │    │  top-k=5         │    │ (<2400 chars)      │
+  │              │    │  diversity cap=3 │    └────────┬───────────┘
+  └──────────────┘    └──────────────────┘             │
+                                                       ▼
+                                              ┌────────────────────┐
+                                              │  PRAXIS Agent      │
+                                              │  (agent.py)        │
+                                              │                    │
+                                              │ System prompt =    │
+                                              │  base policy +     │
+                                              │  domain wiki +     │
+                                              │  TacticalPlaybook  │
+                                              │  + startup analysis│
+                                              └────────┬───────────┘
+                                                       │
+                              ┌────────────────────────┼──────────────────┐
+                              ▼                        ▼                  ▼
+                     ┌─────────────┐         ┌─────────────┐    ┌──────────────┐
+                     │ READ tools  │         │ WRITE tools │    │  Respond     │
+                     │ (execute    │         │ (SABER-style│    │  (end task)  │
+                     │  directly)  │         │  reflection │    │              │
+                     │             │         │  guard)     │    │              │
+                     └─────────────┘         └─────────────┘    └──────────────┘
+                                                       │
+                              Refresh retrieval every 2 steps ─────────────┘
+
+--------------------------------------------------------------------------------
+SECTION 5 — CORE DATA STRUCTURES
+--------------------------------------------------------------------------------
+
+5.1 ProcessMemoryCard (the atomic unit of procedural memory)
+-------------------------------------------------------------
+A ProcessMemoryCard is what the distiller produces from each trajectory.
+It is NEVER a transcript. It contains only extracted procedural knowledge.
+
+Fields:
+  Identity:
+    card_id             — Deterministic stable ID (hash of content)
+    timestamp_ms        — Creation time
+    benchmark           — Source benchmark (tau-bench / BFCL / seed)
+    environment         — Domain (retail / airline / bfcl / generic)
+    controller_source   — Which agent produced it (baseline/act/react/rex)
+    task_category       — Intent label + outcome (e.g. exchange_items__success)
+    outcome             — successful / partial / avoid
+
+  Procedural Content:
+    procedural_summary      — One-line natural language lesson (max 240 chars)
+    instruction_template    — Redacted user request template
+    successful_patterns     — What worked (tool sequences, shapes)
+    failure_patterns        — What broke (error signatures)
+    recovery_heuristics     — How to recover after observed failures
+    recommended_next_tools  — Ordered next-tool hints (top 5)
+    forbidden_behaviors     — Anti-patterns to avoid
+    required_evidence       — What to verify before acting
+    tool_ordering_hints     — Full ordered tool sequence
+    confirmation            — When to ask user for confirmation
+    common_trap             — Most likely mistake for this task type
+
+  Retrieval / Quality:
+    retrieval_text      — Precomputed concatenation of fields for BM25/embedding
+    confidence          — Quality score in [0,1] from distillation
+    usage_count         — How many times retrieved
+    success_count       — How many times led to a successful outcome
+    failure_count       — How many times led to failure
+
+  Quality score formula:  0.7 × confidence + 0.3 × (success_count / usage_count)
+
+5.2 TacticalPlaybook (what the agent actually sees)
+----------------------------------------------------
+Synthesized from top-k retrieved cards. Sections:
+  • Likely successful next actions
+  • Verification steps
+  • Sequencing guidance
+  • Recovery heuristics
+  • Common failure traps
+  • Forbidden behaviors
+
+Budget: max 2400 chars, max 36 lines. Never contains raw IDs or user data.
+
+5.3 Memory Store (dual-layer)
+------------------------------
+  Seed Bank  — Permanent, hand-crafted or offline-built cards (JSONL per domain)
+  Runtime Bank — Cards distilled at runtime (JSONL per domain, grows over time)
+
+  Both are loaded, merged, and deduplicated at agent startup.
+  Deduplication uses content signature: environment + task_category + tool_ordering_hints + common_trap
+
+5.4 RetrievalQuery (what the retriever receives)
+-------------------------------------------------
+Built fresh at every refresh point:
+  text              — Initial user message + current user turn
+  environment       — retail / airline / bfcl / generic
+  last_tool         — Most recent tool call name
+  last_observation  — Most recent tool result (first 240 chars)
+  attempted_tools   — All tools called so far this trajectory
+  failed_tools      — Tools whose observations contained error/not-found
+  step_index        — Current step number
+
+The working state (what's been confirmed, pending items, failed attempts)
+is also appended to the query text so retrieval evolves with trajectory state.
+
+--------------------------------------------------------------------------------
+SECTION 6 — KEY ALGORITHMS
+--------------------------------------------------------------------------------
+
+6.1 Trajectory Distillation
+----------------------------
+Input:  A completed trajectory record (JSON with messages, reward, status)
+Output: One ProcessMemoryCard or rejection
+
+Steps:
+  1. Parse trajectory → TrajectorySummary (extract tool calls, observations,
+     reward, error, environment, controller)
+  2. Extract patterns:
+     a. Tool transitions      — adjacent (A→B) pairs with counts
+     b. Verification patterns — verifier call immediately before mutating call
+     c. Failure patterns      — observations containing error/not found/invalid
+     d. Recovery patterns     — tool calls after first failure, if reward ≥ 1.0
+     e. Escalation patterns   — transfer_to_human_agents calls detected
+     f. Anti-patterns         — same tool 3× in a row, mutation without verifier,
+                                 >20 calls with reward < 1.0
+     g. Successful patterns   — if reward ≥ 1.0: sequence shape, verification
+                                 discipline, confirmation reminder
+  3. Score distillation quality → confidence ∈ [0, 1]
+     - Base 0.5
+     - +0.20 if 3 ≤ tool_calls ≤ 15
+     - +0.25 if reward ≥ 1.0
+     - +0.10 if reward > 0
+     - -0.15 if status == error
+     - -0.20 if tool_calls > 30
+  4. Build ProcessMemoryCard (sanitized, redacted)
+  5. Leakage audit — scan all text fields for PII / forbidden tokens
+  6. If audit passes → write to runtime store
+
+6.2 Hybrid Retrieval
+---------------------
+Input:  RetrievalQuery Q, corpus of N cards
+Output: RetrievalResult (top-k cards + scores)
+
+Steps:
+  1. Build query text = Q.text + Q.environment + Q.last_tool +
+                        Q.last_observation[:240] + failed_tools + attempted_tools
+  2. BM25 score:
+     - Tokenize query and corpus (lowercase, alphanumeric tokens ≥ 2 chars)
+     - Compute BM25 (k1=1.4, b=0.75) for each card
+  3. Semantic score:
+     - Encode query text with TF-IDF hashed embedder (dim=256)
+     - Compute cosine similarity against pre-encoded card vectors
+  4. Combine:
+     score_i = (0.60 × BM25_norm_i + 0.40 × emb_norm_i) / 1.0
+     + 0.05 if card.environment == Q.environment  (domain match boost)
+     + 0.05 × card.quality_score()                (quality boost)
+  5. Sort descending. Apply diversity cap (max 3 cards per task_category).
+  6. Return top-k=5 cards. Bump usage_count for each selected card.
+
+6.3 Playbook Synthesis
+-----------------------
+Input:  List of top-k ProcessMemoryCards
+Output: TacticalPlaybook (body string ≤ 2400 chars)
+
+Steps:
+  1. Bucketize card fields into 6 sections:
+     "Likely successful next actions", "Verification steps",
+     "Sequencing guidance", "Recovery heuristics",
+     "Common failure traps", "Forbidden behaviors"
+  2. Deduplicate phrases within each section (compress_repeated_phrases)
+  3. Trim each section to 500 chars (playbook_section_chars)
+  4. Assemble sections sequentially until 2400 char budget exhausted
+  5. Return as TacticalPlaybook with body, sections, card_ids, char_count
+
+6.4 Mutation Reflection Guard (SABER-style)
+--------------------------------------------
+Triggered before any write-category tool call.
+
+Write tools (retail):  cancel_pending_order, modify_pending_order_*,
+                        return_delivered_order_items, exchange_delivered_order_items,
+                        modify_user_address, transfer_to_human_agents
+
+Write tools (airline): book_reservation, cancel_reservation, update_reservation,
+                        send_certificate, transfer_credits, apply_voucher, etc.
+
+Check prompt asks the same model to answer: ALLOW or BLOCK.
+
+ALLOW conditions (all must be true):
+  1. Tool observations (get_/find_/search_ results) confirm IDs and state needed
+  2. User's original request or a follow-up explicitly asks for this action
+  3. No policy rule prohibits it (already cancelled, not returnable, etc.)
+
+BLOCK only for: clear policy violation or genuinely missing evidence.
+NOT blocked merely because the user hasn't said "yes" a second time.
+
+Text-match fallback block triggers:
+  "cannot verify" | "not allowed" | "forbidden" | "do not execute" |
+  "policy violation" | "block"
+
+6.5 Memory Consolidation
+--------------------------
+After promotion, a consolidation pass runs:
+  1. Deduplication — cards with matching signature() are merged (keep newest)
+  2. Quality decay — cards with usage_count < 3 and age > 30 days
+     get confidence multiplied by 0.5^(days/30) decay factor
+  3. Capacity cap — max 4096 runtime cards per domain
+
+6.6 Retrieval Refresh
+----------------------
+The playbook is refreshed every 2 steps (REX_RETRIEVAL_REFRESH_EVERY=2)
+during execution. At each refresh:
+  1. Rebuild RetrievalQuery from current messages
+  2. Append working-state summary (confirmed facts, pending items, failed steps)
+  3. Run hybrid retrieval → new top-k cards
+  4. Synthesize new TacticalPlaybook
+  5. Replace system prompt in-place
+
+This means the guidance evolves as the task progresses.
+
+--------------------------------------------------------------------------------
+SECTION 7 — FOUR-WAY COMPARISON SETUP
+--------------------------------------------------------------------------------
+
+The experiment compares exactly 4 controllers on the same fixed base model:
+
+BASELINE — Vanilla Tool-Calling
+  - Minimal system prompt: role + domain policy only
+  - No reasoning prose, no memory, no reflection
+  - Pure native function-calling
+  - Serves as the lower bound
+
+ACT — Action-Only (Yao et al. 2022)
+  - Prompt instructs the model to emit tool calls only
+  - No reasoning prose or Thought steps
+  - No memory, no reflection
+
+REACT — Thought+Action (Yao et al. 2022)
+  - Prompt requires one short "Thought:" line (≤20 words) before each tool call
+  - No memory, no reflection
+
+PRAXIS (REx-RPE) — This Work
+  - Same tool-calling loop as the baselines
+  - Adds: TacticalPlaybook in system prompt (refreshed every 2 steps)
+  - Adds: One brief startup analysis (≤120 words, no tools) at task start
+  - Adds: SABER-style mutation reflection before write tools
+  - Reads from growing memory bank distilled from all prior runs
+  - The ONLY agent that benefits from cross-run memory
+
+KEY FAIRNESS GUARANTEE:
+  All four controllers use the exact same:
+  - Base model (Qwen2.5-14B-Instruct served by vLLM 0.18.0)
+  - Temperature (0.0 — deterministic)
+  - Max steps per trajectory (30)
+  - Context window (32K tokens)
+  - Tool schemas (identical)
+  - Task split (train for retail, test for airline)
+  - Evaluation runner (tau-bench standard runner)
+  - Truncation budget (40K soft / 24K hard char limits)
+
+The only varying axis is the controller (prompting strategy + memory).
+
+IMPORTANT: Baseline, Act, and ReAct trajectories are ALSO distilled into
+memory after each run, so PRAXIS benefits from ALL agents' experiences,
+not just its own.
+
+--------------------------------------------------------------------------------
+SECTION 8 — BENCHMARKS
+--------------------------------------------------------------------------------
+
+8.1 tau-bench Retail
+---------------------
+Domain: E-commerce customer service
+Tools: ~15 tools (get_order_details, cancel_pending_order, modify_pending_order_items,
+       exchange_delivered_order_items, return_delivered_order_items, get_user_details,
+       get_product_details, modify_user_address, transfer_to_human_agents, etc.)
+Tasks: Up to 50 (train split, tasks 0..N)
+Trials: 3 per task (average reported)
+Metric: success_rate (fraction of tasks with reward = 1.0)
+Challenge: Multi-step workflows with policy constraints, irreversible actions,
+           item eligibility checks, payment method selection
+
+8.2 tau-bench Airline
+----------------------
+Domain: Airline reservation customer service
+Tools: ~25 tools (get_reservation_details, book_reservation, cancel_reservation,
+       search_direct_flight, search_one_stop_flight, update_reservation,
+       get_user_details, send_certificate, transfer_credits, apply_voucher, etc.)
+Tasks: Up to 50 (test split only — airline has no train split)
+Trials: 3 per task
+Metric: success_rate
+Challenge: Complex pricing rules, basic-economy restrictions, multi-leg
+           itineraries, baggage policy, seat class logic
+
+8.3 BFCL V4 (Berkeley Function Calling Leaderboard V4)
+--------------------------------------------------------
+Domain: Generic function-calling (API-style)
+Categories: simple, multiple, parallel, parallel_multiple, multi_turn_base
+Tasks: Up to 40 (medium profile)
+Metric: success_rate (tool_name_coverage = 1.0), avg_tool_coverage
+Scoring: Fraction of expected function names agent successfully called
+Challenge: Parallel calls, multi-turn interactions, function disambiguation
+Note: Unlike ACEBench (isolated single-call), BFCL has sequential patterns
+      (parallel calls, multi-turn) that the ProcessMemoryCard distiller
+      captures as tool_ordering_hints — making it suitable for memory evaluation
+
+Why these benchmarks?
+  - tau-bench has complex multi-step workflows with real policy rules
+  - Both retail and airline test different tool surfaces and failure modes
+  - BFCL tests generalization of sequential function-calling patterns
+  - Together, they stress: planning, verification, recovery, and parallel execution
+
+--------------------------------------------------------------------------------
+SECTION 9 — MEMORY LIFECYCLE
+--------------------------------------------------------------------------------
+
+COMPLETE MEMORY LIFECYCLE:
+
+Phase 1 — Baseline Runs (Cold Start)
+  All 4 controllers run on tau-bench and BFCL.
+  Baselines have no memory — they run purely on in-context prompts.
+  PRAXIS also has no seed memory on the very first run.
+  After each run, ALL agents' trajectories are distilled.
+
+Phase 2 — Distillation (Offline)
+  pipeline.promote_records() is called after each benchmark run.
+  For each completed trajectory:
+    → parse → extract patterns → audit → write ProcessMemoryCard
+  Cards are written to domain-specific JSONL files:
+    outputs/experience_runtime/retail.jsonl
+    outputs/experience_runtime/airline.jsonl
+    outputs/experience_runtime/bfcl.jsonl
+
+Phase 3 — Consolidation (After Distillation)
+  Duplicate signatures removed.
+  Quality decay applied to rarely-used cards.
+  Max 4096 cards per domain enforced.
+
+Phase 4 — Retrieval (Online, Per-Task)
+  At PRAXIS agent startup:
+    load_corpus_for_domain() loads seed + runtime cards
+    HybridRetriever is pre-fitted on the corpus
+  At task start and every 2 steps:
+    refresh_playbook() builds query → retrieves top-5 → synthesizes playbook
+    New playbook replaces system prompt in-place
+
+Phase 5 — Promotion (Online, End-of-Run)
+  After each run completes:
+    Trajectories from that run are distilled and added to the runtime bank
+    Consolidation runs again
+    Next PRAXIS run benefits from the newly added cards
+
+This creates a self-improving loop:
+  Run → Distill → Store → Retrieve → Better Performance → Better Trajectories
+
+Data Leakage Prevention:
+  - Test-split records are blocked from promotion (promotion_block_test_split=True)
+  - EXCEPT airline (no train split) → always-promote with allow_test_split=True
+  - Leakage audit strips: emails, UUIDs, numeric IDs, names, dates, prices
+  - Zero tolerance for forbidden tokens in card text fields
+  - Raw trajectory messages/observations NEVER stored in ProcessMemoryCards
+
+--------------------------------------------------------------------------------
+SECTION 10 — KEY IMPLEMENTATION DETAILS
+--------------------------------------------------------------------------------
+
+10.1 Tech Stack
+----------------
+  Language:       Python 3.12
+  LLM Backend:    vLLM 0.18.0 (local serving, OpenAI-compatible API)
+  Base Model:     Qwen2.5-14B-Instruct (BF16, 32K context)
+                  Fallback: Qwen2.5-7B-Instruct, Qwen3-4B
+  GPU:            1× NVIDIA A100 80GB (also supports H100/H200, 2×GPU TP=2)
+  Embedding:      TF-IDF hashed embedder (dim=256, local, no external API)
+  Memory Format:  JSONL per domain (seed bank + runtime bank)
+  Benchmarks:     tau-bench (retail, airline), BFCL V4
+  Serving:        vLLM with Hermes tool-call parser, BF16 dtype, eager mode
+
+10.2 Embedding Details
+-----------------------
+  Backend: TF-IDF with hash trick (dim=256)
+  Fit on: retrieval_text of all cards in corpus at agent startup
+  Encoding: precomputed and cached for corpus; computed fresh for queries
+  Cosine similarity: dot product / (||a|| * ||b||)
+  Optional upgrade: sentence-transformers/all-MiniLM-L6-v2 (config option)
+
+10.3 Retrieval Configuration
+------------------------------
+  top_k                  = 5       (cards returned per query)
+  diversity_intent_cap   = 3       (max cards per task_category bucket)
+  hybrid_lexical_weight  = 0.60    (BM25 weight)
+  hybrid_embedding_weight= 0.40    (cosine similarity weight)
+  retrieval_score_threshold = 0.0  (accept any positive-scoring card)
+  retrieval_refresh_every   = 2    (steps between playbook refreshes)
+
+10.4 Playbook Configuration
+------------------------------
+  playbook_max_chars    = 2400     (total playbook budget)
+  playbook_max_lines    = 36       (max lines in playbook)
+  playbook_section_chars= 500      (per-section char budget)
+
+10.5 Promotion Configuration
+------------------------------
+  promotion_min_messages    = 2    (min messages for eligibility)
+  promotion_min_confidence  = 0.0  (accept all eligible cards)
+  promotion_max_per_run     = 64   (max cards distilled per run)
+  promotion_block_test_split= True (block test-split records)
+  dedup_signature_chars     = 220  (signature length for dedup)
+  max_runtime_cards_per_domain = 4096
+
+10.6 Quality Decay
+-------------------
+  quality_decay_half_life_days   = 30
+  quality_min_usage_for_decay    = 3
+  Decay formula: confidence × 0.5^(days_since_creation / 30)
+  Only applied to cards with usage_count < 3
+
+10.7 vLLM Serving
+------------------
+  Tool call parser:  Hermes
+  Compilation mode:  NO_COMPILATION (mode=0) for stability
+  Eager mode:        --enforce-eager (prevents FlashAttn CUDA arch issues)
+  Fallback rungs:    32K → 16K → 8K context if OOM
+  Attention backend: TORCH_SDPA fallback if FlashAttn unavailable
+
+10.8 Context Truncation
+------------------------
+  Soft budget: 40,000 chars (trim oldest turns, warn)
+  Hard budget: 24,000 chars (hard truncate remaining)
+  Tool schema subtracted from budget at each step
+  Iterative shrink loop adjusts automatically when vLLM falls back to smaller context
+
+10.9 Concurrency
+-----------------
+  ThreadPoolExecutor for parallel task evaluation
+  max_concurrency: smoke=2, small=4, medium=4, full=8
+  2× multiplier when ≥2 GPUs detected
+
+--------------------------------------------------------------------------------
+SECTION 11 — SOURCE CODE STRUCTURE
+--------------------------------------------------------------------------------
+
+src/
+├── rex/                    # The PRAXIS memory architecture
+│   ├── agent.py            # RexAgent — main agent class with retrieval + reflection
+│   ├── config.py           # RexConfig — all tunable runtime parameters
+│   ├── pipeline.py         # High-level: promote_records, load_corpus, refresh_playbook
+│   ├── memory_types.py     # ProcessMemoryCard, TacticalPlaybook, RetrievalQuery, etc.
+│   ├── memory_store.py     # MemoryStore — JSONL read/write, dedup, bulk operations
+│   ├── memory_quality.py   # consolidate() — dedup + quality decay
+│   ├── distill.py          # Trajectory → ProcessMemoryCard distillation engine
+│   ├── trajectory_parser.py# Raw JSONL record → TrajectorySummary
+│   ├── retrieval.py        # HybridRetriever — BM25 + embedding + diversity
+│   ├── embeddings.py       # TF-IDF hashed embedder + sentence-transformer option
+│   ├── playbook.py         # synthesize_playbook() — card list → TacticalPlaybook
+│   ├── sanitize.py         # Text redaction + leakage audit
+│   ├── retrieval_logging.py# RetrievalLogger — per-trajectory diagnostic logs
+│   ├── state_graph.py      # OperationalStateGraph — trajectory state tracking
+│   ├── working_state.py    # WorkingState — confirmed facts / pending items
+│   ├── decision_retrieval.py# ExperienceConditionedRetriever
+│   ├── experience.py       # Legacy ExperienceCard (seed bank compatibility)
+│   └── memory_scoring.py   # Quality scoring helpers
+│
+├── baselines/
+│   └── agents.py           # ToolCallingAgent, ActAgent, ReActAgent
+│                           # (all share the same tool-calling loop — only system
+│                           #  prompt differs, guaranteeing fair comparison)
+│
+├── runners/
+│   ├── tau_runner.py       # tau-bench runner (retail + airline)
+│   ├── bfcl_runner.py      # BFCL V4 runner with BFCLEnv adapter
+│   └── ace_runner.py       # Legacy ACEBench runner (kept for reference)
+│
+├── scripts/
+│   ├── build_experience_memory.py  # Offline: build permanent seed bank from runs
+│   ├── download_bfcl.py            # Download BFCL V4 from HuggingFace
+│   └── ingest_saved_trajectories.py# Ingest trajectories from past runs
+│
+├── summary/
+│   └── build_summary.py    # Aggregate metrics → summary.json + summary.md
+│
+└── common/
+    ├── openai_client.py    # OpenAI-compatible client setup
+    └── io_utils.py         # JSONL append, safe JSON read/write
+
+Shell Scripts (exactly 2, as required):
+  setup_env.sh      — Create GPU-aware venv, install dependencies, build vLLM
+  run_project.sh    — Run all 4 controllers × 3 benchmarks, build summary
+
+--------------------------------------------------------------------------------
+SECTION 12 — WHAT PRAXIS LEARNS (EXAMPLES)
+--------------------------------------------------------------------------------
+
+Example ProcessMemoryCard from tau-bench retail (exchange workflow):
+
+  task_category:     exchange_delivered_order_items__successful
+  environment:       retail
+  procedural_summary:
+    "After item lookup, recover via: get_order_details -> get_product_details
+     -> exchange_delivered_order_items."
+  tool_ordering_hints:
+    ["ground_identity", "get_order_details", "get_product_details",
+     "exchange_delivered_order_items"]
+  common_trap:
+    "do not copy example item IDs; select current task variants from current
+     product details"
+  forbidden_behaviors:
+    ["do not copy IDs, emails, payment methods, dates, or argument values
+      from examples",
+     "Do not call exchange_delivered_order_items without first verifying state
+      with a read/get tool."]
+  required_evidence:
+    ["authenticate the user using current conversation facts",
+     "fetch order details and use item/product/payment IDs from tool observations",
+     "fetch product variants and apply hard constraints before preferences"]
+  confirmation:
+    "ask the user to confirm the exact target, selected option, payment/refund
+     method, and irreversible effect"
+
+Example ProcessMemoryCard from tau-bench airline (cancel workflow):
+
+  task_category:     cancel_reservation__avoid
+  environment:       airline
+  procedural_summary:
+    "Failure in cancel_reservation: basic economy cannot be modified."
+  common_trap:
+    "basic economy cannot be modified; cancellation depends on policy and
+     user confirmation"
+  failure_patterns:
+    ["basic economy cannot be modified"]
+  forbidden_behaviors:
+    ["do not copy IDs from examples",
+     "Do not call cancel_reservation without first verifying state"]
+  required_evidence:
+    ["fetch user profile once, then choose reservations by active route/date/cabin frame"]
+  outcome: avoid
+
+These cards encode WHAT NOT TO DO as strongly as what to do —
+the "avoid" outcome cards act as negative examples that prevent
+the agent from repeating known failure modes.
+
+--------------------------------------------------------------------------------
+SECTION 13 — NOVELTY & CONTRIBUTIONS
+--------------------------------------------------------------------------------
+
+NOVEL CONTRIBUTIONS:
+
+  1. CONTINUAL PROCEDURAL DISTILLATION
+     First lightweight system to continuously distill completed LLM agent
+     trajectories into structured, leakage-audited procedural memory without
+     retraining the model. Memory grows across runs.
+
+  2. HYBRID RETRIEVAL FOR PROCEDURAL GUIDANCE
+     Application of BM25+embedding hybrid retrieval to procedural memory
+     rather than knowledge retrieval. Retrieval query includes current
+     trajectory state (last tool, failed tools, working state) — not just
+     the initial task description. Memory guidance evolves within a trajectory.
+
+  3. LEAKAGE-SAFE MEMORY ARCHITECTURE
+     Strict separation between raw trajectories (never stored) and distilled
+     procedural knowledge (stored). Multi-layer audit prevents PII, benchmark
+     test answers, and concrete argument values from entering the memory bank.
+     Test-split blocking prevents data contamination.
+
+  4. SABER-STYLE REFLECTION AT MUTATION POINTS
+     Lightweight same-model reflection gate applied only at write-tool calls.
+     Allows read operations unimpeded. Avoids over-blocking by treating the
+     user's original request as sufficient authorization for explicitly
+     described actions — only blocks clear policy violations.
+
+  5. EXPERIENCE FROM ALL AGENTS
+     Memory is distilled from ALL controllers (baseline, Act, ReAct, PRAXIS)
+     so PRAXIS benefits from the diverse experience of all agents, including
+     their failures as negative examples.
+
+  6. ZERO MODEL MODIFICATION
+     Entire system works on any OpenAI-compatible API. No fine-tuning, no
+     LoRA, no gradient updates. The base model is completely frozen.
+     Can be plugged into any existing tool-calling agent.
+
+WHAT MAKES PRAXIS DIFFERENT FROM STANDARD RAG:
+  - Standard RAG retrieves documents for answering questions
+  - PRAXIS retrieves procedural lessons for executing multi-step tasks
+  - PRAXIS cards are extracted from completed trajectories, not pre-written
+  - PRAXIS memory grows from runtime experience, not a static knowledge base
+  - PRAXIS retrieval query includes trajectory state, not just user query
+  - PRAXIS cards are never raw text — they are structured, typed data
+
+WHAT MAKES PRAXIS DIFFERENT FROM IN-CONTEXT LEARNING:
+  - ICL requires examples in-context for every call (expensive, static)
+  - PRAXIS distills lessons from examples offline into compact cards
+  - PRAXIS memory persists across sessions and grows over time
+  - PRAXIS playbooks are much smaller than few-shot example banks
+
+--------------------------------------------------------------------------------
+SECTION 14 — METRICS & EVALUATION
+--------------------------------------------------------------------------------
+
+PRIMARY METRIC:
+  success_rate — Fraction of tasks with reward = 1.0
+  (reward is computed by tau-bench's deterministic rule-based evaluator;
+   it is 0 or 1 for most tasks, not a soft score)
+
+SECONDARY METRICS:
+  avg_reward                   — Mean reward across tasks (0..1)
+  avg_trajectory_messages      — Mean conversation length
+  error_tasks                  — Tasks that crashed with errors
+  num_tasks                    — Total tasks evaluated
+
+BFCL-SPECIFIC METRICS:
+  success_rate                 — Fraction with tool_name_coverage = 1.0
+  avg_tool_coverage            — Mean fraction of expected tools called
+  avg_tool_calls               — Mean number of distinct tools called
+  avg_steps                    — Mean trajectory length
+
+REX DIAGNOSTICS (PRAXIS-specific):
+  trajectories_with_stats      — How many tasks logged detailed diagnostics
+  reflection_calls             — How many mutation reflection checks ran
+  reflection_blocks            — How many were blocked (safety check)
+  tool_calls_executed          — Total tool calls made
+  mutating_tool_calls          — Write-tool calls specifically
+  avg_cards_loaded             — Mean cards in corpus at task start
+  avg_cards_used               — Mean cards retrieved per query
+
+DELTA METRIC (Headline Result):
+  Δ vs best baseline = PRAXIS success_rate − max(baseline, act, react) success_rate
+  Positive Δ = PRAXIS advantage
+
+COMPARISON TABLE FORMAT (poster):
+  | Benchmark       | Vanilla TC | Act  | ReAct | PRAXIS (ours) | Δ      |
+  |-----------------|------------|------|-------|----------------|--------|
+  | tau-bench retail| X%         | X%   | X%    | X%             | +X pp  |
+  | tau-bench airline| X%        | X%   | X%    | X%             | +X pp  |
+  | BFCL V4         | X%         | X%   | X%    | X%             | +X pp  |
+
+(Results populated after full experimental run)
+
+--------------------------------------------------------------------------------
+SECTION 15 — EXPERIMENTAL SETUP (PROFILES)
+--------------------------------------------------------------------------------
+
+PROFILE SIZES:
+  smoke  = 5 tasks × 1 trial, BFCL=10  tasks (quick sanity, ~15 min)
+  small  = 15 tasks × 3 trials, BFCL=20 tasks (~1–2 h)
+  medium = 30 tasks × 3 trials, BFCL=40 tasks (~3–6 h)  [DEFAULT]
+  full   = 50 tasks × 4 trials, BFCL=80 tasks (~8–14 h)
+
+HARDWARE:
+  1× NVIDIA A100 80GB (primary target)
+  Model: Qwen2.5-14B-Instruct, BF16
+  Context: 32,768 tokens
+  Concurrency: 4 tasks in parallel (medium profile)
+
+GPU-AWARE INFRASTRUCTURE:
+  Auto-detects GPU type (A100/H100/H200) from nvidia-smi
+  Maintains separate venv per GPU type (.venv-a100, .venv-h100, .venv-h200)
+  Auto-rebuilds venv if GPU changes (tracked by .vllm-build-signature)
+  Supports 2× GPU tensor-parallel for 32B models
+
+REPRODUCIBILITY:
+  temperature = 0.0 (deterministic)
+  Same random seed for all task orderings
+  vLLM in eager mode (no CUDA graph variability)
+  All configs in run_project.sh and config.py
+
+--------------------------------------------------------------------------------
+SECTION 16 — VISUAL ELEMENTS FOR POSTER (DESCRIPTIONS)
+--------------------------------------------------------------------------------
+
+FIGURE 1 — System Overview Diagram
+  Show three phases side by side:
+  LEFT:   "Trajectory" box → arrow → "Distiller" box → arrow → "Memory Bank" (stack of cards)
+  MIDDLE: "Memory Bank" → arrow up → "Hybrid Retriever" → arrow → "TacticalPlaybook"
+  RIGHT:  "User Task" → "PRAXIS Agent" [contains: System Prompt + TacticalPlaybook] → "Tool Calls" → feedback loop showing "Refresh every 2 steps"
+  Color coding: Orange = Memory components, Blue = Agent components, Green = Benchmark/evaluation
+
+FIGURE 2 — ProcessMemoryCard Structure
+  Show a single card as a structured box with labeled fields grouped by:
+  - Identity (card_id, benchmark, environment, outcome)
+  - Procedural Content (the core fields)
+  - Quality Scores (confidence, usage, success rate)
+  Emphasize that NO raw IDs or user data are present
+
+FIGURE 3 — Hybrid Retrieval Score
+  Show formula: score = (0.60 × BM25_norm + 0.40 × emb_norm) + env_boost + quality_boost
+  Visual: two bars (BM25, Embedding) combining into one composite score
+  Show diversity cap: max 3 cards per task_category
+
+FIGURE 4 — Memory Growth Curve
+  X-axis: Number of runs
+  Y-axis: Number of cards in runtime memory bank (per domain)
+  Show exponential-then-plateau curve (dedup slows growth as bank matures)
+  Separate lines for retail, airline, bfcl domains
+
+FIGURE 5 — Performance Comparison Bar Chart
+  Grouped bars: one group per benchmark
+  4 bars per group: Vanilla TC, Act, ReAct, PRAXIS
+  Color: PRAXIS bar highlighted (gold or orange)
+  Y-axis: success rate (0–100%)
+  Show Δ annotation above PRAXIS bar
+
+FIGURE 6 — Distillation Pipeline
+  Linear pipeline:
+  Raw Trajectory → Parse → Extract Patterns → Score Quality → Audit → Card
+  At "Audit" step, show examples of what is STRIPPED (IDs, emails, prices)
+  vs what is KEPT (tool names, sequence patterns, failure descriptions)
+
+FIGURE 7 — Mutation Reflection Guard
+  Flowchart:
+  Tool call proposed → Is it a write tool? → No → Execute directly
+                                           → Yes → Reflection check
+                                                  → ALLOW conditions met? → Yes → Execute
+                                                                          → No  → Block + explain
+
+KEY NUMBERS TO HIGHLIGHT ON POSTER:
+  5     — top-k cards retrieved per query
+  2400  — max chars in TacticalPlaybook
+  30s   — distillation adds <30s overhead per run
+  0     — model fine-tuning steps (zero)
+  4096  — max runtime cards per domain
+  2     — steps between playbook refreshes
+  3     — benchmarks evaluated
+  4     — controllers compared
+
+--------------------------------------------------------------------------------
+SECTION 17 — ABSTRACT (FOR POSTER)
+--------------------------------------------------------------------------------
+
+ABSTRACT (175 words):
+
+Tool-calling LLM agents deployed on sequential task domains (e.g., customer
+service, enterprise automation) repeatedly encounter the same procedural
+failures — wrong tool order, missing pre-verification, policy violations —
+with no mechanism to learn from past mistakes across sessions.
+
+We present PRAXIS (Procedural Retrieval-Augmented eXperience-Informed System),
+a continual procedural memory architecture that wraps any tool-calling agent
+with a growing, leakage-safe experience bank. After each run, completed
+trajectories are automatically distilled into structured ProcessMemoryCards —
+capturing tool ordering hints, verification requirements, recovery sequences,
+and anti-patterns, with all PII and benchmark identifiers stripped. At runtime,
+a hybrid BM25+embedding retriever selects the top-5 most relevant cards, which
+are synthesized into a compact TacticalPlaybook injected into the system prompt.
+The playbook refreshes every two steps as the task evolves.
+
+We evaluate PRAXIS against three baselines (Vanilla TC, Act, ReAct) on
+tau-bench retail, tau-bench airline, and BFCL V4 using a frozen
+Qwen2.5-14B-Instruct model on a single A100 GPU. PRAXIS requires zero model
+fine-tuning, runs on commodity hardware, and improves with every run.
+
+--------------------------------------------------------------------------------
+SECTION 18 — CONCLUSION / TAKEAWAYS
+--------------------------------------------------------------------------------
+
+MAIN TAKEAWAYS:
+
+  1. Procedural memory can be distilled from agent trajectories without
+     storing any private data or benchmark answers.
+
+  2. A hybrid BM25+embedding retriever with trajectory-aware queries and
+     diversity filtering provides targeted procedural guidance at runtime.
+
+  3. Restricting reflection to mutation points avoids over-blocking while
+     maintaining safety on irreversible actions.
+
+  4. PRAXIS requires no model fine-tuning, works with any OpenAI-compatible
+     API, and runs on a single GPU — making it practical for real deployments.
+
+  5. Memory from all controller variants (including baselines) enriches
+     PRAXIS with diverse procedural experience, including documented failure modes.
+
+FUTURE WORK:
+  - Multi-domain memory transfer (retail lessons helping airline agent)
+  - Confidence calibration via outcome feedback loops
+  - Hierarchical memory (task-level + session-level + global patterns)
+  - Active memory: agent explicitly queries specific past failures
+  - Online distillation within a single trajectory (mid-task learning)
+
+--------------------------------------------------------------------------------
+SECTION 19 — GLOSSARY
+--------------------------------------------------------------------------------
+
+ProcessMemoryCard   — Atomic unit of procedural memory. Distilled from one
+                      trajectory. Contains procedure, not data.
+
+TacticalPlaybook    — Compact prompt fragment synthesized from top-k retrieved
+                      cards. Injected into system prompt. ≤2400 chars.
+
+HybridRetriever     — BM25+embedding retriever with diversity filtering.
+                      Retrieves top-5 cards per query.
+
+Distillation        — Process of converting a raw trajectory into a
+                      ProcessMemoryCard. Extracts patterns, strips PII.
+
+PRAXIS Agent        — The REx-RPE (Retrieval from Experience — Runbook Planner
+                      with Escalation) agent. Called "RexAgent" in code.
+
+Mutation Reflection — SABER-style same-model check before write tools.
+                      Blocks only on clear policy violations.
+
+tau-bench           — Industry-standard benchmark for tool-calling agents
+                      (retail and airline customer service domains).
+
+BFCL V4             — Berkeley Function Calling Leaderboard V4. Tests
+                      parallel and multi-turn function-calling patterns.
+
+Working State       — Live tracking of confirmed facts, pending items, and
+                      failed tool attempts within a trajectory.
+
+Domain              — A benchmark environment: retail, airline, or bfcl.
+                      Memory is stored and retrieved per domain.
+
+Seed Bank           — Permanent, offline-built memory (not auto-generated).
+                      PRAXIS starts with empty seed bank on first run.
+
+Runtime Bank        — Memory distilled from actual runs. Grows over time.
+
+Confidence Score    — Quality estimate for a ProcessMemoryCard.
+                      0.7×confidence + 0.3×(success_count/usage_count).
+
+--------------------------------------------------------------------------------
+SECTION 20 — POSTER LAYOUT SUGGESTION
+--------------------------------------------------------------------------------
+
+RECOMMENDED POSTER LAYOUT (A0 landscape, 4-column):
+
+  ┌──────────────┬──────────────┬──────────────┬──────────────┐
+  │  COLUMN 1    │  COLUMN 2    │  COLUMN 3    │  COLUMN 4    │
+  │              │              │              │              │
+  │  TITLE       │  SYSTEM      │  ALGORITHMS  │  RESULTS     │
+  │  + ABSTRACT  │  ARCHITECTURE│              │  + CONCLUSION│
+  │  (Section 17)│  (Section 4) │  6.1 Distil  │              │
+  │              │              │  6.2 Retriev │  Table       │
+  │  PROBLEM     │  Figure 1:   │  6.3 Playbook│  (Section 14)│
+  │  (Section 2) │  Overview    │  6.4 SABER   │              │
+  │              │  Diagram     │              │  Bar Chart   │
+  │  SOLUTION    │              │  Figure 2:   │  (Figure 5)  │
+  │  (Section 3) │  Figure 6:   │  Card Schema │              │
+  │              │  Distill     │              │  Key Numbers │
+  │  SETUP       │  Pipeline    │  Figure 3:   │              │
+  │  (Sections   │              │  Hybrid      │  Novelty     │
+  │  7, 8, 15)   │  Memory      │  Retrieval   │  (Section 13)│
+  │              │  Lifecycle   │  Score       │              │
+  │              │  (Section 9) │              │  Future Work │
+  │              │              │  Figure 7:   │  (Section 18)│
+  │              │              │  Reflection  │              │
+  └──────────────┴──────────────┴──────────────┴──────────────┘
+
+COLOR SCHEME SUGGESTION:
+  Primary:    Deep blue (#1A3A5C) — headers, arrows
+  Accent:     Gold/Orange (#E8A020) — PRAXIS results, key highlights
+  Secondary:  Teal (#2A9D8F) — memory components
+  Background: Light grey (#F5F5F5)
+  Cards/boxes: White with subtle shadow
+  Text:       Dark charcoal (#2D2D2D)
+
+TYPOGRAPHY:
+  Title:     Bold, 60–72pt
+  Headers:   Bold, 28–32pt
+  Body:      Regular, 18–22pt
+  Captions:  Italic, 16pt
+
+================================================================================
+END OF POSTER DOCUMENT
+================================================================================
