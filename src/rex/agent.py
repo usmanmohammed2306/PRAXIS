@@ -401,9 +401,13 @@ class RexAgent(Agent):  # type: ignore[misc]
                 "content": (
                     "You are the REx mutation reflection check. Return JSON only:\n"
                     "{\"allow\": true|false, \"reason\": \"short\", \"ask_user\": \"question if blocked\"}\n"
-                    "Allow only if current conversation/tool evidence supports the exact write, policy permits it, "
-                    "and the user has confirmed the exact action/arguments when confirmation is needed. "
-                    "Examples are not evidence."
+                    "Allow the mutation if ALL of:\n"
+                    "  1. Tool observations (get_/find_/search_ results) confirm the IDs and state needed.\n"
+                    "  2. The user's original request or a follow-up message explicitly asks for this action.\n"
+                    "  3. No policy rule prohibits it (e.g. order already cancelled, item not returnable).\n"
+                    "Block ONLY for a clear policy violation or genuinely missing evidence — NOT because "
+                    "the user has not said 'yes' a second time. The user's original request is sufficient "
+                    "authorisation for the actions it explicitly describes. Examples are not evidence."
                 ),
             },
             {
@@ -421,7 +425,7 @@ class RexAgent(Agent):  # type: ignore[misc]
         if "allow" in data:
             return bool(data.get("allow")), str(data.get("reason") or ""), str(data.get("ask_user") or "")
         text = (content or "").lower()
-        block = any(x in text for x in ("missing", "cannot verify", "not allowed", "forbidden", "ask the user", "do not execute"))
+        block = any(x in text for x in ("cannot verify", "not allowed", "forbidden", "do not execute", "policy violation", "block"))
         return (not block), content[:160], ""
 
     def _check_mutation(self, tool_name: str, args: Dict[str, Any], messages: List[Dict[str, Any]], stats: Dict[str, Any]) -> tuple[bool, str]:
