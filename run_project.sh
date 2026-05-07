@@ -919,6 +919,10 @@ run_bfcl () {
     fi
   fi
 
+  # Same promotion policy as tau: only rex writes to the experience bank.
+  local bfcl_promote="never"
+  [[ "$agent_kind" == "rex" ]] && bfcl_promote="auto"
+
   if python -m src.runners.bfcl_runner \
       --agent "$agent_kind" --model "$SERVED_NAME" \
       --data-dir "$BFCL_DATA_DIR" \
@@ -926,6 +930,7 @@ run_bfcl () {
       --limit "$BFCL_LIMIT" \
       --max-num-steps "$BFCL_MAX_STEPS" \
       --max-concurrency "$BFCL_MAX_CONCURRENCY" \
+      --promote-runtime-memory "$bfcl_promote" \
       --runtime-dir "$REX_RUNTIME_DIR" \
       --output-dir "$out"; then
     log "BFCL V4 OK: $agent_kind"
