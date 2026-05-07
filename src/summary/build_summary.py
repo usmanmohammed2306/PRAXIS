@@ -1,7 +1,11 @@
 """Aggregate per-run metrics.json files into outputs/summary/{summary.json,summary.md}.
 
-Renders a four-way comparison across the same fixed base model on tau-bench:
+Renders a four-way comparison across the same fixed base model on three benchmarks:
+  - tau-bench retail   (task-completion / success_rate)
+  - tau-bench airline  (task-completion / success_rate)
+  - BFCL V4            (tool-name coverage / success_rate)
 
+Four controllers:
   1. baseline — vanilla tool-calling (minimal system prompt)
   2. act      — Act (Yao et al. 2022): action-only, no reasoning prose
   3. react    — ReAct (Yao et al. 2022): one-line Thought before each Action
@@ -16,9 +20,6 @@ data.
 The summary computes a ``deltas`` block per benchmark — REx-RPE minus
 the strongest non-REx controller on success rate — to make the wins
 immediately visible.
-
-Note: ACEBench is excluded because its standalone function-calling tasks
-do not produce sufficient procedural patterns for experience distillation.
 """
 from __future__ import annotations
 
@@ -53,6 +54,12 @@ SECTIONS: List[Tuple[str, Dict[str, str]]] = [
         "act": "tau_airline_act",
         "react": "tau_airline_react",
         "rex": "tau_airline_rex",
+    }),
+    ("BFCL V4", {
+        "baseline": "bfcl_agent_baseline",
+        "act": "bfcl_agent_act",
+        "react": "bfcl_agent_react",
+        "rex": "bfcl_agent_rex",
     }),
 ]
 
@@ -143,8 +150,19 @@ def _ace_rows(label: str, by_cond: Dict[str, Dict[str, Any]]) -> List[str]:
     ])
 
 
+def _bfcl_rows(label: str, by_cond: Dict[str, Dict[str, Any]]) -> List[str]:
+    return _rows_with_keys(label, by_cond, [
+        ("success_rate", "success rate (exact)", _pct),
+        ("avg_tool_coverage", "avg tool coverage", _pct),
+        ("avg_tool_calls", "avg tool calls", _num),
+        ("avg_steps", "avg steps", _num),
+        ("num_tasks", "tasks", lambda x: str(x) if x is not None else "n/a"),
+        ("error_tasks", "error tasks", lambda x: str(x) if x is not None else "n/a"),
+    ])
+
+
 def _headline_metric_key(label: str) -> str:
-    return "success_rate" if label.startswith("tau") else "completion_rate"
+    return "success_rate"
 
 
 def _strongest_baseline(by_cond: Dict[str, Dict[str, Any]], key: str) -> Tuple[Optional[str], Optional[float]]:
@@ -326,8 +344,10 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         label = section["label"]
         by_cond = section["by_condition"]
         lines.append(f"### {label}")
-        # All sections are now tau-bench (ACEBench excluded for lack of sequential patterns)
-        lines.extend(_tau_rows(label, by_cond))
+        if label.startswith("BFCL"):
+            lines.extend(_bfcl_rows(label, by_cond))
+        else:
+            lines.extend(_tau_rows(label, by_cond))
         lines.append("")
     # REx-specific diagnostics block.
     lines.append("## REx diagnostics")
