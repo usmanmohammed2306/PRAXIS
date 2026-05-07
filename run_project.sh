@@ -813,14 +813,17 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 export OPENAI_BASE_URL="http://127.0.0.1:${PORT}/v1"
 export OPENAI_API_BASE="$OPENAI_BASE_URL"
 
-# Build the REx procedural-memory bank from allowed support data only. This is
-# fast, deterministic, and explicitly avoids prior eval trajectories.
-export REX_EXPERIENCE_DIR="${REX_EXPERIENCE_DIR:-${PROJECT_SCRATCH}/rex_experience_bank}"
 # Runtime memory accumulates lessons distilled from saved trajectories across
 # runs. Lives under PROJECT_SCRATCH so cards survive cluster job boundaries and
 # are available to every re-invocation of this script on the same scratch volume.
 export REX_RUNTIME_DIR="${REX_RUNTIME_DIR:-${PROJECT_SCRATCH}/rex_experience_runtime}"
 mkdir -p "$REX_RUNTIME_DIR"
+# No separate pre-built seed bank exists on the scratch volume — only
+# rex_experience_runtime is available. Seed bank defaults to the same directory
+# so REx loads all accumulated experience cards from rex_experience_runtime.
+# MemoryStore deduplicates by signature so loading the same card twice is safe.
+export REX_EXPERIENCE_DIR="${REX_EXPERIENCE_DIR:-${REX_RUNTIME_DIR}}"
+mkdir -p "$REX_EXPERIENCE_DIR"
 # Stateful re-retrieval cadence: refresh the playbook every N effective steps.
 # 0 disables (only the initial brief is used).
 export REX_RETRIEVAL_REFRESH_EVERY="${REX_RETRIEVAL_REFRESH_EVERY:-2}"
