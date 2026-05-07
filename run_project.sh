@@ -828,10 +828,25 @@ run_tau () {
   local out="$OUTPUTS_DIR/tau_${env_name}_${agent_kind}"
   mkdir -p "$out"
   log "tau-bench: env=$env_name agent=$agent_kind -> $out"
+
+  # The airline tau-bench env only ships a "test" split; "train" doesn't exist
+  # for it.  Use "test" for airline but pass --promote-runtime-memory always so
+  # experiences are still distilled into the runtime memory bank (the normal
+  # auto mode skips promotion when task_split=="test" to prevent data leakage,
+  # but for airline that's the only available split so we override it).
+  # Retail has a "train" split so we use TAU_TASK_SPLIT (defaults to "train").
+  local split_arg="$TAU_TASK_SPLIT"
+  local promote_arg="auto"
+  if [[ "$env_name" == "airline" ]]; then
+    split_arg="test"
+    promote_arg="always"
+  fi
+
   if python -m src.runners.tau_runner \
       --env "$env_name" --agent "$agent_kind" \
       --model "$SERVED_NAME" --user-model "$SERVED_NAME" \
-      --task-split "$TAU_TASK_SPLIT" \
+      --task-split "$split_arg" \
+      --promote-runtime-memory "$promote_arg" \
       --start-index "$TAU_START_INDEX" --end-index "$TAU_END_INDEX" \
       --num-trials "$TAU_NUM_TRIALS" \
       --max-concurrency "$TAU_MAX_CONCURRENCY" \
