@@ -297,7 +297,7 @@ class RexAgent(Agent):  # type: ignore[misc]
     def _experience_domain(self) -> str:
         if self.env_hint in {"retail", "airline"}:
             return self.env_hint
-        return "ace" if self.env_hint == "ace" else "retail"
+        return "bfcl" if self.env_hint == "bfcl" else "retail"
 
     def _mutating_tools(self) -> set[str]:
         if self.env_hint == "retail":
@@ -357,8 +357,8 @@ class RexAgent(Agent):  # type: ignore[misc]
     def _benchmark_label(self) -> str:
         if self.env_hint in {"retail", "airline"}:
             return "tau-bench"
-        if self.env_hint == "ace":
-            return "ACEBench"
+        if self.env_hint == "bfcl":
+            return "BFCL"
         return "unknown"
 
     def _startup_analysis(self, initial_user: str, brief: str) -> str:

@@ -5,10 +5,10 @@
 # One-shot driver for the four-way comparison experiment. Loads the same
 # cluster toolchain that setup_env.sh used, activates the .venv (Python 3.12
 # + cu130 torch stack + vLLM 0.18.0 from source), serves a single local vLLM
-# instance, and runs 12 evaluations:
+# instance, and runs evaluations:
 #
 #   4 controllers (vanilla tool-calling, Act, ReAct, REx-RPE)
-#   x 3 benchmarks (tau-retail, tau-airline, ACEBench Agent)
+#   x 3 benchmarks (tau-retail, tau-airline, BFCL V4)
 #
 # All four controllers share the same in-process loop, model, temperature,
 # tool schemas, max steps, and truncation budget — so the only varying axis
@@ -31,8 +31,8 @@
 #   bash run_project.sh --profile small       # 15 tasks × 3 trials (~1–2 h)
 #   bash run_project.sh --profile medium      # 30 tasks × 3 trials (~3–6 h)  [default]
 #   bash run_project.sh --profile full        # 50 tasks × 4 trials (~8–14 h, full 15h budget)
-#   bash run_project.sh --tau-tasks 20 --tau-trials 2 --ace-limit 10
-#   bash run_project.sh --controllers baseline,react,rex --skip-acebench
+#   bash run_project.sh --tau-tasks 20 --tau-trials 2
+#   bash run_project.sh --controllers baseline,react,rex
 #   bash run_project.sh --tau-only retail --controllers rex
 #   bash run_project.sh --dry-run             # print resolved config and exit
 #
@@ -80,24 +80,26 @@ GPU and model:
 
 Workload:
   --profile NAME         Workload profile: smoke | small | medium | full (default: medium).
-                           smoke   =   5 tasks ×  1 trial,  ace=5,  conc=2  (~10–15 min)
-                           small   =  15 tasks ×  3 trials, ace=15, conc=4  (~1–2 h)
-                           medium  =  30 tasks ×  3 trials, ace=20, conc=4  (~3–6 h)
-                           full    =  50 tasks ×  4 trials, ace=40, conc=8  (~8–14 h)
+                           smoke   =   5 tasks ×  1 trial,  bfcl=10,  conc=2  (~10–15 min)
+                           small   =  15 tasks ×  3 trials, bfcl=20,  conc=4  (~1–2 h)
+                           medium  =  30 tasks ×  3 trials, bfcl=40,  conc=4  (~3–6 h)
+                           full    =  50 tasks ×  4 trials, bfcl=80,  conc=8  (~8–14 h)
                          Env: PROFILE=medium
   --tau-tasks N          Override τ-bench tasks per env (start=0, end=N).
                          Env: TAU_END_INDEX=N (uses TAU_START_INDEX=0)
-  --tau-trials N         Override τ-bench trial count.   Env: TAU_NUM_TRIALS=N
-  --ace-limit N          Override ACEBench task count.   Env: ACE_LIMIT=N
+  --tau-trials N         Override τ-bench trial count.       Env: TAU_NUM_TRIALS=N
+  --bfcl-limit N         Override BFCL task count total.     Env: BFCL_LIMIT=N
+  --bfcl-data-dir DIR    Path to local BFCL data directory.  Env: BFCL_DATA_DIR=DIR
+  --bfcl-categories CAT  Comma-separated BFCL categories.    Env: BFCL_CATEGORIES=...
   --max-concurrency N    Override per-runner max concurrency. Env: MAX_CONCURRENCY=N
   --tau-max-steps N      Cap τ-bench steps per trajectory.    Env: TAU_MAX_STEPS=N
-  --ace-max-steps N      Cap ACEBench steps per trajectory.   Env: ACE_MAX_STEPS=N
+  --bfcl-max-steps N     Cap BFCL steps per trajectory.       Env: BFCL_MAX_STEPS=N
 
 Controller filter:
   --controllers LIST     Comma-separated subset of {baseline,act,react,rex}.
                          Default: baseline,act,react,rex. Env: CONTROLLERS=...
-  --skip-acebench        Skip ACEBench cells; run only τ-bench retail+airline.
-                         Env: SKIP_ACEBENCH=1
+  --skip-bfcl            Skip BFCL cells; run only τ-bench retail+airline.
+                         Env: SKIP_BFCL=1
   --tau-only ENV         Run only one τ-bench env (retail|airline). Env: TAU_ONLY=...
 
 Server:
@@ -129,17 +131,19 @@ MODEL_TIER="${MODEL_TIER:-auto}"
 TP_OPT="${TENSOR_PARALLEL_SIZE:-}"
 PROFILE="${PROFILE:-medium}"
 CONTROLLERS_OPT="${CONTROLLERS:-baseline,act,react,rex}"
-SKIP_ACEBENCH="${SKIP_ACEBENCH:-0}"
+SKIP_BFCL="${SKIP_BFCL:-0}"
 TAU_ONLY="${TAU_ONLY:-}"
 DRY_RUN="${DRY_RUN:-0}"
 
 # Per-knob overrides (these take precedence over the profile).
 TAU_END_INDEX_OPT=""
 TAU_NUM_TRIALS_OPT=""
-ACE_LIMIT_OPT=""
+BFCL_LIMIT_OPT=""
+BFCL_DATA_DIR_OPT=""
+BFCL_CATEGORIES_OPT=""
 MAX_CONCURRENCY_OPT=""
 TAU_MAX_STEPS_OPT=""
-ACE_MAX_STEPS_OPT=""
+BFCL_MAX_STEPS_OPT=""
 MAX_MODEL_LEN_OPT=""
 GPU_MEM_UTIL_OPT=""
 
@@ -157,21 +161,25 @@ while [[ $# -gt 0 ]]; do
     --tau-tasks=*)     TAU_END_INDEX_OPT="${1#*=}"; shift ;;
     --tau-trials)      TAU_NUM_TRIALS_OPT="$2"; shift 2 ;;
     --tau-trials=*)    TAU_NUM_TRIALS_OPT="${1#*=}"; shift ;;
-    --ace-limit)       ACE_LIMIT_OPT="$2"; shift 2 ;;
-    --ace-limit=*)     ACE_LIMIT_OPT="${1#*=}"; shift ;;
+    --bfcl-limit)      BFCL_LIMIT_OPT="$2"; shift 2 ;;
+    --bfcl-limit=*)    BFCL_LIMIT_OPT="${1#*=}"; shift ;;
+    --bfcl-data-dir)   BFCL_DATA_DIR_OPT="$2"; shift 2 ;;
+    --bfcl-data-dir=*) BFCL_DATA_DIR_OPT="${1#*=}"; shift ;;
+    --bfcl-categories) BFCL_CATEGORIES_OPT="$2"; shift 2 ;;
+    --bfcl-categories=*) BFCL_CATEGORIES_OPT="${1#*=}"; shift ;;
     --max-concurrency) MAX_CONCURRENCY_OPT="$2"; shift 2 ;;
     --max-concurrency=*) MAX_CONCURRENCY_OPT="${1#*=}"; shift ;;
     --tau-max-steps)   TAU_MAX_STEPS_OPT="$2"; shift 2 ;;
     --tau-max-steps=*) TAU_MAX_STEPS_OPT="${1#*=}"; shift ;;
-    --ace-max-steps)   ACE_MAX_STEPS_OPT="$2"; shift 2 ;;
-    --ace-max-steps=*) ACE_MAX_STEPS_OPT="${1#*=}"; shift ;;
+    --bfcl-max-steps)  BFCL_MAX_STEPS_OPT="$2"; shift 2 ;;
+    --bfcl-max-steps=*) BFCL_MAX_STEPS_OPT="${1#*=}"; shift ;;
     --max-model-len)   MAX_MODEL_LEN_OPT="$2"; shift 2 ;;
     --max-model-len=*) MAX_MODEL_LEN_OPT="${1#*=}"; shift ;;
     --gpu-mem-util)    GPU_MEM_UTIL_OPT="$2"; shift 2 ;;
     --gpu-mem-util=*)  GPU_MEM_UTIL_OPT="${1#*=}"; shift ;;
     --controllers)     CONTROLLERS_OPT="$2"; shift 2 ;;
     --controllers=*)   CONTROLLERS_OPT="${1#*=}"; shift ;;
-    --skip-acebench)   SKIP_ACEBENCH=1; shift ;;
+    --skip-bfcl)       SKIP_BFCL=1; shift ;;
     --tau-only)        TAU_ONLY="$2"; shift 2 ;;
     --tau-only=*)      TAU_ONLY="${1#*=}"; shift ;;
     --port)            PORT_OPT="$2"; shift 2 ;;
@@ -280,10 +288,10 @@ fi
 # Profile resolution (workload sizing)
 # ---------------------------------------------------------------------------
 case "$PROFILE" in
-  smoke)   P_TAU_END=5;  P_TAU_TRIALS=1; P_ACE_LIMIT=5;  P_CONC=2; P_TAU_STEPS=20; P_ACE_STEPS=15 ;;
-  small)   P_TAU_END=15; P_TAU_TRIALS=3; P_ACE_LIMIT=15; P_CONC=4; P_TAU_STEPS=30; P_ACE_STEPS=20 ;;
-  medium)  P_TAU_END=30; P_TAU_TRIALS=3; P_ACE_LIMIT=20; P_CONC=4; P_TAU_STEPS=30; P_ACE_STEPS=20 ;;
-  full)    P_TAU_END=50; P_TAU_TRIALS=4; P_ACE_LIMIT=40; P_CONC=8; P_TAU_STEPS=30; P_ACE_STEPS=20 ;;
+  smoke)   P_TAU_END=5;  P_TAU_TRIALS=1; P_BFCL_LIMIT=10; P_CONC=2; P_TAU_STEPS=20; P_BFCL_STEPS=15 ;;
+  small)   P_TAU_END=15; P_TAU_TRIALS=3; P_BFCL_LIMIT=20; P_CONC=4; P_TAU_STEPS=30; P_BFCL_STEPS=20 ;;
+  medium)  P_TAU_END=30; P_TAU_TRIALS=3; P_BFCL_LIMIT=40; P_CONC=4; P_TAU_STEPS=30; P_BFCL_STEPS=20 ;;
+  full)    P_TAU_END=50; P_TAU_TRIALS=4; P_BFCL_LIMIT=80; P_CONC=8; P_TAU_STEPS=30; P_BFCL_STEPS=20 ;;
   *) echo "ERROR: --profile must be smoke|small|medium|full (got '$PROFILE')" >&2; exit 1 ;;
 esac
 
@@ -295,11 +303,11 @@ fi
 # Apply per-knob overrides (CLI > env > profile).
 TAU_END_INDEX="${TAU_END_INDEX_OPT:-${TAU_END_INDEX:-$P_TAU_END}}"
 TAU_NUM_TRIALS="${TAU_NUM_TRIALS_OPT:-${TAU_NUM_TRIALS:-$P_TAU_TRIALS}}"
-ACE_LIMIT="${ACE_LIMIT_OPT:-${ACE_LIMIT:-$P_ACE_LIMIT}}"
+BFCL_LIMIT="${BFCL_LIMIT_OPT:-${BFCL_LIMIT:-$P_BFCL_LIMIT}}"
 TAU_MAX_CONCURRENCY="${MAX_CONCURRENCY_OPT:-${MAX_CONCURRENCY:-${TAU_MAX_CONCURRENCY:-$P_CONC}}}"
-ACE_MAX_CONCURRENCY="${MAX_CONCURRENCY_OPT:-${MAX_CONCURRENCY:-${ACE_MAX_CONCURRENCY:-$P_CONC}}}"
+BFCL_MAX_CONCURRENCY="${MAX_CONCURRENCY_OPT:-${MAX_CONCURRENCY:-${BFCL_MAX_CONCURRENCY:-$P_CONC}}}"
 TAU_MAX_STEPS="${TAU_MAX_STEPS_OPT:-${TAU_MAX_STEPS:-$P_TAU_STEPS}}"
-ACE_MAX_STEPS="${ACE_MAX_STEPS_OPT:-${ACE_MAX_STEPS:-$P_ACE_STEPS}}"
+BFCL_MAX_STEPS="${BFCL_MAX_STEPS_OPT:-${BFCL_MAX_STEPS:-$P_BFCL_STEPS}}"
 
 # Tier-aware vLLM serving knobs.
 PRIMARY_MAX_LEN="${MAX_MODEL_LEN_OPT:-${MAX_MODEL_LEN:-$TIER_DEFAULT_MAX_LEN}}"
@@ -340,10 +348,10 @@ GPUS=$GPUS_CSV   NUM_GPUS=$NUM_GPUS   TP=$TP
 MODEL_TIER=$MODEL_TIER
   primary_max_len=$PRIMARY_MAX_LEN   gpu_mem_util=$PRIMARY_MEM_UTIL
 PROFILE=$PROFILE
-  TAU: tasks=[${TAU_START_INDEX:-0}..${TAU_END_INDEX}) trials=$TAU_NUM_TRIALS conc=$TAU_MAX_CONCURRENCY max_steps=$TAU_MAX_STEPS
-  ACE: limit=$ACE_LIMIT conc=$ACE_MAX_CONCURRENCY max_steps=$ACE_MAX_STEPS
+  TAU:  tasks=[${TAU_START_INDEX:-0}..${TAU_END_INDEX}) trials=$TAU_NUM_TRIALS conc=$TAU_MAX_CONCURRENCY max_steps=$TAU_MAX_STEPS
+  BFCL: limit=$BFCL_LIMIT conc=$BFCL_MAX_CONCURRENCY max_steps=$BFCL_MAX_STEPS
 CONTROLLERS=$CONTROLLERS_OPT
-SKIP_ACEBENCH=$SKIP_ACEBENCH
+SKIP_BFCL=$SKIP_BFCL
 TAU_ONLY=${TAU_ONLY:-(both)}
 MODEL_CANDIDATES:
 $(printf '  - %s\n' "${MODEL_CANDIDATES[@]}")
@@ -374,7 +382,7 @@ fi
 
 EXTERNAL_DIR="${EXTERNAL_DIR:-${REPO_ROOT}/external}"
 TAU_DIR="${TAU_DIR:-${EXTERNAL_DIR}/tau-bench}"
-ACE_DIR="${ACE_DIR:-${EXTERNAL_DIR}/ACEBench}"
+BFCL_DATA_DIR="${BFCL_DATA_DIR_OPT:-${BFCL_DATA_DIR:-${EXTERNAL_DIR}/bfcl}}"
 
 export HF_HOME="${HF_HOME:-${PROJECT_SCRATCH}/hf_home}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
@@ -555,7 +563,7 @@ export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-24000}"
 TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-train}"
 TAU_START_INDEX="${TAU_START_INDEX:-0}"
 TAU_TEMPERATURE="${TAU_TEMPERATURE:-0.0}"
-ACE_LANGUAGE="${ACE_LANGUAGE:-en}"
+BFCL_CATEGORIES="${BFCL_CATEGORIES_OPT:-${BFCL_CATEGORIES:-simple,multiple,parallel,parallel_multiple,multi_turn_base}}"
 
 # OpenAI SDK timeout for direct in-process calls.
 # At 32K context, prefill of a long trajectory can be substantial; timeouts
@@ -583,9 +591,9 @@ print_resolved_config() {
 GPUS=$GPUS_CSV   NUM_GPUS=$NUM_GPUS   TP=$TP
 MODEL_TIER=$MODEL_TIER   primary_max_len=$PRIMARY_MAX_LEN   gpu_mem_util=$PRIMARY_MEM_UTIL
 PROFILE=$PROFILE
-  TAU: tasks=[$TAU_START_INDEX..$TAU_END_INDEX) trials=$TAU_NUM_TRIALS conc=$TAU_MAX_CONCURRENCY max_steps=$TAU_MAX_STEPS
-  ACE: limit=$ACE_LIMIT conc=$ACE_MAX_CONCURRENCY max_steps=$ACE_MAX_STEPS
-CONTROLLERS=$CONTROLLERS_OPT  SKIP_ACEBENCH=$SKIP_ACEBENCH  TAU_ONLY=${TAU_ONLY:-(both)}
+  TAU:  tasks=[$TAU_START_INDEX..$TAU_END_INDEX) trials=$TAU_NUM_TRIALS conc=$TAU_MAX_CONCURRENCY max_steps=$TAU_MAX_STEPS
+  BFCL: limit=$BFCL_LIMIT conc=$BFCL_MAX_CONCURRENCY max_steps=$BFCL_MAX_STEPS data_dir=$BFCL_DATA_DIR
+CONTROLLERS=$CONTROLLERS_OPT  TAU_ONLY=${TAU_ONLY:-(both)}  SKIP_BFCL=$SKIP_BFCL
 PORT=$PORT  SERVED_NAME=$SERVED_NAME  ENFORCE_EAGER=$ENFORCE_EAGER
 MODEL_CANDIDATES:
 $(printf '  - %s\n' "${MODEL_CANDIDATES[@]}")
@@ -859,20 +867,34 @@ run_tau () {
   fi
 }
 
-run_ace () {
+run_bfcl () {
   local agent_kind="$1"
-  local out="$OUTPUTS_DIR/acebench_agent_${agent_kind}"
+  local out="$OUTPUTS_DIR/bfcl_agent_${agent_kind}"
   mkdir -p "$out"
-  log "ACEBench: agent=$agent_kind -> $out"
-  if python -m src.runners.ace_runner \
+  log "BFCL V4: agent=$agent_kind -> $out"
+
+  # Auto-download BFCL data if the directory doesn't exist or is empty.
+  if [[ ! -d "$BFCL_DATA_DIR" ]] || [[ -z "$(ls -A "$BFCL_DATA_DIR" 2>/dev/null)" ]]; then
+    log "BFCL data not found at $BFCL_DATA_DIR — downloading..."
+    if python -m src.scripts.download_bfcl --output-dir "$BFCL_DATA_DIR"; then
+      log "BFCL download OK"
+    else
+      log "WARNING: BFCL download failed — BFCL cells may be skipped"
+    fi
+  fi
+
+  if python -m src.runners.bfcl_runner \
       --agent "$agent_kind" --model "$SERVED_NAME" \
-      --language "$ACE_LANGUAGE" \
-      --limit "$ACE_LIMIT" --max-num-steps "$ACE_MAX_STEPS" \
-      --max-concurrency "$ACE_MAX_CONCURRENCY" \
+      --data-dir "$BFCL_DATA_DIR" \
+      --categories "$BFCL_CATEGORIES" \
+      --limit "$BFCL_LIMIT" \
+      --max-num-steps "$BFCL_MAX_STEPS" \
+      --max-concurrency "$BFCL_MAX_CONCURRENCY" \
+      --runtime-dir "$REX_RUNTIME_DIR" \
       --output-dir "$out"; then
-    log "ACEBench OK: $agent_kind"
+    log "BFCL V4 OK: $agent_kind"
   else
-    log "WARNING: ACEBench FAILED: $agent_kind (continuing)"
+    log "WARNING: BFCL V4 FAILED: $agent_kind (continuing)"
   fi
 }
 
@@ -895,15 +917,15 @@ for env_name in "${TAU_ENVS[@]}"; do
   done
 done
 
-# ACEBench cells (controller-only).
-if [[ "$SKIP_ACEBENCH" != "1" ]]; then
+# BFCL V4 cells (controller-only; no per-env axis).
+if [[ "$SKIP_BFCL" != "1" ]]; then
   for c in "${REQUESTED_CONTROLLERS[@]}"; do
     c="$(echo "$c" | tr -d '[:space:]')"
     [[ -z "$c" ]] && continue
-    run_ace "$c"
+    run_bfcl "$c"
   done
 else
-  log "Skipping ACEBench cells (--skip-acebench)."
+  log "Skipping BFCL cells (--skip-bfcl)."
 fi
 
 # ---------------------------------------------------------------------------

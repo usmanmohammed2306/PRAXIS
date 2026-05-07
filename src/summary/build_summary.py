@@ -1,7 +1,11 @@
 """Aggregate per-run metrics.json files into outputs/summary/{summary.json,summary.md}.
 
-Renders a four-way comparison across the same fixed base model:
+Renders a four-way comparison across the same fixed base model on three benchmarks:
+  - tau-bench retail   (task-completion / success_rate)
+  - tau-bench airline  (task-completion / success_rate)
+  - BFCL V4            (tool-name coverage / success_rate)
 
+Four controllers:
   1. baseline — vanilla tool-calling (minimal system prompt)
   2. act      — Act (Yao et al. 2022): action-only, no reasoning prose
   3. react    — ReAct (Yao et al. 2022): one-line Thought before each Action
@@ -13,10 +17,9 @@ Each section renders a row per metric for all four conditions. Missing runs
 are reported as ``status=missing`` so the table never collapses on partial
 data.
 
-The summary also computes a ``deltas`` block per benchmark — REx-RPE minus
-the strongest non-REx controller on the headline metric (success rate
-for tau-bench, completion rate for ACEBench) and REx-RPE vs. baseline — to
-make the wins immediately visible.
+The summary computes a ``deltas`` block per benchmark — REx-RPE minus
+the strongest non-REx controller on success rate — to make the wins
+immediately visible.
 """
 from __future__ import annotations
 
@@ -52,11 +55,11 @@ SECTIONS: List[Tuple[str, Dict[str, str]]] = [
         "react": "tau_airline_react",
         "rex": "tau_airline_rex",
     }),
-    ("ACEBench Agent", {
-        "baseline": "acebench_agent_baseline",
-        "act": "acebench_agent_act",
-        "react": "acebench_agent_react",
-        "rex": "acebench_agent_rex",
+    ("BFCL V4", {
+        "baseline": "bfcl_agent_baseline",
+        "act": "bfcl_agent_act",
+        "react": "bfcl_agent_react",
+        "rex": "bfcl_agent_rex",
     }),
 ]
 
@@ -147,8 +150,19 @@ def _ace_rows(label: str, by_cond: Dict[str, Dict[str, Any]]) -> List[str]:
     ])
 
 
+def _bfcl_rows(label: str, by_cond: Dict[str, Dict[str, Any]]) -> List[str]:
+    return _rows_with_keys(label, by_cond, [
+        ("success_rate", "success rate (exact)", _pct),
+        ("avg_tool_coverage", "avg tool coverage", _pct),
+        ("avg_tool_calls", "avg tool calls", _num),
+        ("avg_steps", "avg steps", _num),
+        ("num_tasks", "tasks", lambda x: str(x) if x is not None else "n/a"),
+        ("error_tasks", "error tasks", lambda x: str(x) if x is not None else "n/a"),
+    ])
+
+
 def _headline_metric_key(label: str) -> str:
-    return "success_rate" if label.startswith("tau") else "completion_rate"
+    return "success_rate"
 
 
 def _strongest_baseline(by_cond: Dict[str, Dict[str, Any]], key: str) -> Tuple[Optional[str], Optional[float]]:
@@ -330,10 +344,10 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         label = section["label"]
         by_cond = section["by_condition"]
         lines.append(f"### {label}")
-        if label.startswith("tau"):
-            lines.extend(_tau_rows(label, by_cond))
+        if label.startswith("BFCL"):
+            lines.extend(_bfcl_rows(label, by_cond))
         else:
-            lines.extend(_ace_rows(label, by_cond))
+            lines.extend(_tau_rows(label, by_cond))
         lines.append("")
     # REx-specific diagnostics block.
     lines.append("## REx diagnostics")
@@ -436,8 +450,6 @@ def render_markdown(summary: Dict[str, Any]) -> str:
                  "no-tools startup analysis, then uses native tool calls. Only "
                  "mutating tau-bench tools trigger same-model SABER-style reflection; "
                  "reads are never blocked by the REx layer.")
-    lines.append("- ACEBench metrics here are diagnostic. For the official score, "
-                 "re-run upstream `score_agent.py` against the saved trajectories.")
     return "\n".join(lines) + "\n"
 
 
