@@ -60,6 +60,7 @@ def promote_records(
     Returns a small manifest describing how many cards were promoted /
     rejected and what the runtime size now is.
     """
+    import sys
     cfg = config or default_config()
     store = MemoryStore(
         seed_dir=Path(seed_dir) if seed_dir else cfg.bank_dir,
@@ -96,6 +97,14 @@ def promote_records(
     written = store.bulk_add_cards(promoted, domain=domain)
     store.save_memory_index()
     runtime_count = sum(1 for _ in store.iter_runtime(domain))
+
+    # Log distillation summary
+    print(
+        f"[distill] domain={domain}  distilled={len(promoted)}  "
+        f"written={len(written)}  rejected={len(rejected)}  blocked={len(blocked)}",
+        file=sys.stderr,
+    )
+
     return {
         "domain": domain,
         "runtime_dir": str(store.runtime_dir),
