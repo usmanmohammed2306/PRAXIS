@@ -212,7 +212,9 @@ class RexAgent(Agent):  # type: ignore[misc]
         self.config = (config or RexConfig.from_env()).with_overrides(**cfg_overrides)
 
         # ------------------------------------------------------------------
-        # Legacy corpus (kept for backwards-compatible diagnostics + tests).
+        # Legacy corpus — v1 ExperienceCard format from seed bank only.
+        # Kept for backwards-compatible diagnostics and the legacy fallback
+        # retriever. Runtime cards are loaded below via load_corpus_for_domain.
         # ------------------------------------------------------------------
         self.cards = load_experience_cards(
             self._experience_domain(), self.bank_dir, runtime_dir=self.runtime_dir,
@@ -220,14 +222,41 @@ class RexAgent(Agent):  # type: ignore[misc]
         self.retriever = ExperienceRetriever(self.cards)
 
         # ------------------------------------------------------------------
-        # Hybrid pipeline corpus — same cards, lifted to ProcessMemoryCard.
-        # We avoid re-reading from disk so behavior matches the legacy path.
+        # Hybrid pipeline corpus — loaded via load_corpus_for_domain so that
+        # BOTH seed AND runtime ProcessMemoryCards (v2 schema written by
+        # pipeline_promote_records) are included.  This is the correct path:
+        # _read_cards_jsonl used by load_experience_cards silently drops v2
+        # cards because it tries ExperienceCard(**data) on every line.
+        # load_corpus_for_domain uses MemoryStore._read_cards which handles
+        # both schemas via _is_legacy_experience_card().
         # ------------------------------------------------------------------
-        process_cards = [from_experience_card(c) for c in self.cards]
+        import sys as _sys
+        try:
+            from .pipeline import load_corpus_for_domain as _load_corpus
+            process_cards = _load_corpus(
+                self._experience_domain(),
+                config=self.config,
+            )
+            print(
+                f"[rex] corpus loaded: domain={self._experience_domain()} "
+                f"cards={len(process_cards)} "
+                f"(seed={sum(1 for c in process_cards if str(c.card_id).startswith('seed-'))} "
+                f"runtime={sum(1 for c in process_cards if not str(c.card_id).startswith('seed-'))})",
+                file=_sys.stderr,
+            )
+        except Exception as _e:
+            # Fallback: lift v1 cards that load_experience_cards did find.
+            process_cards = [from_experience_card(c) for c in self.cards]
+            print(
+                f"[rex] corpus fallback (load_corpus_for_domain failed: {_e}): "
+                f"{len(process_cards)} cards",
+                file=_sys.stderr,
+            )
         self.process_cards = process_cards
         try:
-            self.hybrid_retriever: Optional[HybridRetriever] = HybridRetriever(
-                process_cards, config=self.config,
+            self.hybrid_retriever: Optional[HybridRetriever] = (
+                HybridRetriever(process_cards, config=self.config)
+                if process_cards else None
             )
         except Exception:
             # If embedding setup fails for any reason, fall back to legacy retrieval.
