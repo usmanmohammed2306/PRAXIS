@@ -100,6 +100,9 @@ Controller filter:
                          Default: baseline,act,react,rex. Env: CONTROLLERS=...
   --skip-bfcl            Skip BFCL cells; run only τ-bench retail+airline.
                          Env: SKIP_BFCL=1
+  --rex-prewarm          Run REx on the retail TRAIN split first to seed the
+                         experience bank, then run all agents on the TEST split.
+                         Use this for warm-start results. Env: REX_PREWARM=1
   --tau-only ENV         Run only one τ-bench env (retail|airline). Env: TAU_ONLY=...
 
 Server:
@@ -134,6 +137,10 @@ CONTROLLERS_OPT="${CONTROLLERS:-baseline,act,react,rex}"
 SKIP_BFCL="${SKIP_BFCL:-0}"
 TAU_ONLY="${TAU_ONLY:-}"
 DRY_RUN="${DRY_RUN:-0}"
+# REX_PREWARM=1: run rex on the train split first (retail only) to seed the
+# experience bank before the main evaluation pass on the test split.  Disabled
+# by default so a first run still produces valid cold-start numbers.
+REX_PREWARM="${REX_PREWARM:-0}"
 
 # Per-knob overrides (these take precedence over the profile).
 TAU_END_INDEX_OPT=""
@@ -180,6 +187,7 @@ while [[ $# -gt 0 ]]; do
     --controllers)     CONTROLLERS_OPT="$2"; shift 2 ;;
     --controllers=*)   CONTROLLERS_OPT="${1#*=}"; shift ;;
     --skip-bfcl)       SKIP_BFCL=1; shift ;;
+    --rex-prewarm)     REX_PREWARM=1; shift ;;
     --tau-only)        TAU_ONLY="$2"; shift 2 ;;
     --tau-only=*)      TAU_ONLY="${1#*=}"; shift ;;
     --port)            PORT_OPT="$2"; shift 2 ;;
@@ -567,7 +575,12 @@ export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-24000}"
 #   12 cells total + BFCL + summary slack → fits in the 10–15 h budget.
 #
 # These are static knobs that the profile / CLI never override.
-TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-train}"
+# IMPORTANT: use "test" for valid comparison — the train split has 87% 1-2 action
+# tasks (trivially easy) vs the test split's mean of 5.1 actions up to 14.
+# Running evaluation on train inflates ALL agents uniformly and is not a
+# meaningful benchmark (confirmed: retail train=500 tasks avg 1.54 actions,
+# retail test=115 tasks avg 5.06 actions).
+TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-test}"
 TAU_START_INDEX="${TAU_START_INDEX:-0}"
 TAU_TEMPERATURE="${TAU_TEMPERATURE:-0.0}"
 BFCL_CATEGORIES="${BFCL_CATEGORIES_OPT:-${BFCL_CATEGORIES:-simple,multiple,parallel,parallel_multiple,multi_turn_base}}"
@@ -844,17 +857,32 @@ run_tau () {
   mkdir -p "$out"
   log "tau-bench: env=$env_name agent=$agent_kind -> $out"
 
-  # The airline tau-bench env only ships a "test" split; "train" doesn't exist
-  # for it.  Use "test" for airline but pass --promote-runtime-memory always so
-  # experiences are still distilled into the runtime memory bank (the normal
-  # auto mode skips promotion when task_split=="test" to prevent data leakage,
-  # but for airline that's the only available split so we override it).
-  # Retail has a "train" split so we use TAU_TASK_SPLIT (defaults to "train").
+  # Split selection:
+  #   retail  — uses TAU_TASK_SPLIT (default "test"; 115 tasks avg 5.1 actions).
+  #             DO NOT use "train": it has 500 trivial tasks (87% need ≤2 calls)
+  #             that inflate every agent's score uniformly and is not a valid eval.
+  #   airline — only ships a "test" split; "train" does not exist.
   local split_arg="$TAU_TASK_SPLIT"
-  local promote_arg="auto"
   if [[ "$env_name" == "airline" ]]; then
     split_arg="test"
-    promote_arg="always"
+  fi
+
+  # Promotion policy — only the REx agent should write to the experience bank:
+  #   • baseline / act / react → "never": these agents have no procedural memory
+  #     and their trajectories would contaminate the REx experience bank with
+  #     non-memory-augmented patterns.
+  #   • rex on retail test split → "auto": _should_promote() returns False for
+  #     "test" split, so no promotion during eval. Pre-warm the bank separately
+  #     (see REX_PREWARM below) if you want warm-start experience.
+  #   • rex on airline (test only) → "always": airline has no train split so
+  #     this is the only way to accumulate airline experience across runs.
+  local promote_arg="never"
+  if [[ "$agent_kind" == "rex" ]]; then
+    if [[ "$env_name" == "airline" ]]; then
+      promote_arg="always"
+    else
+      promote_arg="auto"
+    fi
   fi
 
   if python -m src.runners.tau_runner \
@@ -891,6 +919,10 @@ run_bfcl () {
     fi
   fi
 
+  # Same promotion policy as tau: only rex writes to the experience bank.
+  local bfcl_promote="never"
+  [[ "$agent_kind" == "rex" ]] && bfcl_promote="auto"
+
   if python -m src.runners.bfcl_runner \
       --agent "$agent_kind" --model "$SERVED_NAME" \
       --data-dir "$BFCL_DATA_DIR" \
@@ -898,6 +930,7 @@ run_bfcl () {
       --limit "$BFCL_LIMIT" \
       --max-num-steps "$BFCL_MAX_STEPS" \
       --max-concurrency "$BFCL_MAX_CONCURRENCY" \
+      --promote-runtime-memory "$bfcl_promote" \
       --runtime-dir "$REX_RUNTIME_DIR" \
       --output-dir "$out"; then
     log "BFCL V4 OK: $agent_kind"
@@ -905,6 +938,39 @@ run_bfcl () {
     log "WARNING: BFCL V4 FAILED: $agent_kind (continuing)"
   fi
 }
+
+# ---------------------------------------------------------------------------
+# Optional REx pre-warm: run rex on the retail TRAIN split to seed the
+# experience bank BEFORE the main evaluation pass on the TEST split.
+#
+# Why: the test split tasks average 5.1 actions; with _should_promote()
+# blocking promotion on "test", REx starts cold unless we pre-warm here.
+# Without pre-warm, results are still valid (cold-start baseline) but weaker
+# than what the system can do with accumulated experience.
+#
+# Enable with --rex-prewarm or REX_PREWARM=1.
+# ---------------------------------------------------------------------------
+if [[ "$REX_PREWARM" == "1" ]] && [[ "$CONTROLLERS_OPT" == *"rex"* ]]; then
+  if [[ "${TAU_ONLY:-}" != "airline" ]]; then
+    log "PRE-WARM: running rex on retail/train to seed experience bank..."
+    if python -m src.runners.tau_runner \
+        --env retail --agent rex \
+        --model "$SERVED_NAME" --user-model "$SERVED_NAME" \
+        --task-split train \
+        --promote-runtime-memory auto \
+        --start-index 0 --end-index "$TAU_END_INDEX" \
+        --num-trials 1 \
+        --max-concurrency "$TAU_MAX_CONCURRENCY" \
+        --temperature "$TAU_TEMPERATURE" \
+        --max-num-steps "$TAU_MAX_STEPS" \
+        --runtime-dir "$REX_RUNTIME_DIR" \
+        --output-dir "$OUTPUTS_DIR/prewarm_retail_rex"; then
+      log "PRE-WARM OK: experience bank seeded from retail/train"
+    else
+      log "WARNING: pre-warm failed — continuing with cold-start rex"
+    fi
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Filtered run list: which controllers and which benchmarks to execute.
