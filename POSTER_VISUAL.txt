@@ -1,0 +1,301 @@
+================================================================================
+  PRAXIS  ·  Procedural Retrieval-Augmented eXperience-Informed System
+  Continual Procedural Memory for Tool-Calling LLM Agents
+================================================================================
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THE CORE IDEA  (The Analogy)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Imagine a team of four workers tackling customer service tasks.
+
+  👤 Act          completes 200 tasks  →  experiences logged
+  👤 ReAct        completes 200 tasks  →  experiences logged
+  👤 Vanilla TC   completes 200 tasks  →  experiences logged
+
+  🧠 PRAXIS  watches all three.
+     It takes no raw data — no order IDs, no emails, no payment details.
+     It takes only the lesson:  "what sequence worked, what failed, and why."
+
+  When PRAXIS performs its own tasks, it reaches into that growing memory
+  every 2 steps, pulls the 5 most relevant lessons, and reasons better.
+  After completing its run, its own experiences join the memory too.
+
+  The memory is permanent.  Every future run starts smarter than the last.
+
+                "An agent that learns from every interaction —
+                 not just its own."
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIAGRAM 1 — THE MEMORY LOOP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────┐   ┌──────────┐   ┌──────────────┐
+  │  Act     │   │  ReAct   │   │  Vanilla TC  │    ← 3 Baselines
+  └────┬─────┘   └────┬─────┘   └──────┬───────┘
+       │              │                │
+       └──────────────┴────────────────┘
+                      │  trajectories.jsonl
+                      ▼
+             ┌─────────────────┐
+             │   DISTILLER     │   strips PII · extracts procedure
+             │                 │   tool order · failure patterns
+             │                 │   recovery hints · anti-patterns
+             └────────┬────────┘
+                      │  ProcessMemoryCards
+                      ▼
+             ┌─────────────────┐
+             │  MEMORY BANK    │   grows across every run
+             │  retail.jsonl   │   deduplicated · quality-scored
+             │  airline.jsonl  │   max 4,096 cards / domain
+             │  bfcl.jsonl     │
+             └────────┬────────┘
+                      │  top-5 cards  (refreshed every 2 steps)
+                      ▼
+             ┌─────────────────┐
+             │  PRAXIS AGENT   │   system prompt + TacticalPlaybook
+             │                 │   SABER reflection on writes
+             └────────┬────────┘
+                      │  completed tasks
+                      └──────────────────▶  back into the loop ↑
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIAGRAM 2 — WHAT A MEMORY CARD LOOKS LIKE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  ProcessMemoryCard                           [retail · ✓]   ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Task type:   exchange_delivered_order_items                 ║
+  ║  Outcome:     successful                                     ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Lesson:  "After item lookup, recover via:                   ║
+  ║            get_order_details → get_product_details           ║
+  ║            → exchange_delivered_order_items"                 ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Tool order:  [ ground_identity, get_order_details,          ║
+  ║                 get_product_details, exchange_... ]          ║
+  ║  Don't:       copy IDs from examples                         ║
+  ║  Verify:      fetch live order state before mutating         ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Confidence: 0.87 · Used: 12× · Successes: 10              ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+  ✗  NO order IDs         ✗  NO emails          ✗  NO payment data
+  ✗  NO user names        ✗  NO prices          ✗  NO raw transcripts
+
+  Only the procedure.  Only the lesson.
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIAGRAM 3 — RETRIEVAL (HOW PRAXIS FINDS THE RIGHT LESSON)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  At task start and every 2 steps:
+
+  Current state ──▶  "exchange item, failed get_product_details,
+                      last tool: get_order_details, step 4"
+
+                      ┌───────────────────────────────┐
+                      │         HybridRetriever        │
+                      │                               │
+                      │   BM25   ×0.60               │
+                      │   TF-IDF ×0.40               │
+                      │   domain boost  +0.05         │
+                      │   quality boost +0.05×score   │
+                      │   diversity cap: 3/category   │
+                      └──────────────┬────────────────┘
+                                     │  top-5 cards
+                                     ▼
+                           ┌──────────────────┐
+                           │ TacticalPlaybook │   ≤ 2400 chars
+                           │                  │   injected into
+                           │  • Next actions  │   system prompt
+                           │  • Verify steps  │
+                           │  • Don't do...   │
+                           └──────────────────┘
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIAGRAM 4 — MUTATION REFLECTION GUARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Every tool call:
+
+  READ tool?   ──▶  Execute immediately.  No delay.
+
+  WRITE tool?  ──▶  Pause.  Ask the same model:
+                    "Do observations confirm this action is safe & requested?"
+
+                    ALLOW  ──▶  Execute
+                    BLOCK  ──▶  Explain to user, ask for confirmation
+
+  Write tools are things like: cancel order, modify reservation,
+  process return, transfer to human.
+
+  Read tools are free.  Only irreversible actions are checked.
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESULTS TABLE  (populate after full run)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────┬────────────┬──────┬───────┬────────────────┬────────┐
+  │ Benchmark        │ Vanilla TC │  Act │ ReAct │ PRAXIS (ours)  │   Δ    │
+  ├──────────────────┼────────────┼──────┼───────┼────────────────┼────────┤
+  │ tau-bench retail │    —       │  —   │  —    │      —         │  + pp  │
+  │ tau-bench airline│    —       │  —   │  —    │      —         │  + pp  │
+  │ BFCL V4          │    —       │  —   │  —    │      —         │  + pp  │
+  └──────────────────┴────────────┴──────┴───────┴────────────────┴────────┘
+
+  Same model  ·  Same tools  ·  Same tasks  ·  Zero fine-tuning
+  Only axis that varies: prompting strategy + memory
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KEY NUMBERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        0          model fine-tuning steps
+        4          agents compared
+        5          cards retrieved per query
+        2          steps between memory refreshes
+       2400        max chars in TacticalPlaybook
+       4096        max memory cards per domain
+        3          benchmarks evaluated
+       <30s        distillation overhead per run
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT IS NEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  PRAXIS learns from everyone, not just itself.
+  Baselines run first.  PRAXIS distills their experience.
+  Every failure becomes a lesson.  Every success becomes a pattern.
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Standard RAG   →  retrieves documents to answer questions          │
+  │  PRAXIS         →  retrieves procedures to execute multi-step tasks │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  In-context learning  →  static examples in every prompt            │
+  │  PRAXIS               →  growing compact lessons across all runs    │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Fine-tuning          →  expensive, slow, risks forgetting          │
+  │  PRAXIS               →  zero training, works on frozen model       │
+  └─────────────────────────────────────────────────────────────────────┘
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FUTURE WORK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. CROSS-DOMAIN TRANSFER
+     Can a retail lesson about "verify before mutating" help an airline agent?
+     Memory is currently siloed per domain.  Cross-domain generalization would
+     let retail experience bootstrap an airline agent from day one.
+
+  2. ACTIVE MEMORY QUERYING
+     Currently PRAXIS retrieves passively every 2 steps.
+     Future: let the agent explicitly say "I don't know how to handle this —
+     retrieve past failures for modify_reservation."  Agent-initiated recall.
+
+  3. MID-TASK ONLINE DISTILLATION
+     Currently distillation happens after a run completes.
+     Future: distill lessons within a single trajectory.  If the agent hits
+     a failure at step 5, immediately learn and adjust by step 8.
+
+  4. MULTI-AGENT SHARED MEMORY
+     Multiple PRAXIS instances (across customers, teams, or organizations)
+     contribute to a shared federated memory bank — while each keeps its
+     private task data completely local.
+
+  5. CONFIDENCE CALIBRATION VIA OUTCOME FEEDBACK
+     Today quality scores are estimated at distillation time.
+     Future: feed live success/failure signals back to update card confidence
+     dynamically, so bad advice gets demoted and good advice promoted faster.
+
+  6. HIERARCHICAL MEMORY
+     Three tiers:  task-level (this specific exchange type) ·
+                   session-level (this user's preferences today) ·
+                   global (cross-user patterns over time)
+     Currently only global.
+
+  7. ADVERSARIAL MEMORY ROBUSTNESS
+     What if a corrupted trajectory injects bad lessons?
+     Future: adversarial auditing of new cards before promotion, with
+     human-in-the-loop review for low-confidence insertions.
+
+  8. MEMORY-GUIDED EXPLORATION IN RL
+     Use memory cards as reward shaping signals in reinforcement learning.
+     Cards that reflect high-reward sequences become intrinsic rewards for
+     a fine-tuned variant — bridging procedural memory and policy learning.
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ONE-LINE ABSTRACT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  PRAXIS wraps any frozen LLM with a growing, leakage-safe procedural memory —
+  distilled from all agents' experience — so each run starts smarter than the last.
+
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+POSTER LAYOUT GUIDE  (for designer)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  COLORS
+    Deep navy   #1A3A5C   — headers, frames, arrows
+    Gold        #E8A020   — PRAXIS, key numbers, highlights
+    Teal        #2A9D8F   — memory components
+    Slate grey  #F0F2F5   — card/box backgrounds
+    Charcoal    #2D2D2D   — body text
+
+  LAYOUT  (A0 landscape, 4 columns)
+    Col 1  →  Analogy · Problem · Key Numbers
+    Col 2  →  Diagram 1 (Memory Loop) · Diagram 4 (Reflection Guard)
+    Col 3  →  Diagram 2 (Memory Card) · Diagram 3 (Retrieval)
+    Col 4  →  Results Table · What is New · Future Work
+
+  TYPOGRAPHY
+    Title    72pt  Bold
+    Section  28pt  Bold
+    Body     18pt  Regular
+    Numbers  48pt  Bold Gold  (for the key numbers panel)
+
+  EMPHASIS
+    Make the analogy paragraph the emotional hook — set in larger type
+    with a light gold background block.
+    Highlight the three contrast boxes in "What is New" with left border
+    in gold/teal/navy respectively.
+
+================================================================================
