@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - exercised in minimal test envs
 
 from ..common.openai_client import get_client
 from .config import RexConfig
-from .decision_retrieval import OperationalDecisionRetriever, extract_operational_context
+from .decision_retrieval import ExperienceConditionedRetriever, extract_operational_context
 from .experience import (
     ExperienceRetriever,
     load_experience_cards,
@@ -55,6 +55,7 @@ from .memory_types import from_experience_card
 from .pipeline import refresh_playbook
 from .playbook import synthesize_playbook
 from .retrieval import HybridRetriever, build_query
+from .retrieval_context import build_experience_query
 from .retrieval_logging import RetrievalLogger
 from .state_graph import OperationalStateGraph, TransitionOutcome
 from .working_state import working_state_for_messages
@@ -233,12 +234,14 @@ class RexAgent(Agent):  # type: ignore[misc]
             self.hybrid_retriever = None
 
         # ------------------------------------------------------------------
-        # Operational decision retriever (Phase 3 upgrade)
-        # Uses operational state graph instead of similarity matching
+        # Experience-conditioned retriever (state-triggered mid-trajectory)
+        # Retrieves prior experiences matching the current execution state
+        # rather than broad text similarity. Used for refresh after failures,
+        # retries, escalations, and verification steps.
         # ------------------------------------------------------------------
         try:
-            self.operational_retriever: Optional[OperationalDecisionRetriever] = (
-                OperationalDecisionRetriever(process_cards)
+            self.operational_retriever: Optional[ExperienceConditionedRetriever] = (
+                ExperienceConditionedRetriever(process_cards)
             )
             self.enable_operational_retrieval = True
         except Exception:
@@ -454,10 +457,13 @@ class RexAgent(Agent):  # type: ignore[misc]
         self,
         state_graph: OperationalStateGraph,
     ) -> tuple[str, List[Any]]:
-        """Retrieve using operational state graph (decision-conditioned).
+        """Retrieve prior experiences matching the current execution state.
 
-        Returns ``(brief, card_objs)`` based on current operational phase.
-        Falls back to empty if operational retriever is not available.
+        Called mid-trajectory when the agent's state changes significantly
+        (failure, retry, escalation, etc.).  Retrieves experiences from
+        Humans 1/2/3 that match the current situation.
+
+        Returns ``(brief, card_objs)``; falls back to empty on any error.
         """
         if not self.operational_retriever or not state_graph:
             return "", []

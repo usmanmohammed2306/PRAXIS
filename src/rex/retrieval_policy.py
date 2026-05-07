@@ -1,26 +1,36 @@
-"""Runtime retrieval policy control for decision-conditioned retrieval.
+"""Retrieval trigger control — decides when and how to retrieve experiences.
 
-The retrieval policy engine determines:
-  * when retrieval is necessary
-  * what type of memory to retrieve
-  * how much memory to retrieve
-  * which retrieval mode to use
+The system retrieves experiences from permanent memory during execution to
+improve tool-calling decisions. This module determines:
 
-The system dynamically decides based on operational state whether to
-retrieve guidance for startup, recovery, failure handling, verification,
-escalation, retries, planning, or anti-pattern avoidance.
+  * WHEN to retrieve (startup, after failure, on retry, etc.)
+  * WHAT type of experiences to retrieve (similar failures, recoveries, etc.)
+  * HOW MANY experiences to retrieve per situation
+
+The runtime agent retrieves prior experiences to condition its next action.
+This is experience-conditioned execution, not policy evolution.
+
+Eight retrieval trigger conditions:
+  1. startup     — initial planning at task start
+  2. recovery    — after a failed recovery attempt
+  3. failure     — immediately after a tool failure
+  4. verification — when verification state is unclear
+  5. escalation  — when escalation conditions are met
+  6. retry       — before retrying a previously failed tool
+  7. planning    — periodic re-retrieval during normal execution
+  8. anti_pattern — when retry count is high (avoid known traps)
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
-from .state_graph import OperationalStateGraph, OperationalPhase, TransitionOutcome
+from .state_graph import OperationalStateGraph, OperationalPhase
 
 
 class RetrievalMode(str, Enum):
-    """Retrieval mode determines what type of guidance to fetch."""
+    """What kind of prior experiences to retrieve."""
     STARTUP = "startup"
     RECOVERY = "recovery"
     FAILURE = "failure"
@@ -32,237 +42,166 @@ class RetrievalMode(str, Enum):
 
 
 @dataclass
-class RetrievalPolicy:
-    """Policy decision: should we retrieve, and if so, how?"""
+class RetrievalDecision:
+    """Decision: should we retrieve experiences, and with what focus?"""
 
     should_retrieve: bool
-    retrieval_mode: RetrievalMode
+    mode: RetrievalMode
     top_k: int = 3
-    urgency: float = 0.0  # 0=low, 1=high (for prioritization)
+    urgency: float = 0.0   # 0 = low urgency, 1 = immediate
     rationale: str = ""
 
 
-class RuntimeRetrievalPolicyEngine:
-    """Dynamically determines retrieval needs based on operational state."""
+class RetrievalTrigger:
+    """Determines when the runtime agent should retrieve prior experiences.
+
+    The agent calls this at each step to decide whether to refresh its
+    retrieved experience guidance and which type of experiences to fetch.
+    """
 
     def __init__(
         self,
         default_top_k: int = 3,
         startup_top_k: int = 5,
         recovery_top_k: int = 4,
-        escalation_top_k: int = 3,
     ):
-        """Initialize policy engine with k-value overrides per mode."""
         self.default_top_k = default_top_k
         self.startup_top_k = startup_top_k
         self.recovery_top_k = recovery_top_k
-        self.escalation_top_k = escalation_top_k
-        self._retrieval_count = 0
 
-    def determine_policy(
+    def evaluate(
         self,
         state_graph: OperationalStateGraph,
         step_count: int = 0,
         last_retrieval_step: int = 0,
         min_steps_between_retrieval: int = 3,
-    ) -> RetrievalPolicy:
-        """Determine whether and how to retrieve based on operational state."""
+    ) -> RetrievalDecision:
+        """Evaluate whether to retrieve experiences at this step.
+
+        Returns a RetrievalDecision describing what to retrieve and why.
+        """
         phase = state_graph.get_operational_phase()
         failed_tools = state_graph.get_failed_tools()
-        successful_tools = state_graph.get_successful_tools()
         recent_failures = state_graph.get_recent_failures(count=5)
         unverified = len(state_graph.get_unresolved_verifications())
         has_escalations = len(state_graph.escalations) > 0
         is_escalation_ready = state_graph.infer_escalation_readiness()
-        is_verification_ready = state_graph.infer_verification_ready()
         retry_count = sum(
-            state_graph.infer_retry_count(tool)
-            for tool in set(failed_tools + successful_tools)
+            state_graph.infer_retry_count(t)
+            for t in set(failed_tools + state_graph.get_successful_tools())
         )
-        failure_patterns = state_graph.get_failure_patterns()
 
-        # STARTUP retrieval: Initial brief at trajectory start
+        # Always retrieve at startup
         if step_count == 0:
-            return RetrievalPolicy(
+            return RetrievalDecision(
                 should_retrieve=True,
-                retrieval_mode=RetrievalMode.STARTUP,
+                mode=RetrievalMode.STARTUP,
                 top_k=self.startup_top_k,
                 urgency=1.0,
-                rationale="Initial trajectory startup",
+                rationale="Retrieve prior experiences for initial planning",
             )
 
-        # ESCALATION retrieval: When escalation conditions are met
+        # Escalation — retrieve similar escalation experiences
         if is_escalation_ready and not has_escalations:
-            return RetrievalPolicy(
+            return RetrievalDecision(
                 should_retrieve=True,
-                retrieval_mode=RetrievalMode.ESCALATION,
-                top_k=self.escalation_top_k,
+                mode=RetrievalMode.ESCALATION,
+                top_k=self.default_top_k,
                 urgency=0.95,
-                rationale="Escalation path exhausted, need guidance",
+                rationale="Escalation conditions met; retrieve escalation experiences",
             )
 
-        # RECOVERY retrieval: Active failures with recovery attempts
-        if recent_failures and any(
-            f.recovery_attempted for f in recent_failures
-        ):
-            return RetrievalPolicy(
+        # Recovery in progress — retrieve recovery experiences
+        if recent_failures and any(f.recovery_attempted for f in recent_failures):
+            return RetrievalDecision(
                 should_retrieve=True,
-                retrieval_mode=RetrievalMode.RECOVERY,
+                mode=RetrievalMode.RECOVERY,
                 top_k=self.recovery_top_k,
                 urgency=0.9,
-                rationale=f"Recovery needed for {len(recent_failures)} recent failures",
+                rationale=f"Active recovery; retrieve {len(recent_failures)} failure contexts",
             )
 
-        # FAILURE retrieval: Tool failed but recovery not yet attempted
-        if recent_failures and not any(
-            f.recovery_attempted for f in recent_failures
-        ):
-            return RetrievalPolicy(
+        # New failure — retrieve similar failure experiences immediately
+        if recent_failures and not any(f.recovery_attempted for f in recent_failures):
+            return RetrievalDecision(
                 should_retrieve=True,
-                retrieval_mode=RetrievalMode.FAILURE,
+                mode=RetrievalMode.FAILURE,
                 top_k=self.default_top_k,
                 urgency=0.8,
-                rationale=f"Tool failure detected: {recent_failures[0].error_type}",
+                rationale=f"Tool failure: {recent_failures[0].error_type}",
             )
 
-        # ANTI_PATTERN retrieval: High retry count or repeated failures
+        # High retry count — retrieve anti-pattern experiences
         if retry_count > 2:
-            return RetrievalPolicy(
+            return RetrievalDecision(
                 should_retrieve=True,
-                retrieval_mode=RetrievalMode.ANTI_PATTERN,
+                mode=RetrievalMode.ANTI_PATTERN,
                 top_k=self.default_top_k,
                 urgency=0.75,
-                rationale=f"Retry count high: {retry_count}",
+                rationale=f"High retry count ({retry_count}); retrieve failure-avoidance experiences",
             )
 
-        # VERIFICATION retrieval: Unresolved verifications
+        # Pending verification — retrieve verification experiences
         if unverified > 0:
-            return RetrievalPolicy(
+            return RetrievalDecision(
                 should_retrieve=True,
-                retrieval_mode=RetrievalMode.VERIFICATION,
+                mode=RetrievalMode.VERIFICATION,
                 top_k=self.default_top_k,
                 urgency=0.7,
-                rationale=f"{unverified} unresolved verifications",
+                rationale=f"{unverified} unresolved verification steps",
             )
 
-        # RETRY retrieval: Recent failure with potential for retry
+        # Retry opportunity
         if recent_failures:
-            recent_failure = recent_failures[0]
-            if not recent_failure.recovery_attempted:
-                retry_ceiling = 3
-                if recent_failure.retry_count < retry_ceiling:
-                    return RetrievalPolicy(
-                        should_retrieve=True,
-                        retrieval_mode=RetrievalMode.RETRY,
-                        top_k=self.default_top_k - 1,
-                        urgency=0.6,
-                        rationale=f"Retry available ({recent_failure.retry_count}/{retry_ceiling})",
-                    )
-
-        # PLANNING retrieval: During normal exploration/execution
-        if phase in (OperationalPhase.EXPLORATION, OperationalPhase.COMPLETION):
-            # Check if enough steps have passed since last retrieval
-            steps_since_retrieval = step_count - last_retrieval_step
-            if steps_since_retrieval >= min_steps_between_retrieval:
-                return RetrievalPolicy(
+            retry_ceiling = 3
+            if recent_failures[0].retry_count < retry_ceiling:
+                return RetrievalDecision(
                     should_retrieve=True,
-                    retrieval_mode=RetrievalMode.PLANNING,
-                    top_k=self.default_top_k,
-                    urgency=0.3,
-                    rationale=f"Periodic re-planning ({steps_since_retrieval} steps passed)",
+                    mode=RetrievalMode.RETRY,
+                    top_k=max(1, self.default_top_k - 1),
+                    urgency=0.6,
+                    rationale=f"Retry opportunity ({recent_failures[0].retry_count}/{retry_ceiling})",
                 )
 
-        # No retrieval needed at this step
-        return RetrievalPolicy(
+        # Periodic re-retrieval during normal execution
+        steps_since = step_count - last_retrieval_step
+        if steps_since >= min_steps_between_retrieval:
+            return RetrievalDecision(
+                should_retrieve=True,
+                mode=RetrievalMode.PLANNING,
+                top_k=self.default_top_k,
+                urgency=0.3,
+                rationale=f"Periodic re-retrieval ({steps_since} steps since last)",
+            )
+
+        return RetrievalDecision(
             should_retrieve=False,
-            retrieval_mode=RetrievalMode.PLANNING,
+            mode=RetrievalMode.PLANNING,
             urgency=0.0,
             rationale="No retrieval needed at this step",
         )
 
-    def should_refresh_brief(
-        self,
-        state_graph: OperationalStateGraph,
-        step_count: int = 0,
-        last_retrieval_step: int = 0,
-        refresh_every: int = 3,
-    ) -> bool:
-        """Determine if a brief refresh is needed.
+    def mode_description(self, mode: RetrievalMode) -> str:
+        """Human-readable description of the retrieval mode."""
+        return {
+            RetrievalMode.STARTUP: "Retrieve prior experiences for initial task planning",
+            RetrievalMode.RECOVERY: "Retrieve recovery experiences for ongoing failure",
+            RetrievalMode.FAILURE: "Retrieve similar failure experiences",
+            RetrievalMode.VERIFICATION: "Retrieve verification-step experiences",
+            RetrievalMode.ESCALATION: "Retrieve escalation-path experiences",
+            RetrievalMode.RETRY: "Retrieve retry-strategy experiences",
+            RetrievalMode.PLANNING: "Retrieve general planning experiences",
+            RetrievalMode.ANTI_PATTERN: "Retrieve failure-avoidance experiences",
+        }.get(mode, "Retrieve relevant experiences")
 
-        This is a simpler check than full policy determination, used for
-        periodic refreshes during normal execution.
-        """
-        if step_count == 0:
-            return True
 
-        # Refresh on phase changes
-        phase = state_graph.get_operational_phase()
-        if phase in (OperationalPhase.RECOVERY, OperationalPhase.ESCALATION):
-            if step_count > last_retrieval_step:
-                return True
-
-        # Refresh on periodic schedule
-        steps_since = step_count - last_retrieval_step
-        if steps_since >= refresh_every:
-            return True
-
-        return False
-
-    def estimate_urgency(
-        self,
-        state_graph: OperationalStateGraph,
-    ) -> float:
-        """Estimate overall urgency of retrieval [0, 1]."""
-        phase = state_graph.get_operational_phase()
-        failed_tools = state_graph.get_failed_tools()
-        recent_failures = state_graph.get_recent_failures(count=3)
-        is_escalation_ready = state_graph.infer_escalation_readiness()
-
-        urgency = 0.0
-
-        # Phase-based urgency
-        phase_urgency_map = {
-            OperationalPhase.INITIAL: 0.8,
-            OperationalPhase.EXPLORATION: 0.4,
-            OperationalPhase.VERIFICATION: 0.6,
-            OperationalPhase.RECOVERY: 0.85,
-            OperationalPhase.ESCALATION: 0.95,
-            OperationalPhase.COMPLETION: 0.2,
-        }
-        urgency = phase_urgency_map.get(phase, 0.4)
-
-        # Boost urgency for unrecovered failures
-        if recent_failures:
-            unrecovered = [
-                f for f in recent_failures
-                if f.recovery_attempted and not f.recovery_successful
-            ]
-            if unrecovered:
-                urgency = max(urgency, 0.85)
-
-        # Escalation is extremely urgent
-        if is_escalation_ready:
-            urgency = max(urgency, 0.95)
-
-        return min(1.0, urgency)
-
-    def get_mode_description(self, mode: RetrievalMode) -> str:
-        """Get human-readable description of a retrieval mode."""
-        descriptions = {
-            RetrievalMode.STARTUP: "Initial task analysis and planning",
-            RetrievalMode.RECOVERY: "Recovery strategies for failures",
-            RetrievalMode.FAILURE: "Guidance for tool failure handling",
-            RetrievalMode.VERIFICATION: "Verification requirements and evidence",
-            RetrievalMode.ESCALATION: "Escalation procedures and criteria",
-            RetrievalMode.RETRY: "Retry limits and strategies",
-            RetrievalMode.PLANNING: "General planning and next-step guidance",
-            RetrievalMode.ANTI_PATTERN: "Anti-patterns and common mistakes",
-        }
-        return descriptions.get(mode, "Unknown retrieval mode")
+# Backward-compatible alias kept so existing imports continue to work.
+RuntimeRetrievalPolicyEngine = RetrievalTrigger
 
 
 __all__ = [
-    "RuntimeRetrievalPolicyEngine",
-    "RetrievalPolicy",
+    "RetrievalTrigger",
+    "RetrievalDecision",
     "RetrievalMode",
+    "RuntimeRetrievalPolicyEngine",  # alias
 ]

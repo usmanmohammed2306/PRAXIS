@@ -402,6 +402,86 @@ def score_distillation_quality(
 
 
 # ---------------------------------------------------------------------------
+# Natural-language experience summary builder
+# ---------------------------------------------------------------------------
+def _build_experience_summary(
+    environment: str,
+    tool_calls: Sequence[str],
+    failures: Sequence[FailurePattern],
+    recoveries: Sequence[RecoveryPattern],
+    verifications: Sequence[VerificationPattern],
+    escalations: Sequence[EscalationPattern],
+    outcome: str,
+) -> str:
+    """Generate a compact natural-language procedural experience summary.
+
+    Produces reusable sentences such as:
+      "Verify identity before refund attempts."
+      "After failed lookup, recover via: normalize_id -> retry_search."
+      "Avoid repeated failed tool calls; escalate after 3 failures."
+
+    The summary captures *what was learned* from this trajectory in plain
+    language — not a transcript, not a doctrine, not benchmark answers.
+    """
+    parts: List[str] = []
+
+    # 1. Recovery insight — most valuable; what succeeded after failure
+    if recoveries:
+        r = recoveries[0]
+        seq = " -> ".join(r.sequence[:4])
+        short_sig = r.after_failure[:60].rstrip(".")
+        parts.append(f"After {short_sig}, recover via: {seq}.")
+
+    # 2. Verification insight — verifier-before-mutation pattern
+    if verifications and len(parts) < 2:
+        v = verifications[0]
+        parts.append(f"{v.verifier_tool} must precede {v.purpose}.")
+
+    # 3. Failure pattern insight — what broke and where
+    if failures and len(parts) < 2:
+        f = failures[0]
+        tool_hint = f" in {f.triggering_tool}" if getattr(f, "triggering_tool", "") else ""
+        desc = f.description[:80].rstrip(".")
+        parts.append(f"Failure{tool_hint}: {desc}.")
+
+    # 4. Escalation insight — when escalation was needed
+    if escalations and len(parts) < 2:
+        parts.append(f"Escalate when: {escalations[0].trigger}.")
+
+    # 5. Domain-specific heuristics for specific environments
+    calls_set = set(tool_calls)
+    if len(parts) < 2:
+        if environment == "airline":
+            if any("flight" in t or "search" in t for t in calls_set):
+                parts.append("Retry flight lookup with normalized airport code after empty itinerary.")
+            elif any("cancel" in t for t in calls_set):
+                parts.append("Verify reservation status before cancellation; basic economy cannot be modified.")
+        elif environment == "retail":
+            if any("return" in t or "exchange" in t for t in calls_set):
+                parts.append("Verify order eligibility and item condition before return or exchange.")
+            elif any("refund" in t for t in calls_set):
+                parts.append("Verify identity and order ownership before processing refunds.")
+
+    # 6. Fallback — concise tool sequence with outcome
+    if not parts:
+        key_tools: List[str] = []
+        seen_t: Set[str] = set()
+        for t in tool_calls[:6]:
+            if t and t not in seen_t:
+                key_tools.append(t)
+                seen_t.add(t)
+        if key_tools:
+            outcome_word = (
+                "succeeded" if outcome == "successful"
+                else "failed" if outcome == "avoid"
+                else "partially completed"
+            )
+            parts.append(f"Sequence {' -> '.join(key_tools)} {outcome_word}.")
+
+    return " ".join(parts[:2])[:240]
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 @dataclass
@@ -496,7 +576,15 @@ def distill_summary_to_card(
 
     instruction_template = sanitize_text(summary.initial_user, limit=360) or "runtime-distilled-card"
     procedural_summary = sanitize_text(
-        f"{intent}: {' -> '.join(tool_calls[:8])}",
+        _build_experience_summary(
+            environment=summary.environment,
+            tool_calls=tool_calls,
+            failures=failures,
+            recoveries=recoveries,
+            verifications=verifications,
+            escalations=escalations,
+            outcome=outcome,
+        ),
         limit=240,
     )
 

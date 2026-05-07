@@ -1,24 +1,25 @@
-"""Decision-conditioned retrieval using operational state graph.
+"""Experience-conditioned retrieval using execution state.
 
-Instead of similarity-based retrieval over trajectories, this system
-retrieves based on:
+Retrieves prior experiences relevant to the agent's *current operational
+situation* rather than just text similarity.  A prior experience is relevant
+when it matches the agent's current combination of:
 
-  * current operational phase
-  * previous tool transitions
-  * failure patterns
-  * retry state
-  * escalation readiness
-  * verification state
-  * unresolved goals
-  * recovery state
-  * tool-transition graph patterns
-  * multi-hop retrieval paths
+  * operational phase (initial, recovery, escalation, …)
+  * tool failures and successful transitions so far
+  * retry / escalation / verification state
+  * pending goals
 
-The retrieval query is not semantic ("find similar tasks").
-The retrieval query is operational ("what should I do given my current state?").
+This lets the agent retrieve experiences like:
+  "what worked when I was stuck in a failed-refund + retry loop?"
+rather than:
+  "what trajectory text is similar to my task description?"
 
-The decision retriever builds operational context vectors and matches them
-against memory cards' operational annotations.
+The ExperienceConditionedRetriever scores each candidate experience card
+against the current execution state using structural matching, not embeddings.
+It is used in tandem with the HybridRetriever: the hybrid covers startup
+broad retrieval; this retriever covers mid-trajectory state-triggered refresh.
+
+``OperationalDecisionRetriever`` is a backward-compatible alias.
 """
 from __future__ import annotations
 
@@ -30,8 +31,8 @@ from .state_graph import OperationalStateGraph, OperationalPhase, TransitionOutc
 
 
 @dataclass
-class OperationalContext:
-    """Operational context extracted from current state graph."""
+class ExperienceRetrievalContext:
+    """Current execution context used to select relevant prior experiences."""
 
     phase: OperationalPhase
     failed_tools: List[str]
@@ -51,7 +52,11 @@ class OperationalContext:
     transition_scores: Dict[str, float]  # outcome -> proportion
 
 
-def extract_operational_context(graph: OperationalStateGraph) -> OperationalContext:
+# Backward-compatible alias
+OperationalContext = ExperienceRetrievalContext
+
+
+def extract_operational_context(graph: OperationalStateGraph) -> ExperienceRetrievalContext:
     """Extract operational context from state graph."""
     failed_tools = graph.get_failed_tools()
     successful_tools = graph.get_successful_tools()
@@ -71,7 +76,7 @@ def extract_operational_context(graph: OperationalStateGraph) -> OperationalCont
     verification_ready = graph.infer_verification_ready()
     escalation_ready = graph.infer_escalation_readiness()
 
-    return OperationalContext(
+    return ExperienceRetrievalContext(
         phase=graph.get_operational_phase(),
         failed_tools=failed_tools,
         successful_tools=successful_tools,
@@ -95,17 +100,28 @@ def extract_operational_context(graph: OperationalStateGraph) -> OperationalCont
 
 
 @dataclass
-class OperationalRetrievalQuery:
-    """Query for decision-conditioned retrieval."""
+class ExperienceQuery:
+    """Query describing current execution context for experience retrieval."""
 
-    operational_context: OperationalContext
+    operational_context: ExperienceRetrievalContext
     retrieval_mode: str  # "startup", "recovery", "failure", "verification", etc.
-    focus_tool: Optional[str] = None  # If targeting specific tool
-    focus_error: Optional[str] = None  # If targeting specific error type
+    focus_tool: Optional[str] = None  # Focus on specific tool's experiences
+    focus_error: Optional[str] = None  # Focus on specific error type's experiences
 
 
-class OperationalDecisionRetriever:
-    """Retriever that conditions on operational state, not text similarity."""
+# Backward-compatible alias
+OperationalRetrievalQuery = ExperienceQuery
+
+
+class ExperienceConditionedRetriever:
+    """Retrieves prior experiences relevant to the current execution state.
+
+    Given the current combination of operational phase, tool failures, retry
+    state, escalation readiness, and verification status, this retriever
+    scores each candidate experience card and returns the most relevant ones.
+
+    This is how Human 4 leverages what Humans 1/2/3 experienced.
+    """
 
     def __init__(self, cards: Sequence[ProcessMemoryCard]):
         """Initialize with a corpus of memory cards."""
@@ -131,7 +147,7 @@ class OperationalDecisionRetriever:
 
     def retrieve(
         self,
-        query: OperationalRetrievalQuery,
+        query: ExperienceQuery,
         *,
         top_k: int = 3,
     ) -> List[ProcessMemoryCard]:
@@ -376,9 +392,17 @@ class OperationalDecisionRetriever:
         return self.retrieve(query, top_k=top_k)
 
 
+# Backward-compatible aliases (old names still importable)
+OperationalDecisionRetriever = ExperienceConditionedRetriever
+
+
 __all__ = [
+    "ExperienceConditionedRetriever",
+    "ExperienceRetrievalContext",
+    "ExperienceQuery",
+    "extract_operational_context",
+    # Aliases for backward compatibility
     "OperationalDecisionRetriever",
     "OperationalContext",
     "OperationalRetrievalQuery",
-    "extract_operational_context",
 ]
