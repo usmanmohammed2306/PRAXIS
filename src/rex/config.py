@@ -82,10 +82,10 @@ class RexConfig:
     # ------------------------------------------------------------------
     # Retrieval knobs
     # ------------------------------------------------------------------
-    top_k: int = 3
+    top_k: int = 5
     retrieval_refresh_every: int = 2
     retrieval_score_threshold: float = 0.0  # accept any positive score
-    diversity_intent_cap: int = 2
+    diversity_intent_cap: int = 3
     hybrid_lexical_weight: float = 0.6
     hybrid_embedding_weight: float = 0.4
 
@@ -112,9 +112,9 @@ class RexConfig:
     # ------------------------------------------------------------------
     # Playbook / prompt budgets
     # ------------------------------------------------------------------
-    playbook_max_chars: int = 1800
-    playbook_max_lines: int = 28
-    playbook_section_chars: int = 360
+    playbook_max_chars: int = 2400
+    playbook_max_lines: int = 36
+    playbook_section_chars: int = 500
     startup_analysis: bool = True
     startup_analysis_max_words: int = 120
     mutation_reflection: bool = True
