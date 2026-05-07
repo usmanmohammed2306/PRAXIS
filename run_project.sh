@@ -31,8 +31,8 @@
 #   bash run_project.sh --profile small       # 15 tasks × 3 trials (~1–2 h)
 #   bash run_project.sh --profile medium      # 30 tasks × 3 trials (~3–6 h)  [default]
 #   bash run_project.sh --profile full        # 50 tasks × 4 trials (~8–14 h, full 15h budget)
-#   bash run_project.sh --tau-tasks 20 --tau-trials 2
-#   bash run_project.sh --controllers baseline,react,rex
+#   bash run_project.sh --tau-tasks 20 --tau-trials 2 --bfcl-limit 10
+#   bash run_project.sh --controllers baseline,react,rex --skip-bfcl
 #   bash run_project.sh --tau-only retail --controllers rex
 #   bash run_project.sh --dry-run             # print resolved config and exit
 #
@@ -367,17 +367,10 @@ fi
 : "${PROJECT_SCRATCH:=${REPO_ROOT}/.scratch}"
 export PROJECT_SCRATCH
 
-# GPU-aware venv selection: use per-GPU-type venv to avoid rebuilding vLLM
-# when switching between A100 (sm_80), H100 (sm_90), H200 (sm_90a), etc.
-#
-# If VENV_DIR is explicitly set, use it as-is (backward compat).
-# Otherwise, detect GPU and use GPU-specific venv: .venv-{gpu_type}
+# If VENV_DIR is explicitly set, use it as-is.
+# Otherwise, we will select a GPU-specific venv after GPU detection.
 if [[ -z "${VENV_DIR:-}" ]]; then
-  # Will be set after GPU detection (see section below)
-  VENV_DIR=""
-else
-  # User explicitly set VENV_DIR; respect it
-  :
+  VENV_DIR="${REPO_ROOT}/.venv"
 fi
 
 EXTERNAL_DIR="${EXTERNAL_DIR:-${REPO_ROOT}/external}"
@@ -450,44 +443,56 @@ if command -v nvcc >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# GPU preflight: detect compute capability and select GPU-specific venv.
-#
-# Maps compute capability to short GPU type name and uses a pre-built venv
-# for that GPU type (e.g., .venv-a100, .venv-h100, .venv-h200).
-# This avoids rebuilding vLLM when switching between GPU types.
-#
-# Supported mappings:
-#   sm_80, sm_81  → A100 / A10G / RTX 6000 Ada   (.venv-a100)
-#   sm_89         → L40  / L40S                  (.venv-a100 — compatible)
-#   sm_90         → H100 / GH200                 (.venv-h100)
-#   sm_90a        → H200                         (.venv-h200)
+# GPU preflight: detect GPU type and select / rebuild the matching venv.
 # ---------------------------------------------------------------------------
+detect_gpu_type() {
+  local gpu_name="unknown"
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_name="$(
+      nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null \
+        | head -n1 \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/[^a-z0-9 ]/ /g' \
+        | tr -s ' ' ' ' \
+        | sed 's/^ *//; s/ *$//'
+    )"
+  fi
+
+  case "$gpu_name" in
+    *h200*) echo "h200|$gpu_name" ;;
+    *h100*|*gh200*) echo "h100|$gpu_name" ;;
+    *a100*|*l40*|*l40s*|*a10g*|*"rtx 6000 ada"*) echo "a100|$gpu_name" ;;
+    *) echo "a100|$gpu_name" ;;
+  esac
+}
+
 log "Detecting GPU for venv selection"
+GPU_INFO="$(detect_gpu_type)"
+GPU_TYPE="${GPU_INFO%%|*}"
+GPU_NAME="${GPU_INFO#*|}"
 
-GPU_TYPE=""
-CURRENT_CAP=$(python - <<'PY'
-import torch
-if torch.cuda.is_available():
-    cap = torch.cuda.get_device_capability(0)
-    print(f"{cap[0]}{cap[1]}")
-else:
-    print("")
-PY
-)
+log "Detected GPU: ${GPU_NAME:-unknown} -> using venv for $GPU_TYPE"
 
-case "$CURRENT_CAP" in
-  80|81)   GPU_TYPE="a100" ;;
-  89)      GPU_TYPE="a100" ;;  # L40/L40S compatible with A100 venv
-  90)      GPU_TYPE="h100" ;;
-  90a)     GPU_TYPE="h200" ;;
-  *)       GPU_TYPE="a100"; log "WARNING: unknown GPU capability sm_$CURRENT_CAP, defaulting to a100 venv" ;;
-esac
-
-log "Detected GPU: sm_$CURRENT_CAP → using venv for $GPU_TYPE"
-
-# If VENV_DIR was not explicitly set, use GPU-specific version
-if [[ -z "${VENV_DIR}" ]]; then
+# If the user did not explicitly set VENV_DIR, switch to the GPU-specific venv.
+if [[ "$VENV_DIR" == "${REPO_ROOT}/.venv" || -z "${VENV_DIR:-}" ]]; then
   VENV_DIR="${REPO_ROOT}/.venv-${GPU_TYPE}"
+fi
+
+BUILD_SIG_FILE="$VENV_DIR/.vllm-build-signature"
+NEED_REBUILD=0
+
+if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
+  NEED_REBUILD=1
+elif [[ ! -f "$BUILD_SIG_FILE" ]]; then
+  NEED_REBUILD=1
+elif ! grep -q "\"gpu_type\": \"${GPU_TYPE}\"" "$BUILD_SIG_FILE" 2>/dev/null; then
+  NEED_REBUILD=1
+fi
+
+if [[ "$NEED_REBUILD" == "1" ]]; then
+  log "Building/rebuilding venv for $GPU_TYPE at $VENV_DIR"
+  VENV_DIR="$VENV_DIR" FORCE_REBUILD=1 SETUP_SKIP_GIT_FETCH=1 bash setup_env.sh
 fi
 
 # ---------------------------------------------------------------------------
@@ -502,6 +507,8 @@ fi
 log "Activating venv: $VENV_DIR"
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
+
+printf '{"gpu_type": "%s", "gpu_name": "%s"}\n' "$GPU_TYPE" "$GPU_NAME" > "$BUILD_SIG_FILE"
 
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -557,7 +564,7 @@ export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-24000}"
 # Wall-clock notes (per controller × benchmark cell, eager BF16):
 #   1×A100 / 7B  : ~22 LLM calls/τ-traj × 30 tasks × 3 trials, conc=4 → ~1.5 h/cell
 #   2×A100 / 32B : ~22 calls × 30 × 3, TP=2, conc=8 → ~1.0–1.5 h/cell
-#   12 cells total + ACE + summary slack → fits in the 10–15 h budget.
+#   12 cells total + BFCL + summary slack → fits in the 10–15 h budget.
 #
 # These are static knobs that the profile / CLI never override.
 TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-train}"
@@ -593,7 +600,7 @@ MODEL_TIER=$MODEL_TIER   primary_max_len=$PRIMARY_MAX_LEN   gpu_mem_util=$PRIMAR
 PROFILE=$PROFILE
   TAU:  tasks=[$TAU_START_INDEX..$TAU_END_INDEX) trials=$TAU_NUM_TRIALS conc=$TAU_MAX_CONCURRENCY max_steps=$TAU_MAX_STEPS
   BFCL: limit=$BFCL_LIMIT conc=$BFCL_MAX_CONCURRENCY max_steps=$BFCL_MAX_STEPS data_dir=$BFCL_DATA_DIR
-CONTROLLERS=$CONTROLLERS_OPT  TAU_ONLY=${TAU_ONLY:-(both)}  SKIP_BFCL=$SKIP_BFCL
+CONTROLLERS=$CONTROLLERS_OPT  SKIP_BFCL=$SKIP_BFCL  TAU_ONLY=${TAU_ONLY:-(both)}
 PORT=$PORT  SERVED_NAME=$SERVED_NAME  ENFORCE_EAGER=$ENFORCE_EAGER
 MODEL_CANDIDATES:
 $(printf '  - %s\n' "${MODEL_CANDIDATES[@]}")
@@ -827,6 +834,7 @@ fi
 # Run that script once after collecting baseline/act/react trajectories,
 # then re-run run_project.sh so REx retrieves from the permanent memory.
 # ---------------------------------------------------------------------------
+
 
 # ---------------------------------------------------------------------------
 # Runners
