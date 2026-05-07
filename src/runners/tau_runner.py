@@ -295,8 +295,8 @@ def _promote_records_to_runtime(
                 manifest["consolidation"] = report.to_dict()
                 print(
                     f"[memory] consolidation: {len(cards)} cards, "
-                    f"duplicates={report.num_duplicates}, "
-                    f"decay_applied={report.cards_with_decay}",
+                    f"duplicates={len(report.duplicates)}, "
+                    f"decay_applied={report.decayed}",
                     file=sys.stderr,
                 )
         except Exception as exc:  # noqa: BLE001
