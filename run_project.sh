@@ -552,7 +552,7 @@ export TAU_PATCH_HARD_BUDGET="${TAU_PATCH_HARD_BUDGET:-24000}"
 #   12 cells total + ACE + summary slack → fits in the 10–15 h budget.
 #
 # These are static knobs that the profile / CLI never override.
-TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-test}"
+TAU_TASK_SPLIT="${TAU_TASK_SPLIT:-train}"
 TAU_START_INDEX="${TAU_START_INDEX:-0}"
 TAU_TEMPERATURE="${TAU_TEMPERATURE:-0.0}"
 ACE_LANGUAGE="${ACE_LANGUAGE:-en}"

@@ -150,30 +150,78 @@ def _extract_user_turn(task: Dict[str, Any]) -> str:
     return ""
 
 
+def _normalize_param_schema(params: Any) -> Dict[str, Any]:
+    """Convert ACEBench parameter schema to OpenAI-compatible format.
+
+    ACEBench uses "type": "dict" for object types; OpenAI API requires
+    "type": "object". Converts recursively.
+    """
+    if not isinstance(params, dict):
+        return {"type": "object", "properties": {}}
+    out = {}
+    for k, v in params.items():
+        if k == "type" and v == "dict":
+            out[k] = "object"
+        elif isinstance(v, dict):
+            out[k] = _normalize_param_schema(v)
+        elif isinstance(v, list):
+            out[k] = [
+                _normalize_param_schema(i) if isinstance(i, dict) else i
+                for i in v
+            ]
+        else:
+            out[k] = v
+    # OpenAI requires "properties" key on object types
+    if out.get("type") == "object" and "properties" not in out:
+        out["properties"] = {}
+    return out
+
+
 def _extract_tool_specs(task: Dict[str, Any]) -> List[Dict[str, Any]]:
-    raw = task.get("tools") or task.get("functions") or task.get("available_tools") or []
+    # ACEBench stores tools in "function" (singular list).
+    # Other benchmarks use "tools", "functions", or "available_tools".
+    raw = (
+        task.get("function")          # ACEBench agent format
+        or task.get("tools")
+        or task.get("functions")
+        or task.get("available_tools")
+        or []
+    )
     if not isinstance(raw, list):
         return []
     out: List[Dict[str, Any]] = []
     for item in raw:
         if not isinstance(item, dict):
             continue
+        # Already in OpenAI wrapped format: {"type": "function", "function": {...}}
         if item.get("type") == "function" and isinstance(item.get("function"), dict):
-            out.append(item)
+            fn = item["function"]
+            params = _normalize_param_schema(
+                fn.get("parameters") or fn.get("params") or {}
+            )
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": str(fn.get("name", "")),
+                    "description": str(fn.get("description", "")),
+                    "parameters": params,
+                },
+            })
             continue
+        # Flat format: {"name": ..., "description": ..., "parameters": ...}
         fn = item.get("function") if isinstance(item.get("function"), dict) else item
         name = fn.get("name")
         if not name:
             continue
+        params = _normalize_param_schema(
+            fn.get("parameters") or fn.get("params") or {}
+        )
         spec = {
             "type": "function",
             "function": {
                 "name": str(name),
                 "description": str(fn.get("description", "")),
-                "parameters": fn.get("parameters") or fn.get("params") or {
-                    "type": "object",
-                    "properties": {},
-                },
+                "parameters": params,
             },
         }
         out.append(spec)
@@ -181,6 +229,22 @@ def _extract_tool_specs(task: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _extract_ground_truth_tools(task: Dict[str, Any]) -> List[str]:
+    # "path" is the ACEBench field for expected tool call sequence.
+    # It may be a list of dicts like [{"name": "func", ...}, ...] or a list of strings.
+    path = task.get("path")
+    if isinstance(path, list) and path:
+        names = []
+        for item in path:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict):
+                n = item.get("name") or item.get("tool_name") or item.get("function")
+                if isinstance(n, str) and n:
+                    names.append(n)
+        if names:
+            return names
+
+    # Fallback: check other common ground-truth field names
     for key in ("ground_truth", "gold", "expected", "answer", "target"):
         gt = task.get(key)
         if gt is None:
@@ -412,20 +476,38 @@ def _promote_ace_records(
         if not isinstance(r, dict):
             continue
         coverage = r.get("tool_coverage")
-        if isinstance(coverage, (int, float)):
+        actual_tools = r.get("actual_tools") or []
+        # Synthesize a reward signal for the distiller.
+        # tool_coverage is 0.0 for all agent tasks whose expected path is empty
+        # (the benchmark doesn't provide a gold call sequence). In that case we
+        # fall back to "were tools called at all?" as a proxy for a useful run.
+        if isinstance(coverage, (int, float)) and float(coverage) > 0.0:
             reward = float(coverage)
-        elif r.get("actual_tools"):
+        elif actual_tools:
+            # Tools were called even though we have no ground-truth to score
+            # against — treat this as a partial success so the distiller keeps
+            # the trajectory as a useful procedural example.
             reward = 0.5
         else:
             reward = 0.0
         enriched.append({
-            "task_id": r.get("index"),
+            "task_id": r.get("task_id") or r.get("index"),
             "trial": 0,
             "reward": reward,
-            "info": {"controller": r.get("controller", ns.agent)},
+            # Include domain/environment so trajectory_parser._environment_for()
+            # correctly labels these cards as "ace" rather than "generic".
+            "info": {
+                "controller": r.get("controller", ns.agent),
+                "domain": "ace",
+                "environment": "ace",
+            },
             "messages": r.get("messages") or [],
             "status": r.get("status", "ok"),
-            "error": r.get("error", ""),
+            "error": r.get("error") or "",
+            # Preserve ACE-specific fields so parse_record can use them.
+            "tool_coverage": coverage if isinstance(coverage, (int, float)) else 0.0,
+            "expected_tools": r.get("expected_tools") or [],
+            "actual_tools": actual_tools,
         })
     try:
         manifest = promote_trajectories(
