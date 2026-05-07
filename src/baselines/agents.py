@@ -183,10 +183,15 @@ class _BaseInProcessAgent(Agent):
             if tool_calls:
                 for tc in tool_calls:
                     name = tc.function.name
-                    try:
-                        kwargs = json.loads(tc.function.arguments or "{}")
-                    except Exception:
-                        kwargs = {}
+                    # Handle both dict and string arguments from the LLM response.
+                    args = tc.function.arguments
+                    if isinstance(args, dict):
+                        kwargs = args
+                    else:
+                        try:
+                            kwargs = json.loads(args or "{}")
+                        except Exception:
+                            kwargs = {}
                     try:
                         env_resp = env.step(Action(name=name, kwargs=kwargs))
                     except Exception as env_exc:

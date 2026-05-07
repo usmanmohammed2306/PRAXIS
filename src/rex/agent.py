@@ -753,10 +753,15 @@ class RexAgent(Agent):  # type: ignore[misc]
             if tool_calls:
                 for tc in tool_calls:
                     name = tc.function.name
-                    try:
-                        kwargs = json.loads(tc.function.arguments or "{}")
-                    except Exception:
-                        kwargs = {}
+                    # Handle both dict and string arguments from the LLM response.
+                    args = tc.function.arguments
+                    if isinstance(args, dict):
+                        kwargs = args
+                    else:
+                        try:
+                            kwargs = json.loads(args or "{}")
+                        except Exception:
+                            kwargs = {}
                     if name in self._mutating_tools():
                         stats["mutating_tool_calls"] += 1
                     allowed, block_text = self._check_mutation(name, kwargs, messages, stats)
