@@ -804,10 +804,9 @@ export OPENAI_API_BASE="$OPENAI_BASE_URL"
 # fast, deterministic, and explicitly avoids prior eval trajectories.
 export REX_EXPERIENCE_DIR="${REX_EXPERIENCE_DIR:-${PROJECT_SCRATCH}/rex_experience_bank}"
 # Runtime memory accumulates lessons distilled from saved trajectories across
-# runs. Default to a stable path under outputs/ so the bank persists between
-# invocations of this script. Override REX_RUNTIME_DIR to share between
-# checkouts (e.g. point at a scratch volume).
-export REX_RUNTIME_DIR="${REX_RUNTIME_DIR:-${OUTPUTS_DIR}/experience_runtime}"
+# runs. Lives under PROJECT_SCRATCH so cards survive cluster job boundaries and
+# are available to every re-invocation of this script on the same scratch volume.
+export REX_RUNTIME_DIR="${REX_RUNTIME_DIR:-${PROJECT_SCRATCH}/rex_experience_runtime}"
 mkdir -p "$REX_RUNTIME_DIR"
 # Stateful re-retrieval cadence: refresh the playbook every N effective steps.
 # 0 disables (only the initial brief is used).
@@ -868,6 +867,7 @@ run_tau () {
       --max-concurrency "$TAU_MAX_CONCURRENCY" \
       --temperature "$TAU_TEMPERATURE" \
       --max-num-steps "$TAU_MAX_STEPS" \
+      --runtime-dir "$REX_RUNTIME_DIR" \
       --output-dir "$out"; then
     log "tau-bench OK: $env_name/$agent_kind"
   else
