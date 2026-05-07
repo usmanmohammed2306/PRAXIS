@@ -150,30 +150,78 @@ def _extract_user_turn(task: Dict[str, Any]) -> str:
     return ""
 
 
+def _normalize_param_schema(params: Any) -> Dict[str, Any]:
+    """Convert ACEBench parameter schema to OpenAI-compatible format.
+
+    ACEBench uses "type": "dict" for object types; OpenAI API requires
+    "type": "object". Converts recursively.
+    """
+    if not isinstance(params, dict):
+        return {"type": "object", "properties": {}}
+    out = {}
+    for k, v in params.items():
+        if k == "type" and v == "dict":
+            out[k] = "object"
+        elif isinstance(v, dict):
+            out[k] = _normalize_param_schema(v)
+        elif isinstance(v, list):
+            out[k] = [
+                _normalize_param_schema(i) if isinstance(i, dict) else i
+                for i in v
+            ]
+        else:
+            out[k] = v
+    # OpenAI requires "properties" key on object types
+    if out.get("type") == "object" and "properties" not in out:
+        out["properties"] = {}
+    return out
+
+
 def _extract_tool_specs(task: Dict[str, Any]) -> List[Dict[str, Any]]:
-    raw = task.get("tools") or task.get("functions") or task.get("available_tools") or []
+    # ACEBench stores tools in "function" (singular list).
+    # Other benchmarks use "tools", "functions", or "available_tools".
+    raw = (
+        task.get("function")          # ACEBench agent format
+        or task.get("tools")
+        or task.get("functions")
+        or task.get("available_tools")
+        or []
+    )
     if not isinstance(raw, list):
         return []
     out: List[Dict[str, Any]] = []
     for item in raw:
         if not isinstance(item, dict):
             continue
+        # Already in OpenAI wrapped format: {"type": "function", "function": {...}}
         if item.get("type") == "function" and isinstance(item.get("function"), dict):
-            out.append(item)
+            fn = item["function"]
+            params = _normalize_param_schema(
+                fn.get("parameters") or fn.get("params") or {}
+            )
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": str(fn.get("name", "")),
+                    "description": str(fn.get("description", "")),
+                    "parameters": params,
+                },
+            })
             continue
+        # Flat format: {"name": ..., "description": ..., "parameters": ...}
         fn = item.get("function") if isinstance(item.get("function"), dict) else item
         name = fn.get("name")
         if not name:
             continue
+        params = _normalize_param_schema(
+            fn.get("parameters") or fn.get("params") or {}
+        )
         spec = {
             "type": "function",
             "function": {
                 "name": str(name),
                 "description": str(fn.get("description", "")),
-                "parameters": fn.get("parameters") or fn.get("params") or {
-                    "type": "object",
-                    "properties": {},
-                },
+                "parameters": params,
             },
         }
         out.append(spec)
@@ -181,6 +229,22 @@ def _extract_tool_specs(task: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _extract_ground_truth_tools(task: Dict[str, Any]) -> List[str]:
+    # "path" is the ACEBench field for expected tool call sequence.
+    # It may be a list of dicts like [{"name": "func", ...}, ...] or a list of strings.
+    path = task.get("path")
+    if isinstance(path, list) and path:
+        names = []
+        for item in path:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict):
+                n = item.get("name") or item.get("tool_name") or item.get("function")
+                if isinstance(n, str) and n:
+                    names.append(n)
+        if names:
+            return names
+
+    # Fallback: check other common ground-truth field names
     for key in ("ground_truth", "gold", "expected", "answer", "target"):
         gt = task.get(key)
         if gt is None:
