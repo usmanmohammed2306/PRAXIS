@@ -422,22 +422,15 @@ def load_experience_cards(
 ) -> List[ExperienceCard]:
     """Return seed + runtime experience cards for ``domain``.
 
-    The seed bank is built once from allowed support data (retail train/dev,
-    policy-derived airline cards, ACE schema cards). The runtime bank is
-    accumulated across runs by ``promote_trajectories``. Both are loaded so
-    later runs can benefit from lessons distilled from earlier ones.
+    The seed bank is built explicitly by running:
+        python -m src.scripts.build_experience_memory --inputs outputs/ --output-bank <bank_dir>
+
+    If the bank file does not exist, REx starts with empty memory — no cards
+    are auto-generated from benchmark training data or hardcoded policies.
+    This ensures REx and baseline are compared on equal footing and that
+    deleting experience files actually takes effect.
     """
-    bank_path = bank_dir / f"{domain}.jsonl"
-    if not bank_path.exists():
-        try:
-            build_experience_bank(output_dir=bank_dir)
-        except Exception:
-            seed = _policy_airline_cards() if domain == "airline" else (
-                _ace_schema_cards() if domain == "ace" else []
-            )
-            runtime = _load_runtime_cards(domain, runtime_dir)
-            return _dedupe_cards(seed + runtime)
-    seed_cards = _read_cards_jsonl(bank_path)
+    seed_cards = _read_cards_jsonl(bank_dir / f"{domain}.jsonl")
     runtime_cards = _load_runtime_cards(domain, runtime_dir)
     return _dedupe_cards(seed_cards + runtime_cards)
 

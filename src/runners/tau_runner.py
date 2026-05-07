@@ -234,8 +234,15 @@ def _promote_records_to_runtime(
     used if an explicit ``--runtime-dir`` override is passed to the runner.
     """
     if not _should_promote(ns):
-        return {"status": "skipped", "reason": f"task_split={ns.task_split}"}
+        reason = f"task_split={ns.task_split}"
+        print(f"[memory] promotion skipped: {reason}", file=sys.stderr)
+        return {"status": "skipped", "reason": reason}
     runtime_dir = Path(ns.runtime_dir) if ns.runtime_dir else None
+    print(
+        f"[memory] promoting {len(records)} trajectories from {ns.env} "
+        f"(promote_mode={ns.promote_runtime_memory or 'auto'})",
+        file=sys.stderr,
+    )
     try:
         manifest = promote_trajectories(
             records,
@@ -244,6 +251,13 @@ def _promote_records_to_runtime(
             allow_test_split=ns.promote_runtime_memory == "always",
         )
         manifest["status"] = "ok"
+        promoted = manifest.get("promoted", 0)
+        total_after = manifest.get("total_runtime_cards_after", 0)
+        print(
+            f"[memory] v1 promoted: {promoted} cards → "
+            f"total runtime={total_after}",
+            file=sys.stderr,
+        )
         # Also run the v2 pipeline (ProcessMemoryCard schema) for richer
         # diagnostics + memory consolidation. Failure here is non-fatal:
         # the legacy bank still survives and existing tests still pass.
@@ -256,8 +270,19 @@ def _promote_records_to_runtime(
                 allow_test_split=ns.promote_runtime_memory == "always",
             )
             manifest["v2"] = v2_manifest
+            v2_promoted = v2_manifest.get("promoted", 0)
+            v2_total = v2_manifest.get("total_runtime_cards_after", 0)
+            print(
+                f"[memory] v2 promoted: {v2_promoted} cards → "
+                f"total runtime={v2_total}",
+                file=sys.stderr,
+            )
         except Exception as exc:  # noqa: BLE001
             manifest["v2_error"] = f"{exc.__class__.__name__}: {exc}"
+            print(
+                f"[memory] v2 promotion failed: {exc.__class__.__name__}",
+                file=sys.stderr,
+            )
         # Memory consolidation pass — runs detect_duplicates, contradictions,
         # decay over the v2 store.
         try:
@@ -268,10 +293,25 @@ def _promote_records_to_runtime(
             if cards:
                 report = consolidate(cards, config=cfg)
                 manifest["consolidation"] = report.to_dict()
+                print(
+                    f"[memory] consolidation: {len(cards)} cards, "
+                    f"duplicates={report.num_duplicates}, "
+                    f"decay_applied={report.cards_with_decay}",
+                    file=sys.stderr,
+                )
         except Exception as exc:  # noqa: BLE001
             manifest["consolidation_error"] = f"{exc.__class__.__name__}: {exc}"
+            print(
+                f"[memory] consolidation failed: {exc.__class__.__name__}",
+                file=sys.stderr,
+            )
+        print(f"[memory] promotion complete: status={manifest['status']}", file=sys.stderr)
         return manifest
     except Exception as exc:  # noqa: BLE001
+        print(
+            f"[memory] promotion error: {exc.__class__.__name__}: {exc}",
+            file=sys.stderr,
+        )
         return {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
 
 

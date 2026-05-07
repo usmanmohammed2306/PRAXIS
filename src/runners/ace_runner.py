@@ -398,8 +398,14 @@ def _promote_ace_records(
     """Distill ACE trajectories into the runtime memory bank for the ace domain."""
     mode = (ns.promote_runtime_memory or "auto").lower()
     if mode == "never":
+        print("[memory] ACE promotion skipped: promote_runtime_memory=never", file=sys.stderr)
         return {"status": "skipped", "reason": "promote_runtime_memory=never"}
     runtime_dir = Path(ns.runtime_dir) if ns.runtime_dir else None
+    print(
+        f"[memory] promoting {len(records)} ACE trajectories "
+        f"(promote_mode={mode})",
+        file=sys.stderr,
+    )
 
     enriched: List[Dict[str, Any]] = []
     for r in records:
@@ -429,6 +435,13 @@ def _promote_ace_records(
             allow_test_split=mode == "always",
         )
         manifest["status"] = "ok"
+        promoted = manifest.get("promoted", 0)
+        total_after = manifest.get("total_runtime_cards_after", 0)
+        print(
+            f"[memory] v1 promoted: {promoted} cards → "
+            f"total runtime={total_after}",
+            file=sys.stderr,
+        )
         # v2 pipeline (ProcessMemoryCard) — non-fatal on failure.
         try:
             v2_runtime = (runtime_dir / "v2") if runtime_dir else None
@@ -439,8 +452,19 @@ def _promote_ace_records(
                 allow_test_split=mode == "always",
             )
             manifest["v2"] = v2_manifest
+            v2_promoted = v2_manifest.get("promoted", 0)
+            v2_total = v2_manifest.get("total_runtime_cards_after", 0)
+            print(
+                f"[memory] v2 promoted: {v2_promoted} cards → "
+                f"total runtime={v2_total}",
+                file=sys.stderr,
+            )
         except Exception as exc:  # noqa: BLE001
             manifest["v2_error"] = f"{exc.__class__.__name__}: {exc}"
+            print(
+                f"[memory] v2 promotion failed: {exc.__class__.__name__}",
+                file=sys.stderr,
+            )
         # Memory consolidation pass over the v2 ACE store.
         try:
             cfg = RexConfig.from_env()
@@ -448,11 +472,27 @@ def _promote_ace_records(
             store = MemoryStore(seed_dir=cfg.bank_dir, runtime_dir=v2_runtime_dir, config=cfg)
             cards = store.load_runtime("ace")
             if cards:
-                manifest["consolidation"] = consolidate(cards, config=cfg).to_dict()
+                report = consolidate(cards, config=cfg)
+                manifest["consolidation"] = report.to_dict()
+                print(
+                    f"[memory] consolidation: {len(cards)} cards, "
+                    f"duplicates={report.num_duplicates}, "
+                    f"decay_applied={report.cards_with_decay}",
+                    file=sys.stderr,
+                )
         except Exception as exc:  # noqa: BLE001
             manifest["consolidation_error"] = f"{exc.__class__.__name__}: {exc}"
+            print(
+                f"[memory] consolidation failed: {exc.__class__.__name__}",
+                file=sys.stderr,
+            )
+        print(f"[memory] promotion complete: status={manifest['status']}", file=sys.stderr)
         return manifest
     except Exception as exc:  # noqa: BLE001
+        print(
+            f"[memory] promotion error: {exc.__class__.__name__}: {exc}",
+            file=sys.stderr,
+        )
         return {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
 
 

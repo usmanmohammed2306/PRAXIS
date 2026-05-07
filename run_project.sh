@@ -798,10 +798,15 @@ mkdir -p "$REX_RUNTIME_DIR"
 # 0 disables (only the initial brief is used).
 export REX_RETRIEVAL_REFRESH_EVERY="${REX_RETRIEVAL_REFRESH_EVERY:-2}"
 if [[ "$CONTROLLERS_OPT" == *"rex"* ]]; then
-  log "Building REx seed experience bank:    $REX_EXPERIENCE_DIR"
+  log "Using REx experience bank:             $REX_EXPERIENCE_DIR"
   log "Using REx runtime memory directory:   $REX_RUNTIME_DIR"
-  python -m src.rex.experience --output-dir "$REX_EXPERIENCE_DIR" \
-    || log "WARNING: REx experience bank build failed; controller will fall back to built-in policy cards"
+  # NOTE: we do NOT auto-generate a seed bank here.
+  # REx starts with whatever experience cards already exist in REX_EXPERIENCE_DIR.
+  # On the very first run that directory is empty — this is intentional.
+  # To build permanent experience memory from collected trajectories, run:
+  #
+  #   python -m src.scripts.build_experience_memory \
+  #       --inputs "$OUTPUTS_DIR" --output-bank "$REX_EXPERIENCE_DIR"
 fi
 
 # ---------------------------------------------------------------------------
