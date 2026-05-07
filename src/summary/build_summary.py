@@ -1,6 +1,6 @@
 """Aggregate per-run metrics.json files into outputs/summary/{summary.json,summary.md}.
 
-Renders a four-way comparison across the same fixed base model:
+Renders a four-way comparison across the same fixed base model on tau-bench:
 
   1. baseline — vanilla tool-calling (minimal system prompt)
   2. act      — Act (Yao et al. 2022): action-only, no reasoning prose
@@ -13,10 +13,12 @@ Each section renders a row per metric for all four conditions. Missing runs
 are reported as ``status=missing`` so the table never collapses on partial
 data.
 
-The summary also computes a ``deltas`` block per benchmark — REx-RPE minus
-the strongest non-REx controller on the headline metric (success rate
-for tau-bench, completion rate for ACEBench) and REx-RPE vs. baseline — to
-make the wins immediately visible.
+The summary computes a ``deltas`` block per benchmark — REx-RPE minus
+the strongest non-REx controller on success rate — to make the wins
+immediately visible.
+
+Note: ACEBench is excluded because its standalone function-calling tasks
+do not produce sufficient procedural patterns for experience distillation.
 """
 from __future__ import annotations
 
@@ -51,12 +53,6 @@ SECTIONS: List[Tuple[str, Dict[str, str]]] = [
         "act": "tau_airline_act",
         "react": "tau_airline_react",
         "rex": "tau_airline_rex",
-    }),
-    ("ACEBench Agent", {
-        "baseline": "acebench_agent_baseline",
-        "act": "acebench_agent_act",
-        "react": "acebench_agent_react",
-        "rex": "acebench_agent_rex",
     }),
 ]
 
@@ -330,10 +326,8 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         label = section["label"]
         by_cond = section["by_condition"]
         lines.append(f"### {label}")
-        if label.startswith("tau"):
-            lines.extend(_tau_rows(label, by_cond))
-        else:
-            lines.extend(_ace_rows(label, by_cond))
+        # All sections are now tau-bench (ACEBench excluded for lack of sequential patterns)
+        lines.extend(_tau_rows(label, by_cond))
         lines.append("")
     # REx-specific diagnostics block.
     lines.append("## REx diagnostics")
@@ -436,8 +430,6 @@ def render_markdown(summary: Dict[str, Any]) -> str:
                  "no-tools startup analysis, then uses native tool calls. Only "
                  "mutating tau-bench tools trigger same-model SABER-style reflection; "
                  "reads are never blocked by the REx layer.")
-    lines.append("- ACEBench metrics here are diagnostic. For the official score, "
-                 "re-run upstream `score_agent.py` against the saved trajectories.")
     return "\n".join(lines) + "\n"
 
 

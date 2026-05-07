@@ -5,10 +5,10 @@
 # One-shot driver for the four-way comparison experiment. Loads the same
 # cluster toolchain that setup_env.sh used, activates the .venv (Python 3.12
 # + cu130 torch stack + vLLM 0.18.0 from source), serves a single local vLLM
-# instance, and runs 12 evaluations:
+# instance, and runs evaluations:
 #
 #   4 controllers (vanilla tool-calling, Act, ReAct, REx-RPE)
-#   x 3 benchmarks (tau-retail, tau-airline, ACEBench Agent)
+#   x 2 benchmarks (tau-retail, tau-airline)  [ACEBench skipped by default]
 #
 # All four controllers share the same in-process loop, model, temperature,
 # tool schemas, max steps, and truncation budget — so the only varying axis
@@ -31,8 +31,8 @@
 #   bash run_project.sh --profile small       # 15 tasks × 3 trials (~1–2 h)
 #   bash run_project.sh --profile medium      # 30 tasks × 3 trials (~3–6 h)  [default]
 #   bash run_project.sh --profile full        # 50 tasks × 4 trials (~8–14 h, full 15h budget)
-#   bash run_project.sh --tau-tasks 20 --tau-trials 2 --ace-limit 10
-#   bash run_project.sh --controllers baseline,react,rex --skip-acebench
+#   bash run_project.sh --tau-tasks 20 --tau-trials 2
+#   bash run_project.sh --controllers baseline,react,rex
 #   bash run_project.sh --tau-only retail --controllers rex
 #   bash run_project.sh --dry-run             # print resolved config and exit
 #
@@ -129,7 +129,7 @@ MODEL_TIER="${MODEL_TIER:-auto}"
 TP_OPT="${TENSOR_PARALLEL_SIZE:-}"
 PROFILE="${PROFILE:-medium}"
 CONTROLLERS_OPT="${CONTROLLERS:-baseline,act,react,rex}"
-SKIP_ACEBENCH="${SKIP_ACEBENCH:-0}"
+SKIP_ACEBENCH="${SKIP_ACEBENCH:-1}"
 TAU_ONLY="${TAU_ONLY:-}"
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -584,8 +584,8 @@ GPUS=$GPUS_CSV   NUM_GPUS=$NUM_GPUS   TP=$TP
 MODEL_TIER=$MODEL_TIER   primary_max_len=$PRIMARY_MAX_LEN   gpu_mem_util=$PRIMARY_MEM_UTIL
 PROFILE=$PROFILE
   TAU: tasks=[$TAU_START_INDEX..$TAU_END_INDEX) trials=$TAU_NUM_TRIALS conc=$TAU_MAX_CONCURRENCY max_steps=$TAU_MAX_STEPS
-  ACE: limit=$ACE_LIMIT conc=$ACE_MAX_CONCURRENCY max_steps=$ACE_MAX_STEPS
-CONTROLLERS=$CONTROLLERS_OPT  SKIP_ACEBENCH=$SKIP_ACEBENCH  TAU_ONLY=${TAU_ONLY:-(both)}
+  (ACEBench disabled by default due to lack of sequential procedural patterns)
+CONTROLLERS=$CONTROLLERS_OPT  TAU_ONLY=${TAU_ONLY:-(both)}
 PORT=$PORT  SERVED_NAME=$SERVED_NAME  ENFORCE_EAGER=$ENFORCE_EAGER
 MODEL_CANDIDATES:
 $(printf '  - %s\n' "${MODEL_CANDIDATES[@]}")
