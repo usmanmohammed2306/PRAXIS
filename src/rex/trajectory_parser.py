@@ -76,8 +76,15 @@ def _environment_for(record: Dict[str, Any]) -> str:
             v = info.get(key)
             if isinstance(v, str) and v.strip():
                 return v.strip().lower()
-    # ACE always lives in the "ace" memory domain
+    # BFCL records carry expected_tools / tool_coverage at the top level but
+    # info["environment"] = "bfcl" is already checked above, so this fallback
+    # only fires for genuinely legacy ACE records that lack an info dict.
     if "tool_coverage" in record or "expected_tools" in record:
+        # Prefer a top-level "domain" or "environment" key before assuming ACE.
+        for key in ("domain", "environment", "env"):
+            v = record.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip().lower()
         return "ace"
     return "generic"
 
