@@ -30,7 +30,6 @@ from ..baselines.ace_loops import run_baseline_style
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 from ..common.openai_client import get_client
 from ..rex.config import RexConfig
-from ..rex.experience import promote_trajectories
 from ..rex.memory_quality import consolidate
 from ..rex.memory_store import MemoryStore
 from ..rex.pipeline import promote_records as pipeline_promote_records
@@ -510,7 +509,10 @@ def _promote_ace_records(
             "actual_tools": actual_tools,
         })
     try:
-        manifest = promote_trajectories(
+        # v2 pipeline only — writes ProcessMemoryCard-schema JSONL to REX_RUNTIME_DIR.
+        # v1 promote_trajectories removed: it wrote a different schema to the same file,
+        # causing mixed-schema JSONL that made RexAgent silently drop all v2 cards.
+        manifest = pipeline_promote_records(
             enriched,
             domain="ace",
             runtime_dir=runtime_dir,
@@ -520,37 +522,14 @@ def _promote_ace_records(
         promoted = manifest.get("promoted", 0)
         total_after = manifest.get("total_runtime_cards_after", 0)
         print(
-            f"[memory] v1 promoted: {promoted} cards → "
+            f"[memory] promoted: {promoted} cards → "
             f"total runtime={total_after}",
             file=sys.stderr,
         )
-        # v2 pipeline (ProcessMemoryCard) — non-fatal on failure.
-        try:
-            v2_runtime = (runtime_dir / "v2") if runtime_dir else None
-            v2_manifest = pipeline_promote_records(
-                enriched,
-                domain="ace",
-                runtime_dir=v2_runtime,
-                allow_test_split=mode == "always",
-            )
-            manifest["v2"] = v2_manifest
-            v2_promoted = v2_manifest.get("promoted", 0)
-            v2_total = v2_manifest.get("total_runtime_cards_after", 0)
-            print(
-                f"[memory] v2 promoted: {v2_promoted} cards → "
-                f"total runtime={v2_total}",
-                file=sys.stderr,
-            )
-        except Exception as exc:  # noqa: BLE001
-            manifest["v2_error"] = f"{exc.__class__.__name__}: {exc}"
-            print(
-                f"[memory] v2 promotion failed: {exc.__class__.__name__}",
-                file=sys.stderr,
-            )
-        # Memory consolidation pass over the v2 ACE store.
+        # Memory consolidation pass over the ACE runtime store.
         try:
             cfg = RexConfig.from_env()
-            v2_runtime_dir = (runtime_dir / "v2") if runtime_dir else cfg.runtime_dir
+            v2_runtime_dir = runtime_dir if runtime_dir else cfg.runtime_dir
             store = MemoryStore(seed_dir=cfg.bank_dir, runtime_dir=v2_runtime_dir, config=cfg)
             cards = store.load_runtime("ace")
             if cards:
@@ -558,8 +537,8 @@ def _promote_ace_records(
                 manifest["consolidation"] = report.to_dict()
                 print(
                     f"[memory] consolidation: {len(cards)} cards, "
-                    f"duplicates={report.num_duplicates}, "
-                    f"decay_applied={report.cards_with_decay}",
+                    f"duplicates={len(report.duplicates)}, "
+                    f"decay_applied={report.decayed}",
                     file=sys.stderr,
                 )
         except Exception as exc:  # noqa: BLE001

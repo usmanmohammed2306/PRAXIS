@@ -33,7 +33,6 @@ from typing import Any, Dict, List, Tuple
 
 from ..common.io_utils import append_jsonl, ensure_dir, safe_mean, write_json
 from ..rex.config import RexConfig
-from ..rex.experience import promote_trajectories
 from ..rex.memory_quality import consolidate
 from ..rex.memory_store import MemoryStore
 from ..rex.pipeline import promote_records as pipeline_promote_records
@@ -226,12 +225,11 @@ def _promote_records_to_runtime(
 ) -> Dict[str, Any]:
     """Distill ``records`` into the runtime memory bank for ``ns.env``.
 
-    Uses the legacy ``promote_trajectories`` API (which writes
-    ``ExperienceCard``-shaped JSONL the existing seed bank also produces).
-    The richer :func:`pipeline_promote_records` is invoked separately for
-    the ``ProcessMemoryCard`` runtime store. By default, both v1 and v2 cards
-    are written to ``${REX_RUNTIME_DIR}``; the ``v2/`` subdirectory is only
-    used if an explicit ``--runtime-dir`` override is passed to the runner.
+    Writes ``ProcessMemoryCard``-schema JSONL (v2) to ``${REX_RUNTIME_DIR}``
+    via :func:`pipeline_promote_records`. The legacy v1 ``promote_trajectories``
+    path has been removed: it wrote a different schema to the same file,
+    producing a mixed-schema JSONL that caused ``RexAgent`` to silently drop
+    all v2 cards when building the hybrid retriever corpus.
     """
     if not _should_promote(ns):
         reason = f"task_split={ns.task_split}"
@@ -244,7 +242,12 @@ def _promote_records_to_runtime(
         file=sys.stderr,
     )
     try:
-        manifest = promote_trajectories(
+        # v2 pipeline only — writes ProcessMemoryCard-schema JSONL to REX_RUNTIME_DIR.
+        # The legacy promote_trajectories (v1 ExperienceCard) is no longer called here
+        # because it wrote a different schema to the same file, producing a mixed-schema
+        # JSONL that confused MemoryStore readers and caused RexAgent to silently drop
+        # all v2 cards when building the hybrid retriever.
+        manifest = pipeline_promote_records(
             records,
             domain=ns.env,
             runtime_dir=runtime_dir,
@@ -254,49 +257,24 @@ def _promote_records_to_runtime(
         promoted = manifest.get("promoted", 0)
         total_after = manifest.get("total_runtime_cards_after", 0)
         print(
-            f"[memory] v1 promoted: {promoted} cards → "
+            f"[memory] promoted: {promoted} cards → "
             f"total runtime={total_after}",
             file=sys.stderr,
         )
-        # Also run the v2 pipeline (ProcessMemoryCard schema) for richer
-        # diagnostics + memory consolidation. Failure here is non-fatal:
-        # the legacy bank still survives and existing tests still pass.
-        try:
-            v2_runtime = (runtime_dir / "v2") if runtime_dir else None
-            v2_manifest = pipeline_promote_records(
-                records,
-                domain=ns.env,
-                runtime_dir=v2_runtime,
-                allow_test_split=ns.promote_runtime_memory == "always",
-            )
-            manifest["v2"] = v2_manifest
-            v2_promoted = v2_manifest.get("promoted", 0)
-            v2_total = v2_manifest.get("total_runtime_cards_after", 0)
-            print(
-                f"[memory] v2 promoted: {v2_promoted} cards → "
-                f"total runtime={v2_total}",
-                file=sys.stderr,
-            )
-        except Exception as exc:  # noqa: BLE001
-            manifest["v2_error"] = f"{exc.__class__.__name__}: {exc}"
-            print(
-                f"[memory] v2 promotion failed: {exc.__class__.__name__}",
-                file=sys.stderr,
-            )
         # Memory consolidation pass — runs detect_duplicates, contradictions,
-        # decay over the v2 store.
+        # decay over the runtime store (same dir that pipeline_promote_records writes to).
         try:
             cfg = RexConfig.from_env()
-            v2_runtime_dir = (runtime_dir / "v2") if runtime_dir else cfg.runtime_dir
-            store = MemoryStore(seed_dir=cfg.bank_dir, runtime_dir=v2_runtime_dir, config=cfg)
+            store_runtime_dir = runtime_dir if runtime_dir else cfg.runtime_dir
+            store = MemoryStore(seed_dir=cfg.bank_dir, runtime_dir=store_runtime_dir, config=cfg)
             cards = store.load_runtime(ns.env)
             if cards:
                 report = consolidate(cards, config=cfg)
                 manifest["consolidation"] = report.to_dict()
                 print(
                     f"[memory] consolidation: {len(cards)} cards, "
-                    f"duplicates={report.num_duplicates}, "
-                    f"decay_applied={report.cards_with_decay}",
+                    f"duplicates={len(report.duplicates)}, "
+                    f"decay_applied={report.decayed}",
                     file=sys.stderr,
                 )
         except Exception as exc:  # noqa: BLE001
