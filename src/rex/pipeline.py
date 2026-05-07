@@ -88,6 +88,7 @@ def promote_records(
                     "reason": result.rejected_reason,
                 })
             continue
+        _assert_not_raw_card(result.card)
         promoted.append(result.card)
         if cfg.promotion_max_per_run and len(promoted) >= cfg.promotion_max_per_run:
             break
@@ -113,6 +114,22 @@ def _is_test_split_record(record: Dict[str, Any]) -> bool:
         if split == "test":
             return True
     return False
+
+
+def _assert_not_raw_card(card: ProcessMemoryCard) -> None:
+    """Benchmark safety guard: a ProcessMemoryCard must never carry raw
+    trajectory content — message lists, observation text, or gold actions.
+
+    This is a defence-in-depth check called before writing to the store.
+    If this fires, the distiller produced something unexpected.
+    """
+    forbidden_fields = ("messages", "gold_actions", "observations", "raw_trajectory")
+    for f in forbidden_fields:
+        if hasattr(card, f) and getattr(card, f):
+            raise ValueError(
+                f"SAFETY: ProcessMemoryCard field '{f}' contains raw trajectory data; "
+                "only distilled procedural experience may enter the memory bank."
+            )
 
 
 # ---------------------------------------------------------------------------

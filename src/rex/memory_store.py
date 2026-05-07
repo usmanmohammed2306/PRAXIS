@@ -181,6 +181,12 @@ class MemoryStore:
     ) -> List[ProcessMemoryCard]:
         """Append new (deduplicated) cards to the runtime store for ``domain``.
 
+        Only distilled :class:`ProcessMemoryCard` objects are accepted.
+        Raw trajectory data (messages, observations, gold actions) must never
+        be written to the runtime store — it is a permanent memory bank, not
+        a replay buffer.  The distillation pipeline (``pipeline.promote_records``)
+        is the only sanctioned writer.
+
         Returns the list of cards actually written.
         """
         if not cards:

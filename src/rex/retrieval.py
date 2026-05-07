@@ -225,6 +225,19 @@ class HybridRetriever:
                     break
 
         result_cards = [self.cards[i] for i in chosen]
+        # Classify memory source for retrieval logging.
+        # Cards whose card_id starts with "seed-" come from the seed (permanent)
+        # bank; others were distilled at runtime.  "hybrid" when both are present.
+        _sources = set()
+        for c in result_cards:
+            _sources.add("seed" if str(c.card_id).startswith("seed-") else "runtime")
+        _memory_source = (
+            "seed" if _sources == {"seed"}
+            else "runtime" if _sources == {"runtime"}
+            else "hybrid" if _sources
+            else "unknown"
+        )
+
         diagnostic: Dict[str, Any] = {
             "query_text": text,
             "query_environment": query.environment,
@@ -235,6 +248,7 @@ class HybridRetriever:
             "top_emb_max": max(emb_raw) if emb_raw else 0.0,
             "selected_card_ids": [c.card_id for c in result_cards],
             "selected_intents": [c.task_category for c in result_cards],
+            "memory_source": _memory_source,
         }
         # Bump usage counters so quality scoring evolves.
         for c in result_cards:

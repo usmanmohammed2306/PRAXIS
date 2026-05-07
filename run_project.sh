@@ -804,12 +804,16 @@ if [[ "$CONTROLLERS_OPT" == *"rex"* ]]; then
     || log "WARNING: REx experience bank build failed; controller will fall back to built-in policy cards"
 fi
 
-# Backfill runtime memory from existing trajectories to avoid re-learning.
-if [[ -d "$OUTPUTS_DIR" ]]; then
-  log "Backfilling runtime memory from existing trajectories under $OUTPUTS_DIR"
-  python -m src.scripts.ingest_saved_trajectories "$OUTPUTS_DIR" --bank-dir "$REX_EXPERIENCE_DIR" \
-    || log "WARNING: runtime memory backfill failed; continuing with current memory"
-fi
+# ---------------------------------------------------------------------------
+# NOTE: raw trajectories are NEVER automatically re-scanned at runtime.
+# Permanent experience memory is built ONLY by an explicit offline step:
+#
+#   python -m src.scripts.build_experience_memory \
+#       --inputs "$OUTPUTS_DIR" --output-bank "$REX_EXPERIENCE_DIR"
+#
+# Run that script once after collecting baseline/act/react trajectories,
+# then re-run run_project.sh so REx retrieves from the permanent memory.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Runners

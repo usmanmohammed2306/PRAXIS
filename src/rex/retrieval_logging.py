@@ -51,6 +51,10 @@ class RetrievalEvent:
     num_corpus: int
     playbook_char_count: int
     playbook_sections: List[str]
+    # "seed" = permanent experience bank built offline;
+    # "runtime" = cards distilled and promoted during prior runs;
+    # "hybrid" = mix of both; "unknown" if not reported.
+    memory_source: str = "unknown"
     diagnostic: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -71,6 +75,7 @@ class RetrievalEvent:
             "num_corpus": int(self.num_corpus),
             "playbook_char_count": int(self.playbook_char_count),
             "playbook_sections": list(self.playbook_sections),
+            "memory_source": str(self.memory_source),
             "diagnostic": dict(self.diagnostic),
         }
 
@@ -129,6 +134,7 @@ class RetrievalLogger:
                 num_corpus=int((result.diagnostic or {}).get("num_corpus", 0) or 0),
                 playbook_char_count=playbook.char_count if playbook else 0,
                 playbook_sections=list((playbook.sections or {}).keys()) if playbook else [],
+                memory_source=str((result.diagnostic or {}).get("memory_source", "unknown")),
                 diagnostic=dict(result.diagnostic or {}),
             )
             self._append(self._path(benchmark, environment, controller), event)
