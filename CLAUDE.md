@@ -1,15 +1,20 @@
 # Project instructions
 
 Primary goal:
-Build and validate a lightweight prototype that compares:
-1. a vanilla tool-calling baseline
-2. a lightweight Runbook Planner with Escalation (RPE)
+Build and validate a prototype that compares four controllers on the same fixed base model:
+1. baseline — vanilla tool-calling
+2. act — Act-only ablation
+3. react — ReAct ablation
+4. praxis — PRAXIS (Procedural Retrieval-Augmented eXperience-Informed System)
+
+The active contribution is PRAXIS: continual procedural memory via experience distillation,
+HybridRetriever, TacticalPlaybook injection, and SABER mutation reflection.
 
 Core rules:
 - Optimize for practical success, not elegance.
 - Prefer the fastest honest path to a runnable prototype on 1x A100.
 - Minimize manual debugging, unnecessary abstraction, and moving parts.
-- Keep the same fixed base model for baseline and RPE unless explicitly changed.
+- Keep the same fixed base model for all four controllers unless explicitly changed.
 - Do not fabricate benchmark results, compatibility, or repo details.
 - If something is uncertain, say so clearly and choose the strongest practical fallback.
 
@@ -31,10 +36,10 @@ Hard constraints:
   - setup_env.sh
   - run_project.sh
 - No third shell script anywhere in the repository.
-- Same fixed model for baseline and RPE.
+- Same fixed model for all four controllers.
 - Baseline must remain vanilla tool-calling.
-- Improved system must be lightweight RPE.
-- run_project.sh must run both baseline and RPE and generate a comparison summary.
+- Improved system must be PRAXIS (procedural experience retrieval).
+- run_project.sh must run all four controllers and generate a comparison summary.
 
 Execution style:
 - Inspect uploaded files first.

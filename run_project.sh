@@ -7,14 +7,14 @@
 # + cu130 torch stack + vLLM 0.18.0 from source), serves a single local vLLM
 # instance, and runs evaluations:
 #
-#   4 controllers (vanilla tool-calling, Act, ReAct, REx-RPE)
+#   4 controllers (vanilla tool-calling, Act, ReAct, PRAXIS)
 #   x 3 benchmarks (tau-retail, tau-airline, BFCL V4)
 #
 # All four controllers share the same in-process loop, model, temperature,
 # tool schemas, max steps, and truncation budget — so the only varying axis
-# is the controller. REx-RPE keeps native function-calling but adds audited
-# procedural experience retrieval, one brief startup analysis, and write-only
-# SABER-style mutation reflection.
+# is the controller. PRAXIS keeps native function-calling but adds audited
+# procedural experience retrieval (HybridRetriever + TacticalPlaybook) and
+# write-only SABER-style mutation reflection.
 # Produces outputs/summary/{summary.json,summary.md}.
 #
 # The venv created by setup_env.sh must already exist.
@@ -32,8 +32,8 @@
 #   bash run_project.sh --profile medium      # 30 tasks × 3 trials (~3–6 h)  [default]
 #   bash run_project.sh --profile full        # 50 tasks × 4 trials (~8–14 h, full 15h budget)
 #   bash run_project.sh --tau-tasks 20 --tau-trials 2 --bfcl-limit 10
-#   bash run_project.sh --controllers baseline,react,rex --skip-bfcl
-#   bash run_project.sh --tau-only retail --controllers rex
+#   bash run_project.sh --controllers baseline,react,praxis --skip-bfcl
+#   bash run_project.sh --tau-only retail --controllers praxis
 #   bash run_project.sh --dry-run             # print resolved config and exit
 #
 # Run `bash run_project.sh --help` for the full flag reference. Every CLI
@@ -96,13 +96,14 @@ Workload:
   --bfcl-max-steps N     Cap BFCL steps per trajectory.       Env: BFCL_MAX_STEPS=N
 
 Controller filter:
-  --controllers LIST     Comma-separated subset of {baseline,act,react,rex}.
-                         Default: baseline,act,react,rex. Env: CONTROLLERS=...
+  --controllers LIST     Comma-separated subset of {baseline,act,react,praxis}.
+                         Default: baseline,act,react,praxis. Env: CONTROLLERS=...
   --skip-bfcl            Skip BFCL cells; run only τ-bench retail+airline.
                          Env: SKIP_BFCL=1
-  --rex-prewarm          Run REx on the retail TRAIN split first to seed the
+  --praxis-prewarm       Run PRAXIS on the retail TRAIN split first to seed the
                          experience bank, then run all agents on the TEST split.
-                         Use this for warm-start results. Env: REX_PREWARM=1
+                         Use this for warm-start results. Env: PRAXIS_PREWARM=1
+  --rex-prewarm          Alias for --praxis-prewarm (backward compatible).
   --tau-only ENV         Run only one τ-bench env (retail|airline). Env: TAU_ONLY=...
 
 Server:
@@ -133,14 +134,15 @@ GPUS_OPT="${GPUS:-}"
 MODEL_TIER="${MODEL_TIER:-auto}"
 TP_OPT="${TENSOR_PARALLEL_SIZE:-}"
 PROFILE="${PROFILE:-medium}"
-CONTROLLERS_OPT="${CONTROLLERS:-baseline,act,react,rex}"
+CONTROLLERS_OPT="${CONTROLLERS:-baseline,act,react,praxis}"
 SKIP_BFCL="${SKIP_BFCL:-0}"
 TAU_ONLY="${TAU_ONLY:-}"
 DRY_RUN="${DRY_RUN:-0}"
-# REX_PREWARM=1: run rex on the train split first (retail only) to seed the
+# PRAXIS_PREWARM=1: run praxis on the train split first (retail only) to seed the
 # experience bank before the main evaluation pass on the test split.  Disabled
 # by default so a first run still produces valid cold-start numbers.
-REX_PREWARM="${REX_PREWARM:-0}"
+PRAXIS_PREWARM="${PRAXIS_PREWARM:-${REX_PREWARM:-0}}"
+REX_PREWARM="$PRAXIS_PREWARM"  # keep backward-compat alias
 
 # Per-knob overrides (these take precedence over the profile).
 TAU_END_INDEX_OPT=""
@@ -187,7 +189,8 @@ while [[ $# -gt 0 ]]; do
     --controllers)     CONTROLLERS_OPT="$2"; shift 2 ;;
     --controllers=*)   CONTROLLERS_OPT="${1#*=}"; shift ;;
     --skip-bfcl)       SKIP_BFCL=1; shift ;;
-    --rex-prewarm)     REX_PREWARM=1; shift ;;
+    --praxis-prewarm)  PRAXIS_PREWARM=1; REX_PREWARM=1; shift ;;
+    --rex-prewarm)     PRAXIS_PREWARM=1; REX_PREWARM=1; shift ;;  # backward compat
     --tau-only)        TAU_ONLY="$2"; shift 2 ;;
     --tau-only=*)      TAU_ONLY="${1#*=}"; shift ;;
     --port)            PORT_OPT="$2"; shift 2 ;;
@@ -233,7 +236,7 @@ fi
 # Why 14B over 7B on a single 80 GB A100/H100?
 #   • 14B BF16 weights ≈ 28 GB + KV cache at max_model_len=32768 ≈ 24 GB → ~52 GB total
 #     (concurrency=4 × 32K tokens, paged pool). Fits in 80 GB at 0.85 mem util.
-#   • REx-RPE relies on native function-calling plus short reflection. 14B has
+#   • PRAXIS relies on native function-calling plus short reflection. 14B has
 #     measurably better tool argument reliability than 7B while still fitting
 #     a one-GPU evaluation budget.
 #   • Speed cost: ~1.8–2.0× slower than 7B per call, still fits medium profile
@@ -325,7 +328,7 @@ PRIMARY_MEM_UTIL="${GPU_MEM_UTIL_OPT:-${GPU_MEM_UTIL:-$TIER_DEFAULT_MEM_UTIL}}"
 # Validate --controllers / --tau-only up-front so typos fail fast (also
 # during --dry-run).
 # ---------------------------------------------------------------------------
-ALLOWED_CONTROLLERS=("baseline" "act" "react" "rex")
+ALLOWED_CONTROLLERS=("baseline" "act" "react" "praxis" "rex")
 IFS=',' read -r -a REQUESTED_CONTROLLERS <<<"$CONTROLLERS_OPT"
 for c in "${REQUESTED_CONTROLLERS[@]}"; do
   c="$(echo "$c" | tr -d '[:space:]')"
@@ -827,11 +830,11 @@ mkdir -p "$REX_EXPERIENCE_DIR"
 # Stateful re-retrieval cadence: refresh the playbook every N effective steps.
 # 0 disables (only the initial brief is used).
 export REX_RETRIEVAL_REFRESH_EVERY="${REX_RETRIEVAL_REFRESH_EVERY:-2}"
-if [[ "$CONTROLLERS_OPT" == *"rex"* ]]; then
-  log "Using REx experience bank:             $REX_EXPERIENCE_DIR"
-  log "Using REx runtime memory directory:   $REX_RUNTIME_DIR"
+if [[ "$CONTROLLERS_OPT" == *"praxis"* || "$CONTROLLERS_OPT" == *"rex"* ]]; then
+  log "Using PRAXIS experience bank:          $REX_EXPERIENCE_DIR"
+  log "Using PRAXIS runtime memory directory: $REX_RUNTIME_DIR"
   # NOTE: we do NOT auto-generate a seed bank here.
-  # REx starts with whatever experience cards already exist in REX_EXPERIENCE_DIR.
+  # PRAXIS starts with whatever experience cards already exist in REX_EXPERIENCE_DIR.
   # On the very first run that directory is empty — this is intentional.
   # To build permanent experience memory from collected trajectories, run:
   #
@@ -870,17 +873,17 @@ run_tau () {
     split_arg="test"
   fi
 
-  # Promotion policy — only the REx agent should write to the experience bank:
+  # Promotion policy — only PRAXIS should write to the experience bank:
   #   • baseline / act / react → "never": these agents have no procedural memory
-  #     and their trajectories would contaminate the REx experience bank with
+  #     and their trajectories would contaminate the PRAXIS experience bank with
   #     non-memory-augmented patterns.
-  #   • rex on retail test split → "auto": _should_promote() returns False for
+  #   • praxis on retail test split → "auto": _should_promote() returns False for
   #     "test" split, so no promotion during eval. Pre-warm the bank separately
-  #     (see REX_PREWARM below) if you want warm-start experience.
-  #   • rex on airline (test only) → "always": airline has no train split so
+  #     (see PRAXIS_PREWARM below) if you want warm-start experience.
+  #   • praxis on airline (test only) → "always": airline has no train split so
   #     this is the only way to accumulate airline experience across runs.
   local promote_arg="never"
-  if [[ "$agent_kind" == "rex" ]]; then
+  if [[ "$agent_kind" == "rex" || "$agent_kind" == "praxis" ]]; then
     if [[ "$env_name" == "airline" ]]; then
       promote_arg="always"
     else
@@ -922,9 +925,9 @@ run_bfcl () {
     fi
   fi
 
-  # Same promotion policy as tau: only rex writes to the experience bank.
+  # Same promotion policy as tau: only PRAXIS writes to the experience bank.
   local bfcl_promote="never"
-  [[ "$agent_kind" == "rex" ]] && bfcl_promote="auto"
+  [[ "$agent_kind" == "rex" || "$agent_kind" == "praxis" ]] && bfcl_promote="auto"
 
   if python -m src.runners.bfcl_runner \
       --agent "$agent_kind" --model "$SERVED_NAME" \
@@ -943,21 +946,21 @@ run_bfcl () {
 }
 
 # ---------------------------------------------------------------------------
-# Optional REx pre-warm: run rex on the retail TRAIN split to seed the
+# Optional PRAXIS pre-warm: run praxis on the retail TRAIN split to seed the
 # experience bank BEFORE the main evaluation pass on the TEST split.
 #
 # Why: the test split tasks average 5.1 actions; with _should_promote()
-# blocking promotion on "test", REx starts cold unless we pre-warm here.
+# blocking promotion on "test", PRAXIS starts cold unless we pre-warm here.
 # Without pre-warm, results are still valid (cold-start baseline) but weaker
 # than what the system can do with accumulated experience.
 #
-# Enable with --rex-prewarm or REX_PREWARM=1.
+# Enable with --praxis-prewarm or PRAXIS_PREWARM=1.
 # ---------------------------------------------------------------------------
-if [[ "$REX_PREWARM" == "1" ]] && [[ "$CONTROLLERS_OPT" == *"rex"* ]]; then
+if [[ "$PRAXIS_PREWARM" == "1" ]] && [[ "$CONTROLLERS_OPT" == *"praxis"* || "$CONTROLLERS_OPT" == *"rex"* ]]; then
   if [[ "${TAU_ONLY:-}" != "airline" ]]; then
-    log "PRE-WARM: running rex on retail/train to seed experience bank..."
+    log "PRE-WARM: running praxis on retail/train to seed experience bank..."
     if python -m src.runners.tau_runner \
-        --env retail --agent rex \
+        --env retail --agent praxis \
         --model "$SERVED_NAME" --user-model "$SERVED_NAME" \
         --task-split train \
         --promote-runtime-memory auto \
@@ -967,10 +970,10 @@ if [[ "$REX_PREWARM" == "1" ]] && [[ "$CONTROLLERS_OPT" == *"rex"* ]]; then
         --temperature "$TAU_TEMPERATURE" \
         --max-num-steps "$TAU_MAX_STEPS" \
         --runtime-dir "$REX_RUNTIME_DIR" \
-        --output-dir "$OUTPUTS_DIR/prewarm_retail_rex"; then
+        --output-dir "$OUTPUTS_DIR/prewarm_retail_praxis"; then
       log "PRE-WARM OK: experience bank seeded from retail/train"
     else
-      log "WARNING: pre-warm failed — continuing with cold-start rex"
+      log "WARNING: pre-warm failed — continuing with cold-start praxis"
     fi
   fi
 fi

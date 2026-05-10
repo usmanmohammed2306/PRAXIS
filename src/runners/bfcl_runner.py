@@ -325,7 +325,7 @@ def _resolve_agent_cls(kind: str):
     if kind == "react":
         from ..baselines.agents import ReActAgent
         return ReActAgent
-    if kind == "rex":
+    if kind in ("rex", "praxis"):
         from ..rex.agent import RexAgent
         return RexAgent
     raise ValueError(f"Unknown agent kind: {kind!r}")
@@ -349,7 +349,7 @@ def _solve_one(
         provider=ns.model_provider,
         temperature=float(ns.temperature),
     )
-    if ns.agent == "rex":
+    if ns.agent in ("rex", "praxis"):
         agent_kwargs["env_hint"] = "bfcl"
 
     expected = _extract_expected_names(task)
@@ -535,7 +535,7 @@ def _promote_bfcl_records(
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("bfcl_runner", description="BFCL V4 evaluation runner")
     p.add_argument("--agent", default="baseline",
-                   choices=["baseline", "act", "react", "rex"])
+                   choices=["baseline", "act", "react", "rex", "praxis"])
     p.add_argument("--model", default="qwen-agent")
     p.add_argument("--model-provider", dest="model_provider", default="openai")
     p.add_argument("--temperature", type=float, default=0.0)

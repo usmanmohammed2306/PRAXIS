@@ -28,8 +28,9 @@ acebench:
   max_num_steps: 20
   temperature: 0.0
 
-rpe:
-  replan_every_steps: 1
-  max_escalations: 2
-  planner_max_tokens: 768
-  decide_max_tokens: 512
+praxis:
+  retrieval_refresh_every: 2
+  max_cards_retrieved: 5
+  max_cards_per_domain: 4096
+  tactical_playbook_max_chars: 2400
+  saber_reflection_on_writes: true

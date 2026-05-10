@@ -39,7 +39,7 @@ from ..rex.pipeline import promote_records as pipeline_promote_records
 from ..rex.retrieval_logging import aggregate_logs
 
 
-AGENT_CHOICES = ["baseline", "act", "react", "rex"]
+AGENT_CHOICES = ["baseline", "act", "react", "rex", "praxis"]
 
 
 def _try_install_litellm_patch() -> None:
@@ -100,7 +100,7 @@ def _resolve_agent_cls(kind: str):
     if kind == "react":
         from ..baselines.agents import ReActAgent
         return ReActAgent
-    if kind == "rex":
+    if kind in ("rex", "praxis"):
         from ..rex.agent import RexAgent
         return RexAgent
     raise ValueError(f"Unknown agent kind: {kind}")
