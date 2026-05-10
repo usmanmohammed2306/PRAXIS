@@ -1,4 +1,13 @@
-# REx-RPE — Leakage-Safe Experience Retrieval for Tool Agents
+# PRAXIS — Procedural Retrieval-Augmented eXperience-Informed System
+
+**Continual Procedural Memory for Tool-Calling LLM Agents**
+
+> *An agent that learns from every interaction — not just its own.*
+
+PRAXIS wraps any frozen LLM with a growing, leakage-safe procedural memory —
+distilled from all agents' experience — so each run starts smarter than the last.
+
+## Overview
 
 This prototype compares four controllers on the same fixed base model:
 
@@ -7,89 +16,99 @@ This prototype compares four controllers on the same fixed base model:
 | 1 | `baseline` | Vanilla native tool-calling with a minimal policy prompt. |
 | 2 | `act` | Act-only ablation: tool calls without reasoning prose. |
 | 3 | `react` | ReAct ablation: one short `Thought:` before tool calls. |
-| 4 | `rex` | REx-RPE: audited procedural experience retrieval, brief startup analysis, native tool-calling, and write-only SABER-style reflection. |
+| 4 | `praxis` | **PRAXIS**: audited procedural experience retrieval, TacticalPlaybook injection, and write-only SABER-style mutation reflection. |
 
-The active contribution is now **REx-RPE**, not CARGO. The old CARGO package is retained only as legacy code for rollback and historical tests; runners, smoke tests, summaries, and `run_project.sh` use `rex`.
+The active contribution is **PRAXIS**. All four controllers share the same model, temperature, tool schemas, max steps, and truncation budget — the only varying axis is the controller. Baselines run first; PRAXIS distils their experience into ProcessMemoryCards and retrieves the top-5 most relevant lessons at each step.
 
 ## Research Idea
 
-**REx: Leakage-Safe Experience Retrieval for Training-Free Multi-Turn Tool Agents.**
+**PRAXIS: Continual Procedural Memory for Tool-Calling LLM Agents.**
 
-Small open models often fail tool benchmarks because they do not have a confident procedure for the task. REx gives the model procedural memory without benchmark-answer leakage:
+Small open models often fail tool benchmarks because they lack a confident procedure for the task. PRAXIS gives any frozen model procedural memory without benchmark-answer leakage:
 
 - Retail experience cards come from the official τ-bench retail train/dev splits.
-- Airline cards are generated from policy/tool structure because the local airline env exposes only a test split.
-- ACEBench cards are generated from schema/task metadata only; `possible_answer/` is never used.
-- Prior eval trajectories are only regression evidence, never prompt examples.
+- Airline cards are generated from policy/tool structure (local airline env exposes only a test split).
+- BFCL cards are generated from schema/task metadata only; `possible_answer/` is never used.
+- Prior eval trajectories are regression evidence only — never prompt examples.
 
-Each card is redacted and audited before use. Cards teach process, not arguments.
+Each card is PII-stripped and quality-scored before use. Cards teach **process**, not arguments.
+
+## The Memory Loop
+
+```
+  Act ─┐
+ReAct ─┼─▶  trajectories.jsonl
+  TC  ─┘
+             │
+             ▼
+        DISTILLER         strips PII · extracts procedure
+             │             tool order · failure patterns
+             ▼             recovery hints · anti-patterns
+        MEMORY BANK        ProcessMemoryCards
+        retail.jsonl       grows across every run
+        airline.jsonl      deduplicated · quality-scored
+        bfcl.jsonl         max 4,096 cards / domain
+             │
+             │  top-5 cards (refreshed every 2 steps)
+             ▼
+        PRAXIS AGENT       system prompt + TacticalPlaybook
+                           SABER reflection on writes
+             │
+             └──── completed tasks ───▶ back into the loop ↑
+```
 
 ## Architecture
 
-REx is a continually-improving process-memory agent. Each run produces
-trajectories; each trajectory is distilled into a procedural lesson; the next
-run retrieves those lessons and uses them to choose the next tool call.
+**Two memory banks, one hybrid retriever:**
 
-**Two memory banks, one retriever:**
+- **Seed memory** (`outputs/experience_bank/{retail,airline,bfcl}.jsonl`) — built from allowed support data only. Never includes prior eval trajectories or test-split answers.
+- **Runtime memory** (`outputs/experience_runtime/`) — append-only, deduplicated, persisted across runs. Populated automatically at the end of every non-test run.
 
-* **Seed memory** (`outputs/experience_bank/{retail,airline,ace}.jsonl`) — built
-  from allowed support data only (retail train/dev splits, policy-derived
-  airline cards, ACE schema cards). Never includes prior eval trajectories or
-  test-split answers.
-* **Runtime memory** (`$REX_RUNTIME_DIR`, default `outputs/experience_runtime/`)
-  — append-only, deduplicated, persisted across runs. Populated automatically
-  at the end of every non-test run by `promote_trajectories`.
+**HybridRetriever** at each step:
 
-**The full learning loop:**
+- BM25 × 0.60 + TF-IDF × 0.40
+- Domain boost +0.05, quality boost +0.05 × score
+- Diversity cap: 3 cards per category
+- Returns top-5 cards → rendered as ≤ 2,400-char TacticalPlaybook
 
-```
-saved trajectories
-  → process memory distillation (distill_trajectory)
-  → persistent memory bank (outputs/experience_runtime/)
-  → retrieval at runtime (load_experience_cards merges seed + runtime)
-  → short playbook synthesis (render_experience_brief)
-  → next tool call decision
-  → tool execution
-  → new trajectory
-  → distill again
-```
+**SABER mutation reflection** guards every write tool:
 
-**At each step in a trajectory, REx:**
+- READ tool → execute immediately, no delay.
+- WRITE tool → pause, ask same model: *"Do observations confirm this action is safe & requested?"* → ALLOW or BLOCK.
 
-1. Builds a stateful retrieval query from `(initial_user, latest_user_reply,
-   latest_tool_name, latest_tool_observation)` — retrieval evolves with the
-   conversation, it is not a one-shot lookup at task start.
-2. Refreshes the experience brief in the system prompt every
-   `REX_RETRIEVAL_REFRESH_EVERY` (default 2) effective steps.
-3. Executes the next tool call with native OpenAI-compatible function calling.
-4. Runs same-model SABER-style reflection only before mutating tau-bench tools.
+**Leakage boundary.** Cards store *process* (intent, sequence, evidence required, confirmation point, common trap) — never IDs, emails, payment methods, dates, or argument values. Promotion is gated: test-split runs are blocked from writing to runtime memory by default.
 
-**Leakage boundary.** Cards store *process* (intent, sequence, evidence
-required, confirmation point, common trap) — never IDs, emails, payment
-methods, dates, or argument values. Promotion is gated: by default, test-split
-runs are blocked from writing to runtime memory.
+## Key Numbers
 
-Reads are never blocked by REx. If a write lacks policy support or user
-confirmation, REx asks a precise question instead of executing the write.
+| Property | Value |
+|---|---|
+| Model fine-tuning steps | **0** |
+| Agents compared | **4** |
+| Cards retrieved per query | **5** |
+| Steps between memory refreshes | **2** |
+| Max chars in TacticalPlaybook | **2,400** |
+| Max memory cards per domain | **4,096** |
+| Benchmarks evaluated | **3** |
+| Distillation overhead per run | **< 30 s** |
 
 ## Run
 
 ```bash
 bash setup_env.sh
 bash run_project.sh --dry-run
-bash run_project.sh --profile smoke --controllers baseline,act,react,rex
+bash run_project.sh --profile smoke --controllers baseline,act,react,praxis
 ```
 
 For quick signal, use at least `50x1`:
 
 ```bash
-bash run_project.sh --tau-tasks 50 --tau-trials 1 --skip-acebench --controllers baseline,act,react,rex
+bash run_project.sh --tau-tasks 50 --tau-trials 1 --skip-bfcl --controllers baseline,act,react,praxis
 ```
 
-For the previous comparable tau setup:
+For a full evaluation pass:
 
 ```bash
-bash run_project.sh --profile full --skip-acebench --controllers baseline,act,react,rex
+bash run_project.sh --profile full --skip-bfcl --controllers baseline,act,react,praxis
 ```
 
 ## Shell Script Invariant
@@ -101,32 +120,28 @@ Exactly two shell scripts are allowed:
 
 ## Outputs
 
-Typical output layout:
-
 ```text
 outputs/
   experience_bank/
     manifest.json
     retail.jsonl
     airline.jsonl
-    ace.jsonl
+    bfcl.jsonl
   tau_retail_baseline/
   tau_retail_act/
   tau_retail_react/
-  tau_retail_rex/
+  tau_retail_praxis/
   tau_airline_baseline/
   tau_airline_act/
   tau_airline_react/
-  tau_airline_rex/
-  acebench_agent_rex/
+  tau_airline_praxis/
+  bfcl_praxis/
   summary/
     summary.json
     summary.md
 ```
 
 ## Verification
-
-Offline checks:
 
 ```bash
 python3 -m unittest tests.test_rex -q
@@ -136,15 +151,13 @@ python3 -m pip check
 git diff --check
 ```
 
-Smoke:
+## What Is New
 
-```bash
-python3 scripts/run_smoke.py --target synthetic
-python3 scripts/run_smoke.py --target tau
-python3 scripts/run_smoke.py --target ace
-```
-
-Live tau/ACE smoke requires a working OpenAI-compatible model endpoint.
+| Standard approach | PRAXIS |
+|---|---|
+| Standard RAG → retrieves documents to answer questions | PRAXIS → retrieves **procedures** to execute multi-step tasks |
+| In-context learning → static examples in every prompt | PRAXIS → **growing compact lessons** across all runs |
+| Fine-tuning → expensive, slow, risks forgetting | PRAXIS → **zero training**, works on any frozen model |
 
 ## Method Boundaries
 
