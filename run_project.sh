@@ -588,6 +588,27 @@ TAU_START_INDEX="${TAU_START_INDEX:-0}"
 TAU_TEMPERATURE="${TAU_TEMPERATURE:-0.0}"
 BFCL_CATEGORIES="${BFCL_CATEGORIES_OPT:-${BFCL_CATEGORIES:-simple,multiple,parallel,parallel_multiple,multi_turn_base}}"
 
+# ---------------------------------------------------------------------------
+# Internal train/test splits for benchmarks that lack an upstream split.
+#
+# These exist purely to keep PRAXIS evaluation honest: PRAXIS pre-warm runs
+# on the "train" indices (which feed the experience bank); the held-out
+# "test" indices are evaluated by all four controllers with promotion gated
+# off, so PRAXIS cannot learn from its own eval set.
+#
+#   AIRLINE_TRAIN_END     — first N tau-bench airline task indices reserved as
+#                           PRAXIS train pool (airline ships only a "test"
+#                           split upstream). Test eval runs on
+#                           [AIRLINE_TRAIN_END, end-index). Default 20.
+#   BFCL_TRAIN_FRACTION   — per-category fraction of BFCL tasks used as the
+#                           internal train pool. Default 0.25 (25%).
+#
+# Override via env vars or the corresponding CLI flags below. Set
+# AIRLINE_TRAIN_END=0 / BFCL_TRAIN_FRACTION=0 to disable the split (this
+# reverts to legacy behaviour and is NOT recommended for paper-grade runs).
+AIRLINE_TRAIN_END="${AIRLINE_TRAIN_END:-20}"
+BFCL_TRAIN_FRACTION="${BFCL_TRAIN_FRACTION:-0.25}"
+
 # OpenAI SDK timeout for direct in-process calls.
 # At 32K context, prefill of a long trajectory can be substantial; timeouts
 # are raised from the 12K-era defaults to accommodate longer sequences.
@@ -877,18 +898,30 @@ run_tau () {
   #   • baseline / act / react → "never": these agents have no procedural memory
   #     and their trajectories would contaminate the PRAXIS experience bank with
   #     non-memory-augmented patterns.
-  #   • praxis on retail test split → "auto": _should_promote() returns False for
-  #     "test" split, so no promotion during eval. Pre-warm the bank separately
-  #     (see PRAXIS_PREWARM below) if you want warm-start experience.
-  #   • praxis on airline (test only) → "always": airline has no train split so
-  #     this is the only way to accumulate airline experience across runs.
+  #   • praxis on retail (eval = upstream test split) → "auto": _should_promote()
+  #     returns False for "test" split, so no promotion during eval. Pre-warm
+  #     the bank from the upstream "train" split (see PRAXIS_PREWARM below).
+  #   • praxis on airline → "auto": we use an internal split (AIRLINE_TRAIN_END)
+  #     because airline ships only a "test" split upstream. The pipeline's
+  #     per-record _is_test_split_record gate keeps eval-range records out of
+  #     the bank even if promotion is invoked.
   local promote_arg="never"
   if [[ "$agent_kind" == "rex" || "$agent_kind" == "praxis" ]]; then
-    if [[ "$env_name" == "airline" ]]; then
-      promote_arg="always"
-    else
-      promote_arg="auto"
+    promote_arg="auto"
+  fi
+
+  # Airline-specific: evaluate only on the held-out test slice of the upstream
+  # "test" split. Train indices [0, AIRLINE_TRAIN_END) are reserved for the
+  # optional PRAXIS pre-warm and skipped during eval here.
+  local tau_start="$TAU_START_INDEX"
+  local internal_end_arg=()
+  if [[ "$env_name" == "airline" && "$AIRLINE_TRAIN_END" -gt 0 ]]; then
+    if [[ "$TAU_START_INDEX" -lt "$AIRLINE_TRAIN_END" ]]; then
+      tau_start="$AIRLINE_TRAIN_END"
     fi
+    # Pass the boundary so per-record info.task_split tagging works for any
+    # records that *do* get distilled (e.g. during pre-warm reuse of this fn).
+    internal_end_arg=(--internal-train-end "$AIRLINE_TRAIN_END")
   fi
 
   if python -m src.runners.tau_runner \
@@ -896,7 +929,8 @@ run_tau () {
       --model "$SERVED_NAME" --user-model "$SERVED_NAME" \
       --task-split "$split_arg" \
       --promote-runtime-memory "$promote_arg" \
-      --start-index "$TAU_START_INDEX" --end-index "$TAU_END_INDEX" \
+      --start-index "$tau_start" --end-index "$TAU_END_INDEX" \
+      "${internal_end_arg[@]}" \
       --num-trials "$TAU_NUM_TRIALS" \
       --max-concurrency "$TAU_MAX_CONCURRENCY" \
       --temperature "$TAU_TEMPERATURE" \
@@ -926,6 +960,10 @@ run_bfcl () {
   fi
 
   # Same promotion policy as tau: only PRAXIS writes to the experience bank.
+  # Evaluation runs on the held-out "test" slice of the internal per-category
+  # split (BFCL has no upstream train/test distinction). PRAXIS pre-warm
+  # (below) runs on the "train" slice. The pipeline's _is_test_split_record
+  # gate is the defence-in-depth backstop.
   local bfcl_promote="never"
   [[ "$agent_kind" == "rex" || "$agent_kind" == "praxis" ]] && bfcl_promote="auto"
 
@@ -937,6 +975,8 @@ run_bfcl () {
       --max-num-steps "$BFCL_MAX_STEPS" \
       --max-concurrency "$BFCL_MAX_CONCURRENCY" \
       --promote-runtime-memory "$bfcl_promote" \
+      --train-fraction "$BFCL_TRAIN_FRACTION" \
+      --task-split test \
       --runtime-dir "$REX_RUNTIME_DIR" \
       --output-dir "$out"; then
     log "BFCL V4 OK: $agent_kind"
@@ -957,6 +997,7 @@ run_bfcl () {
 # Enable with --praxis-prewarm or PRAXIS_PREWARM=1.
 # ---------------------------------------------------------------------------
 if [[ "$PRAXIS_PREWARM" == "1" ]] && [[ "$CONTROLLERS_OPT" == *"praxis"* || "$CONTROLLERS_OPT" == *"rex"* ]]; then
+  # --- Retail prewarm (upstream train split) -------------------------------
   if [[ "${TAU_ONLY:-}" != "airline" ]]; then
     log "PRE-WARM: running praxis on retail/train to seed experience bank..."
     if python -m src.runners.tau_runner \
@@ -974,6 +1015,55 @@ if [[ "$PRAXIS_PREWARM" == "1" ]] && [[ "$CONTROLLERS_OPT" == *"praxis"* || "$CO
       log "PRE-WARM OK: experience bank seeded from retail/train"
     else
       log "WARNING: pre-warm failed — continuing with cold-start praxis"
+    fi
+  fi
+
+  # --- Airline prewarm (internal split: indices [0, AIRLINE_TRAIN_END)) ----
+  # Airline only ships a "test" split upstream, so we partition it ourselves.
+  # Pre-warm reads the train slice; the eval pass (above in run_tau) skips
+  # past AIRLINE_TRAIN_END so PRAXIS is never evaluated on the same tasks it
+  # learned from.
+  if [[ "${TAU_ONLY:-}" != "retail" && "$AIRLINE_TRAIN_END" -gt 0 ]]; then
+    log "PRE-WARM: running praxis on airline train slice [0, $AIRLINE_TRAIN_END)..."
+    if python -m src.runners.tau_runner \
+        --env airline --agent praxis \
+        --model "$SERVED_NAME" --user-model "$SERVED_NAME" \
+        --task-split test \
+        --internal-train-end "$AIRLINE_TRAIN_END" \
+        --promote-runtime-memory auto \
+        --start-index 0 --end-index "$AIRLINE_TRAIN_END" \
+        --num-trials 1 \
+        --max-concurrency "$TAU_MAX_CONCURRENCY" \
+        --temperature "$TAU_TEMPERATURE" \
+        --max-num-steps "$TAU_MAX_STEPS" \
+        --runtime-dir "$REX_RUNTIME_DIR" \
+        --output-dir "$OUTPUTS_DIR/prewarm_airline_praxis"; then
+      log "PRE-WARM OK: experience bank seeded from airline train slice"
+    else
+      log "WARNING: airline pre-warm failed — continuing with cold-start praxis"
+    fi
+  fi
+
+  # --- BFCL prewarm (internal per-category split: first BFCL_TRAIN_FRACTION)
+  # awk fallback: bc may not be installed on minimal containers.
+  _BFCL_HAS_TRAIN="$(awk -v x="$BFCL_TRAIN_FRACTION" 'BEGIN{print (x>0)?1:0}')"
+  if [[ "$SKIP_BFCL" != "1" && "$_BFCL_HAS_TRAIN" == "1" ]]; then
+    log "PRE-WARM: running praxis on BFCL train slice (fraction=$BFCL_TRAIN_FRACTION)..."
+    if python -m src.runners.bfcl_runner \
+        --agent praxis --model "$SERVED_NAME" \
+        --data-dir "$BFCL_DATA_DIR" \
+        --categories "$BFCL_CATEGORIES" \
+        --limit "$BFCL_LIMIT" \
+        --max-num-steps "$BFCL_MAX_STEPS" \
+        --max-concurrency "$BFCL_MAX_CONCURRENCY" \
+        --promote-runtime-memory auto \
+        --train-fraction "$BFCL_TRAIN_FRACTION" \
+        --task-split train \
+        --runtime-dir "$REX_RUNTIME_DIR" \
+        --output-dir "$OUTPUTS_DIR/prewarm_bfcl_praxis"; then
+      log "PRE-WARM OK: experience bank seeded from BFCL train slice"
+    else
+      log "WARNING: BFCL pre-warm failed — continuing with cold-start praxis"
     fi
   fi
 fi

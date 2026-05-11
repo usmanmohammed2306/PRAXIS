@@ -78,6 +78,30 @@ ReAct ─┼─▶  trajectories.jsonl
 
 **Leakage boundary.** Cards store *process* (intent, sequence, evidence required, confirmation point, common trap) — never IDs, emails, payment methods, dates, or argument values. Promotion is gated: test-split runs are blocked from writing to runtime memory by default.
 
+## Train / Test Split (Evaluation Fairness)
+
+All four controllers are evaluated on identical held-out test sets. PRAXIS's
+memory bank is only ever populated from **train** trajectories, never from the
+tasks used to score it. Three layers enforce this:
+
+1. **Run-level gate** — `tau_runner._should_promote()` returns False for
+   pure-test runs unless explicitly overridden.
+2. **Record-level gate** — `pipeline._is_test_split_record()` drops any record
+   tagged `info.task_split == "test"` before it can be distilled. Both
+   runners stamp every record with its split label.
+3. **Pre-warm separation** — PRAXIS pre-warm runs (`--praxis-prewarm`) write
+   only on train indices; the subsequent four-way evaluation runs only on
+   test indices.
+
+| Benchmark | Train source | Test source |
+|---|---|---|
+| τ-bench retail  | Upstream `train` split (500 tasks) | Upstream `test` split (115 tasks) |
+| τ-bench airline | Internal split: indices `[0, AIRLINE_TRAIN_END)` of the upstream `test` split (default `AIRLINE_TRAIN_END=20`) | Indices `[AIRLINE_TRAIN_END, end)` of the upstream `test` split |
+| BFCL V4         | Per-category first `BFCL_TRAIN_FRACTION` of each category (default `0.25`, deterministic sort by task id) | Remaining `1 − BFCL_TRAIN_FRACTION` per category |
+
+Override via env vars: `AIRLINE_TRAIN_END=N`, `BFCL_TRAIN_FRACTION=F`. Setting
+either to `0` disables that split (not recommended for paper-grade runs).
+
 ## Key Numbers
 
 | Property | Value |
