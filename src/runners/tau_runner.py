@@ -87,6 +87,18 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="Override REX_RUNTIME_DIR for this run; empty falls back to the env var.",
     )
+    p.add_argument(
+        "--internal-train-end",
+        type=int,
+        default=0,
+        help=(
+            "Index boundary for an internal train/test split (used for airline, "
+            "which ships only a 'test' split upstream). Task indices in [0, "
+            "internal_train_end) are tagged info.task_split='train' (eligible "
+            "for promotion); indices >= internal_train_end are tagged 'test' "
+            "and blocked from promotion by the pipeline. 0 disables the override."
+        ),
+    )
     return p.parse_args()
 
 
@@ -215,7 +227,12 @@ def _should_promote(ns: argparse.Namespace) -> bool:
         return False
     if mode == "always":
         return True
-    # auto: promote only when split is not the held-out test split
+    # auto: promote unless this is a pure held-out test-split run.
+    # When --internal-train-end is set, we have a mixed run (some train, some
+    # test indices) and rely on the pipeline's per-record _is_test_split_record
+    # gate to drop the test ones — so we DO want to enter the promotion path.
+    if int(getattr(ns, "internal_train_end", 0) or 0) > 0:
+        return True
     return (ns.task_split or "").strip().lower() != "test"
 
 
@@ -349,6 +366,17 @@ def _solve_one(
         info.setdefault("environment", ns.env)
     else:
         info = {"domain": ns.env, "environment": ns.env}
+    # Stamp task_split into info so the pipeline's _is_test_split_record() gate
+    # can block test-split records from being distilled into the memory bank.
+    # This is defence-in-depth on top of _should_promote() at the run level.
+    #   • If --internal-train-end > 0 (airline-style internal split), label by
+    #     task_index: indices in [0, N) are "train", rest are "test".
+    #   • Otherwise, fall back to ns.task_split (e.g. retail's upstream split).
+    internal_end = int(getattr(ns, "internal_train_end", 0) or 0)
+    if internal_end > 0:
+        info["task_split"] = "train" if task_index < internal_end else "test"
+    else:
+        info.setdefault("task_split", ns.task_split)
     return {
         "task_id": task_index,
         "trial": trial,
@@ -447,6 +475,7 @@ def main() -> int:
             "max_num_steps": ns.max_num_steps,
             "temperature": ns.temperature,
             "promote_runtime_memory": ns.promote_runtime_memory,
+            "internal_train_end": int(getattr(ns, "internal_train_end", 0) or 0),
         },
         "metrics": metrics,
         "runtime_memory_promotion": promotion,

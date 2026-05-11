@@ -175,6 +175,10 @@ def _load_bfcl_tasks(
                 continue
             try:
                 loaded = _read_jsonl_or_json(path)
+                # Tag each task with its category so the train/test splitter
+                # can partition per-category deterministically.
+                for t in loaded:
+                    t.setdefault("_category", cat)
                 tasks.extend(loaded)
                 print(f"[bfcl] loaded {len(loaded)} tasks from {fname}", file=sys.stderr)
                 break
@@ -375,6 +379,12 @@ def _solve_one(
     info.setdefault("domain", "bfcl")
     info.setdefault("environment", "bfcl")
     info.setdefault("controller", ns.agent)
+    # Stamp task_split so the promotion pipeline can drop test-split records
+    # via _is_test_split_record (defence-in-depth on top of run-level gating).
+    split_label = task.get("_split_label")
+    if split_label:
+        info["task_split"] = split_label
+        info.setdefault("category", task.get("_category"))
 
     return {
         "task_id": task.get("id") or task_idx,
@@ -392,6 +402,48 @@ def _solve_one(
 # ---------------------------------------------------------------------------
 # Batch runner
 # ---------------------------------------------------------------------------
+
+def _apply_train_test_split(
+    tasks: List[Dict[str, Any]],
+    train_fraction: float,
+    keep_split: str,
+) -> List[Dict[str, Any]]:
+    """Assign each task a deterministic train/test label per category and
+    optionally filter the list down to one side of the split.
+
+    - Per-category: tasks are sorted by their stable id and the first
+      ``ceil(N * train_fraction)`` become "train"; the rest are "test".
+    - When ``keep_split`` is "train" or "test", only that subset is returned;
+      "all" (default) returns every task with its label stamped in place.
+    - When ``train_fraction <= 0`` no labels are added and all tasks are kept;
+      this preserves legacy behaviour for callers that opt out of the split.
+    """
+    import math
+    if train_fraction <= 0.0 or not tasks:
+        return tasks
+    train_fraction = min(max(train_fraction, 0.0), 1.0)
+
+    # Group by category, sort each group deterministically, label, then
+    # rebuild the original list order so trajectories.jsonl ordering is stable.
+    by_cat: Dict[str, List[Dict[str, Any]]] = {}
+    for t in tasks:
+        by_cat.setdefault(str(t.get("_category", "default")), []).append(t)
+
+    train_ids: set = set()
+    for cat, group in by_cat.items():
+        group_sorted = sorted(group, key=lambda x: str(x.get("id", "")))
+        n_train = math.ceil(len(group_sorted) * train_fraction)
+        for t in group_sorted[:n_train]:
+            train_ids.add(id(t))  # use object identity — ids may collide
+
+    for t in tasks:
+        t["_split_label"] = "train" if id(t) in train_ids else "test"
+
+    keep = (keep_split or "all").strip().lower()
+    if keep in ("train", "test"):
+        return [t for t in tasks if t.get("_split_label") == keep]
+    return tasks
+
 
 def _run_inprocess(ns: argparse.Namespace) -> None:
     data_dir = Path(ns.data_dir)
@@ -413,7 +465,29 @@ def _run_inprocess(ns: argparse.Namespace) -> None:
         print(f"[bfcl] ERROR: no tasks loaded from {data_dir} (categories={cats})", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[bfcl] running {len(tasks)} tasks  agent={ns.agent}", file=sys.stderr)
+    # Apply the deterministic per-category train/test split if requested.
+    # BFCL has no upstream split distinction, so we manufacture one to keep
+    # PRAXIS evaluation honest: the first `train_fraction` of each category
+    # is used for PRAXIS pre-warm; the remainder is the held-out test set on
+    # which all four controllers are evaluated. Records keep their split label
+    # in `info.task_split` so the pipeline can defence-in-depth block test
+    # records from being distilled into the memory bank.
+    train_fraction = float(getattr(ns, "train_fraction", 0.0) or 0.0)
+    keep_split = getattr(ns, "task_split", "all") or "all"
+    tasks = _apply_train_test_split(tasks, train_fraction, keep_split)
+    if not tasks:
+        print(
+            f"[bfcl] ERROR: split filter '{keep_split}' left zero tasks "
+            f"(train_fraction={train_fraction})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(
+        f"[bfcl] running {len(tasks)} tasks  agent={ns.agent}  "
+        f"train_fraction={train_fraction}  keep_split={keep_split}",
+        file=sys.stderr,
+    )
 
     AgentCls = _resolve_agent_cls(ns.agent)
     out_dir = Path(ns.output_dir)
@@ -488,11 +562,15 @@ def _promote_bfcl_records(
         file=sys.stderr,
     )
     try:
+        # allow_test_split is True only when the user explicitly opts in via
+        # --promote-runtime-memory always (e.g. for ablation runs). In auto
+        # mode the per-record `_is_test_split_record` gate drops test-labeled
+        # records — this is what keeps PRAXIS from learning on its eval set.
         manifest = pipeline_promote_records(
             records,
             domain="bfcl",
             runtime_dir=runtime_dir,
-            allow_test_split=True,  # BFCL has no train/test promotion concern
+            allow_test_split=mode == "always",
         )
         manifest["status"] = "ok"
         promoted = manifest.get("promoted", 0)
@@ -551,6 +629,28 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--runtime-dir", dest="runtime_dir", default="")
     p.add_argument("--promote-runtime-memory", dest="promote_runtime_memory", default="auto",
                    choices=["auto", "always", "never"])
+    p.add_argument(
+        "--train-fraction",
+        dest="train_fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-category fraction of BFCL tasks assigned to the internal "
+            "'train' split (used for PRAXIS pre-warm). The remainder is the "
+            "held-out 'test' split on which all four controllers are evaluated. "
+            "0.0 disables the split (legacy behaviour)."
+        ),
+    )
+    p.add_argument(
+        "--task-split",
+        dest="task_split",
+        default="all",
+        choices=["all", "train", "test"],
+        help=(
+            "Filter to one side of the internal train/test split. Requires "
+            "--train-fraction > 0 to take effect."
+        ),
+    )
     return p.parse_args()
 
 
