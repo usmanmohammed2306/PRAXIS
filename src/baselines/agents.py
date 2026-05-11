@@ -303,3 +303,84 @@ class ReActAgent(_BaseInProcessAgent):
             "- Reply with a final answer (no Thought, no tool call) when the user's "
             "request is fully resolved."
         )
+
+
+# ---------------------------------------------------------------------------
+# Donor-only controllers (Phase B experience harvest)
+#
+# These agents exist primarily to widen the experience pool that PRAXIS
+# distills its memory from. They are NOT evaluated against PRAXIS in the
+# main results table — they only generate trajectories on the TRAIN split.
+# Each adds a distinct prompting prior so the cards entering the bank cover
+# diverse failure modes and recovery strategies.
+# ---------------------------------------------------------------------------
+
+class CoTAgent(_BaseInProcessAgent):
+    """Chain-of-Thought donor (Wei et al., 2022).
+
+    Forces a brief numbered reasoning chain BEFORE the first tool call of
+    each new sub-task. Adds long-form planning prose into the trajectory,
+    which surfaces different failure modes (over-planning, sunk cost) for
+    the distiller to learn from.
+    """
+
+    style_name = "cot"
+
+    def _style_block(self) -> str:
+        return (
+            "You are a tool-using agent operating in CHAIN-OF-THOUGHT mode.\n"
+            "- For each new user request, FIRST write a short numbered reasoning "
+            "chain (3-5 steps) starting with 'Let me think step by step:'.\n"
+            "- After the chain, begin executing tool calls one at a time. You do "
+            "NOT need to repeat the chain before every tool — only when the "
+            "sub-task changes.\n"
+            "- Make exactly one tool call at a time and wait for its observation.\n"
+            "- Finish with a short natural-language answer when the request is "
+            "fully resolved."
+        )
+
+
+class PlanSolveAgent(_BaseInProcessAgent):
+    """Plan-and-Solve donor (Wang et al., 2023).
+
+    Generates an explicit ordered plan up-front, then executes against it.
+    Produces trajectories with clear sub-goal boundaries that the distiller
+    can convert into ``tool_order`` and ``confirmation_point`` fields.
+    """
+
+    style_name = "plan-solve"
+
+    def _style_block(self) -> str:
+        return (
+            "You are a tool-using agent operating in PLAN-AND-SOLVE mode.\n"
+            "- BEFORE any tool call, write a 'Plan:' block listing the ordered "
+            "sub-goals you intend to satisfy (numbered, 2-6 items).\n"
+            "- Then execute the plan one tool call at a time. If an observation "
+            "invalidates the plan, write a 'Revised plan:' block and continue.\n"
+            "- Make exactly one tool call per step and wait for its result.\n"
+            "- Finish with a short final answer when the request is resolved."
+        )
+
+
+class ReflexionLiteAgent(_BaseInProcessAgent):
+    """Reflexion-lite donor (Shinn et al., 2023; in-episode variant).
+
+    After every tool observation, the agent writes a one-line 'Reflect:'
+    note assessing whether the action moved it closer to the goal. These
+    self-critiques become high-signal ``common_traps`` and
+    ``recovery_hints`` for the distilled cards.
+    """
+
+    style_name = "reflexion-lite"
+
+    def _style_block(self) -> str:
+        return (
+            "You are a tool-using agent operating in REFLEXION-LITE mode.\n"
+            "- After EACH tool observation, write exactly ONE short line starting "
+            "with 'Reflect:' that evaluates in <=20 words whether the result "
+            "advanced the task, and what the very next tool call should be.\n"
+            "- Then emit the next tool call. One tool call per step.\n"
+            "- If two consecutive Reflect: lines indicate no progress, change "
+            "strategy rather than repeating the same tool.\n"
+            "- Finish with a short final answer when the request is resolved."
+        )

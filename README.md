@@ -18,7 +18,17 @@ This prototype compares four controllers on the same fixed base model:
 | 3 | `react` | ReAct ablation: one short `Thought:` before tool calls. |
 | 4 | `praxis` | **PRAXIS**: audited procedural experience retrieval, TacticalPlaybook injection, and write-only SABER-style mutation reflection. |
 
-The active contribution is **PRAXIS**. All four controllers share the same model, temperature, tool schemas, max steps, and truncation budget — the only varying axis is the controller. Baselines run first; PRAXIS distils their experience into ProcessMemoryCards and retrieves the top-5 most relevant lessons at each step.
+The active contribution is **PRAXIS**. All four controllers share the same model, temperature, tool schemas, max steps, and truncation budget — the only varying axis is the controller.
+
+### Three-phase execution
+
+The pipeline runs in three explicit phases so PRAXIS never benefits from data its competitors didn't see:
+
+- **Phase A — Baseline evaluation.** `baseline`, `act`, and `react` are scored on the held-out TEST split with promotion turned off. Their trajectories are reported but never written to the memory bank.
+- **Phase B — Donor-cohort experience harvest.** A diverse pool of *donor* controllers (`act`, `react`, `cot`, `plan-solve`, `reflexion-lite`, plus `praxis` itself) runs on the TRAIN split, and every trajectory is distilled into Process Memory Cards. PRAXIS reasons from this *multi-agent* pool — not just from itself or one ReAct baseline — so the bank captures distinct prompting priors and failure modes.
+- **Phase C — PRAXIS evaluation.** With the warm, diverse bank from Phase B, PRAXIS is scored on the same TEST split as the Phase A baselines. Promotion stays gated on test, so no leakage.
+
+Donor agents (CoT, Plan-and-Solve, Reflexion-Lite) are prompting-only variants of the same base model. They exist to widen the experience pool, not to compete in the results table.
 
 ## Research Idea
 
@@ -120,7 +130,12 @@ either to `0` disables that split (not recommended for paper-grade runs).
 ```bash
 bash setup_env.sh
 bash run_project.sh --dry-run
-bash run_project.sh --profile smoke --controllers baseline,act,react,praxis
+# Full three-phase run (donor cohort harvest in Phase B):
+PRAXIS_RESET_BANK=1 bash run_project.sh --profile smoke
+# Override the donor cohort:
+DONOR_CONTROLLERS=act,react,cot bash run_project.sh --profile smoke
+# Skip a phase (e.g. re-score baselines only):
+RUN_PHASE_B=0 RUN_PHASE_C=0 bash run_project.sh --profile smoke
 ```
 
 For quick signal, use at least `50x1`:

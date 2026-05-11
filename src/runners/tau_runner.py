@@ -39,7 +39,11 @@ from ..rex.pipeline import promote_records as pipeline_promote_records
 from ..rex.retrieval_logging import aggregate_logs
 
 
-AGENT_CHOICES = ["baseline", "act", "react", "rex", "praxis"]
+AGENT_CHOICES = [
+    "baseline", "act", "react",        # evaluation baselines
+    "cot", "plan-solve", "reflexion-lite",  # donor-only controllers (Phase B)
+    "rex", "praxis",
+]
 
 
 def _try_install_litellm_patch() -> None:
@@ -112,6 +116,15 @@ def _resolve_agent_cls(kind: str):
     if kind == "react":
         from ..baselines.agents import ReActAgent
         return ReActAgent
+    if kind == "cot":
+        from ..baselines.agents import CoTAgent
+        return CoTAgent
+    if kind == "plan-solve":
+        from ..baselines.agents import PlanSolveAgent
+        return PlanSolveAgent
+    if kind == "reflexion-lite":
+        from ..baselines.agents import ReflexionLiteAgent
+        return ReflexionLiteAgent
     if kind in ("rex", "praxis"):
         from ..rex.agent import RexAgent
         return RexAgent

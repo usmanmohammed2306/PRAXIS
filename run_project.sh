@@ -144,6 +144,42 @@ DRY_RUN="${DRY_RUN:-0}"
 PRAXIS_PREWARM="${PRAXIS_PREWARM:-${REX_PREWARM:-0}}"
 REX_PREWARM="$PRAXIS_PREWARM"  # keep backward-compat alias
 
+# ---------------------------------------------------------------------------
+# Three-phase architecture (Phase A → Phase B → Phase C).
+#
+#   PHASE A — Baseline evaluation (CLEAN, no recording)
+#     Run every controller in $EVAL_CONTROLLERS on the held-out TEST split
+#     with --promote-runtime-memory=never. Their metrics are reported as-is
+#     and their trajectories are NEVER distilled.
+#
+#   PHASE B — Experience harvest (donor cohort, TRAIN only)
+#     Run every controller in $DONOR_CONTROLLERS on the TRAIN split (or the
+#     train slice of the internal split) with --promote-runtime-memory=auto.
+#     Each donor contributes Process Memory Cards from a different prompting
+#     prior so PRAXIS reasons from a *diverse* experience pool rather than
+#     learning only from itself or one ReAct baseline.
+#
+#   PHASE C — PRAXIS evaluation
+#     With the warm, diverse bank from Phase B, PRAXIS runs on the TEST
+#     split. Promotion stays gated on test, so it cannot leak.
+#
+# Defaults:
+#   EVAL_CONTROLLERS  = baseline,act,react              (paper baselines)
+#   DONOR_CONTROLLERS = act,react,cot,plan-solve,reflexion-lite,praxis
+#                       (diverse prompting priors; praxis self-donates on
+#                        train so its bank also captures its own successes)
+#
+# Override via env vars. Setting RUN_PHASE_A=0 / RUN_PHASE_B=0 / RUN_PHASE_C=0
+# skips that phase (useful for re-running just one piece).
+EVAL_CONTROLLERS="${EVAL_CONTROLLERS:-baseline,act,react}"
+DONOR_CONTROLLERS="${DONOR_CONTROLLERS:-act,react,cot,plan-solve,reflexion-lite,praxis}"
+RUN_PHASE_A="${RUN_PHASE_A:-1}"
+RUN_PHASE_B="${RUN_PHASE_B:-1}"
+RUN_PHASE_C="${RUN_PHASE_C:-1}"
+# PRAXIS_RESET_BANK=1 wipes REX_RUNTIME_DIR before Phase B so the donor
+# harvest writes into a clean bank (recommended for paper-grade runs).
+PRAXIS_RESET_BANK="${PRAXIS_RESET_BANK:-0}"
+
 # Per-knob overrides (these take precedence over the profile).
 TAU_END_INDEX_OPT=""
 TAU_NUM_TRIALS_OPT=""
@@ -996,82 +1032,78 @@ run_bfcl () {
 #
 # Enable with --praxis-prewarm or PRAXIS_PREWARM=1.
 # ---------------------------------------------------------------------------
-if [[ "$PRAXIS_PREWARM" == "1" ]] && [[ "$CONTROLLERS_OPT" == *"praxis"* || "$CONTROLLERS_OPT" == *"rex"* ]]; then
-  # --- Retail prewarm (upstream train split) -------------------------------
-  if [[ "${TAU_ONLY:-}" != "airline" ]]; then
-    log "PRE-WARM: running praxis on retail/train to seed experience bank..."
-    if python -m src.runners.tau_runner \
-        --env retail --agent praxis \
-        --model "$SERVED_NAME" --user-model "$SERVED_NAME" \
-        --task-split train \
-        --promote-runtime-memory auto \
-        --start-index 0 --end-index "$TAU_END_INDEX" \
-        --num-trials 1 \
-        --max-concurrency "$TAU_MAX_CONCURRENCY" \
-        --temperature "$TAU_TEMPERATURE" \
-        --max-num-steps "$TAU_MAX_STEPS" \
-        --runtime-dir "$REX_RUNTIME_DIR" \
-        --output-dir "$OUTPUTS_DIR/prewarm_retail_praxis"; then
-      log "PRE-WARM OK: experience bank seeded from retail/train"
-    else
-      log "WARNING: pre-warm failed — continuing with cold-start praxis"
+# ---------------------------------------------------------------------------
+# Phase B donor helpers — run a single non-PRAXIS controller on the TRAIN
+# slice of a benchmark and distill its trajectories into the shared
+# experience bank. These are only used during Phase B (experience harvest);
+# Phase A and Phase C use the standard run_tau / run_bfcl functions.
+# ---------------------------------------------------------------------------
+run_tau_donor () {
+  local env_name="$1" donor="$2"
+  local out="$OUTPUTS_DIR/donor_${env_name}_${donor}"
+  mkdir -p "$out"
+  log "Phase B donor: env=$env_name agent=$donor -> $out"
+
+  local split_arg internal_end_arg=() start_idx end_idx
+  if [[ "$env_name" == "retail" ]]; then
+    split_arg="train"
+    start_idx=0
+    end_idx="$TAU_END_INDEX"
+  else  # airline
+    split_arg="test"
+    internal_end_arg=(--internal-train-end "$AIRLINE_TRAIN_END")
+    start_idx=0
+    end_idx="$AIRLINE_TRAIN_END"
+    if [[ "$end_idx" -le 0 ]]; then
+      log "Phase B donor: AIRLINE_TRAIN_END<=0; skipping $env_name/$donor"
+      return 0
     fi
   fi
 
-  # --- Airline prewarm (internal split: indices [0, AIRLINE_TRAIN_END)) ----
-  # Airline only ships a "test" split upstream, so we partition it ourselves.
-  # Pre-warm reads the train slice; the eval pass (above in run_tau) skips
-  # past AIRLINE_TRAIN_END so PRAXIS is never evaluated on the same tasks it
-  # learned from.
-  if [[ "${TAU_ONLY:-}" != "retail" && "$AIRLINE_TRAIN_END" -gt 0 ]]; then
-    log "PRE-WARM: running praxis on airline train slice [0, $AIRLINE_TRAIN_END)..."
-    if python -m src.runners.tau_runner \
-        --env airline --agent praxis \
-        --model "$SERVED_NAME" --user-model "$SERVED_NAME" \
-        --task-split test \
-        --internal-train-end "$AIRLINE_TRAIN_END" \
-        --promote-runtime-memory auto \
-        --start-index 0 --end-index "$AIRLINE_TRAIN_END" \
-        --num-trials 1 \
-        --max-concurrency "$TAU_MAX_CONCURRENCY" \
-        --temperature "$TAU_TEMPERATURE" \
-        --max-num-steps "$TAU_MAX_STEPS" \
-        --runtime-dir "$REX_RUNTIME_DIR" \
-        --output-dir "$OUTPUTS_DIR/prewarm_airline_praxis"; then
-      log "PRE-WARM OK: experience bank seeded from airline train slice"
-    else
-      log "WARNING: airline pre-warm failed — continuing with cold-start praxis"
-    fi
+  if python -m src.runners.tau_runner \
+      --env "$env_name" --agent "$donor" \
+      --model "$SERVED_NAME" --user-model "$SERVED_NAME" \
+      --task-split "$split_arg" \
+      --promote-runtime-memory auto \
+      --start-index "$start_idx" --end-index "$end_idx" \
+      "${internal_end_arg[@]}" \
+      --num-trials 1 \
+      --max-concurrency "$TAU_MAX_CONCURRENCY" \
+      --temperature "$TAU_TEMPERATURE" \
+      --max-num-steps "$TAU_MAX_STEPS" \
+      --runtime-dir "$REX_RUNTIME_DIR" \
+      --output-dir "$out"; then
+    log "Phase B donor OK: $env_name/$donor"
+  else
+    log "WARNING: Phase B donor FAILED: $env_name/$donor (continuing)"
   fi
+}
 
-  # --- BFCL prewarm (internal per-category split: first BFCL_TRAIN_FRACTION)
-  # awk fallback: bc may not be installed on minimal containers.
-  _BFCL_HAS_TRAIN="$(awk -v x="$BFCL_TRAIN_FRACTION" 'BEGIN{print (x>0)?1:0}')"
-  if [[ "$SKIP_BFCL" != "1" && "$_BFCL_HAS_TRAIN" == "1" ]]; then
-    log "PRE-WARM: running praxis on BFCL train slice (fraction=$BFCL_TRAIN_FRACTION)..."
-    if python -m src.runners.bfcl_runner \
-        --agent praxis --model "$SERVED_NAME" \
-        --data-dir "$BFCL_DATA_DIR" \
-        --categories "$BFCL_CATEGORIES" \
-        --limit "$BFCL_LIMIT" \
-        --max-num-steps "$BFCL_MAX_STEPS" \
-        --max-concurrency "$BFCL_MAX_CONCURRENCY" \
-        --promote-runtime-memory auto \
-        --train-fraction "$BFCL_TRAIN_FRACTION" \
-        --task-split train \
-        --runtime-dir "$REX_RUNTIME_DIR" \
-        --output-dir "$OUTPUTS_DIR/prewarm_bfcl_praxis"; then
-      log "PRE-WARM OK: experience bank seeded from BFCL train slice"
-    else
-      log "WARNING: BFCL pre-warm failed — continuing with cold-start praxis"
-    fi
+run_bfcl_donor () {
+  local donor="$1"
+  local out="$OUTPUTS_DIR/donor_bfcl_${donor}"
+  mkdir -p "$out"
+  log "Phase B donor: bfcl agent=$donor -> $out"
+  if python -m src.runners.bfcl_runner \
+      --agent "$donor" --model "$SERVED_NAME" \
+      --data-dir "$BFCL_DATA_DIR" \
+      --categories "$BFCL_CATEGORIES" \
+      --limit "$BFCL_LIMIT" \
+      --max-num-steps "$BFCL_MAX_STEPS" \
+      --max-concurrency "$BFCL_MAX_CONCURRENCY" \
+      --promote-runtime-memory auto \
+      --train-fraction "$BFCL_TRAIN_FRACTION" \
+      --task-split train \
+      --runtime-dir "$REX_RUNTIME_DIR" \
+      --output-dir "$out"; then
+    log "Phase B donor OK: bfcl/$donor"
+  else
+    log "WARNING: Phase B donor FAILED: bfcl/$donor (continuing)"
   fi
-fi
+}
 
 # ---------------------------------------------------------------------------
-# Filtered run list: which controllers and which benchmarks to execute.
-# (REQUESTED_CONTROLLERS and the --tau-only / --controllers values were
-# already validated near the top of the script.)
+# Tau-bench env list (shared by Phase A and Phase C).
 # ---------------------------------------------------------------------------
 case "${TAU_ONLY:-}" in
   ""|"both") TAU_ENVS=("retail" "airline") ;;
@@ -1079,23 +1111,112 @@ case "${TAU_ONLY:-}" in
   airline)   TAU_ENVS=("airline") ;;
 esac
 
-for env_name in "${TAU_ENVS[@]}"; do
-  for c in "${REQUESTED_CONTROLLERS[@]}"; do
-    c="$(echo "$c" | tr -d '[:space:]')"
-    [[ -z "$c" ]] && continue
-    run_tau "$env_name" "$c"
-  done
-done
+# Comma-split helpers.
+IFS=',' read -r -a EVAL_LIST  <<<"$EVAL_CONTROLLERS"
+IFS=',' read -r -a DONOR_LIST <<<"$DONOR_CONTROLLERS"
 
-# BFCL V4 cells (controller-only; no per-env axis).
-if [[ "$SKIP_BFCL" != "1" ]]; then
-  for c in "${REQUESTED_CONTROLLERS[@]}"; do
-    c="$(echo "$c" | tr -d '[:space:]')"
-    [[ -z "$c" ]] && continue
-    run_bfcl "$c"
+# ===========================================================================
+# PHASE A — Baseline evaluation (CLEAN, no recording)
+# ===========================================================================
+# Every controller in $EVAL_CONTROLLERS runs on the held-out TEST split.
+# run_tau / run_bfcl set --promote-runtime-memory=never for non-PRAXIS agents,
+# so these trajectories are scored and discarded. PRAXIS is intentionally
+# NOT in this list — its evaluation happens in Phase C after the bank has
+# been populated.
+# ---------------------------------------------------------------------------
+if [[ "$RUN_PHASE_A" == "1" ]]; then
+  log "=================================================================="
+  log "PHASE A — Baseline evaluation on TEST (no recording)"
+  log "  controllers: $EVAL_CONTROLLERS"
+  log "=================================================================="
+  for env_name in "${TAU_ENVS[@]}"; do
+    for c in "${EVAL_LIST[@]}"; do
+      c="$(echo "$c" | tr -d '[:space:]')"
+      [[ -z "$c" ]] && continue
+      [[ "$c" == "praxis" || "$c" == "rex" ]] && continue   # Phase C only
+      run_tau "$env_name" "$c"
+    done
   done
+  if [[ "$SKIP_BFCL" != "1" ]]; then
+    for c in "${EVAL_LIST[@]}"; do
+      c="$(echo "$c" | tr -d '[:space:]')"
+      [[ -z "$c" ]] && continue
+      [[ "$c" == "praxis" || "$c" == "rex" ]] && continue
+      run_bfcl "$c"
+    done
+  else
+    log "Phase A: skipping BFCL cells (--skip-bfcl)."
+  fi
 else
-  log "Skipping BFCL cells (--skip-bfcl)."
+  log "Phase A skipped (RUN_PHASE_A=0)."
+fi
+
+# ===========================================================================
+# PHASE B — Experience harvest from a diverse donor cohort
+# ===========================================================================
+# Every controller in $DONOR_CONTROLLERS runs on the TRAIN slice with
+# --promote-runtime-memory=auto. Cards from each donor accumulate in
+# $REX_RUNTIME_DIR. The diversity of prompting priors (act, react, cot,
+# plan-solve, reflexion-lite, plus PRAXIS itself for self-experience)
+# widens the procedural-memory pool beyond what a single baseline can
+# provide. Run-level and record-level gates keep TEST records out.
+# ---------------------------------------------------------------------------
+if [[ "$RUN_PHASE_B" == "1" ]]; then
+  # Optional clean slate so the donor harvest writes into an empty bank.
+  if [[ "$PRAXIS_RESET_BANK" == "1" ]]; then
+    log "PHASE B: PRAXIS_RESET_BANK=1 — clearing $REX_RUNTIME_DIR"
+    rm -rf "$REX_RUNTIME_DIR" && mkdir -p "$REX_RUNTIME_DIR"
+  fi
+
+  log "=================================================================="
+  log "PHASE B — Donor-cohort experience harvest on TRAIN"
+  log "  donors: $DONOR_CONTROLLERS"
+  log "  bank  : $REX_RUNTIME_DIR"
+  log "=================================================================="
+  # Tau-bench donors
+  for env_name in "${TAU_ENVS[@]}"; do
+    for d in "${DONOR_LIST[@]}"; do
+      d="$(echo "$d" | tr -d '[:space:]')"
+      [[ -z "$d" ]] && continue
+      [[ "$d" == "baseline" ]] && d="baseline"  # alias kept for clarity
+      run_tau_donor "$env_name" "$d"
+    done
+  done
+  # BFCL donors
+  _BFCL_HAS_TRAIN="$(awk -v x="$BFCL_TRAIN_FRACTION" 'BEGIN{print (x>0)?1:0}')"
+  if [[ "$SKIP_BFCL" != "1" && "$_BFCL_HAS_TRAIN" == "1" ]]; then
+    for d in "${DONOR_LIST[@]}"; do
+      d="$(echo "$d" | tr -d '[:space:]')"
+      [[ -z "$d" ]] && continue
+      run_bfcl_donor "$d"
+    done
+  else
+    log "Phase B: skipping BFCL donors (skip-bfcl or BFCL_TRAIN_FRACTION=0)."
+  fi
+else
+  log "Phase B skipped (RUN_PHASE_B=0) — PRAXIS will evaluate cold-start."
+fi
+
+# ===========================================================================
+# PHASE C — PRAXIS evaluation on TEST (warm bank from Phase B)
+# ===========================================================================
+# With the bank populated by Phase B, PRAXIS now runs on the held-out TEST
+# split. The promotion gate stays on, so PRAXIS cannot learn from its own
+# eval; any train-slice trajectories it produces (in mixed airline runs)
+# are still eligible. Results are reported alongside Phase A baselines.
+# ---------------------------------------------------------------------------
+if [[ "$RUN_PHASE_C" == "1" ]]; then
+  log "=================================================================="
+  log "PHASE C — PRAXIS evaluation on TEST (warm bank)"
+  log "=================================================================="
+  for env_name in "${TAU_ENVS[@]}"; do
+    run_tau "$env_name" "praxis"
+  done
+  if [[ "$SKIP_BFCL" != "1" ]]; then
+    run_bfcl "praxis"
+  fi
+else
+  log "Phase C skipped (RUN_PHASE_C=0)."
 fi
 
 # ---------------------------------------------------------------------------

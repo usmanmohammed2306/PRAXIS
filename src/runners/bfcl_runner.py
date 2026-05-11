@@ -329,6 +329,15 @@ def _resolve_agent_cls(kind: str):
     if kind == "react":
         from ..baselines.agents import ReActAgent
         return ReActAgent
+    if kind == "cot":
+        from ..baselines.agents import CoTAgent
+        return CoTAgent
+    if kind == "plan-solve":
+        from ..baselines.agents import PlanSolveAgent
+        return PlanSolveAgent
+    if kind == "reflexion-lite":
+        from ..baselines.agents import ReflexionLiteAgent
+        return ReflexionLiteAgent
     if kind in ("rex", "praxis"):
         from ..rex.agent import RexAgent
         return RexAgent
@@ -613,7 +622,9 @@ def _promote_bfcl_records(
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("bfcl_runner", description="BFCL V4 evaluation runner")
     p.add_argument("--agent", default="baseline",
-                   choices=["baseline", "act", "react", "rex", "praxis"])
+                   choices=["baseline", "act", "react",
+                            "cot", "plan-solve", "reflexion-lite",
+                            "rex", "praxis"])
     p.add_argument("--model", default="qwen-agent")
     p.add_argument("--model-provider", dest="model_provider", default="openai")
     p.add_argument("--temperature", type=float, default=0.0)

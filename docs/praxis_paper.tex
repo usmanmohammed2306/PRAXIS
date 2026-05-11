@@ -50,11 +50,17 @@ BM25$+$TF-IDF retriever with domain and quality boosts, and renders
 them into a bounded \emph{Tactical Playbook} injected into the
 system prompt. Every \emph{mutating} tool call is additionally guarded
 by a SABER-style reflection pass that asks the same model whether
-the observed evidence confirms the action. We benchmark PRAXIS
-against three controller baselines---vanilla tool-calling, Act-only,
-and ReAct---on $\tau$-bench retail, $\tau$-bench airline, and
-BFCL~V4, with all four controllers sharing the same frozen base
-model, temperature, tool schemas, and step budget. A three-layer
+the observed evidence confirms the action. Critically, PRAXIS's
+bank is not populated by self-distillation alone: a \emph{diverse
+donor cohort} of prompting-only controllers---Act, ReAct,
+Chain-of-Thought, Plan-and-Solve, and Reflexion-lite---runs on the
+training split, so the procedural memory captures patterns no
+single prior would yield. We benchmark PRAXIS against vanilla
+tool-calling, Act-only, and ReAct on $\tau$-bench retail,
+$\tau$-bench airline, and BFCL~V4, with all controllers sharing the
+same frozen base model, temperature, tool schemas, and step budget,
+in a three-phase protocol (baseline evaluation, donor harvest,
+PRAXIS evaluation). A three-layer
 train/test fairness protocol (run-level promotion gate, per-record
 split tag, and pre-warm separation) ensures that PRAXIS's memory is
 populated exclusively from training-pool trajectories and never from
@@ -277,26 +283,106 @@ The thresholds $T$ and $f$ are configurable
 (\texttt{AIRLINE\_TRAIN\_END}, \texttt{BFCL\_TRAIN\_FRACTION}) and
 are recorded in the run summary for reproducibility.
 
+\section{Three-Phase Execution Protocol}\label{sec:phases}
+
+A subtle confound in any retrieval-augmented controller comparison
+is that the retrieval-augmented condition \emph{also} sees its
+training data at inference time. We avoid this confound by
+factoring the run into three explicit phases (Fig.~\ref{fig:phases})
+which are enforced by the runner script:
+
+\begin{enumerate}
+  \item \textbf{Phase A --- Baseline evaluation (no recording).}
+    Each \emph{evaluation} controller (\texttt{baseline},
+    \texttt{act}, \texttt{react}) is scored on the held-out TEST
+    slice with \texttt{--promote-runtime-memory=never}. Their
+    trajectories are reported but \emph{never} distilled into the
+    memory bank. PRAXIS does \emph{not} appear in this phase.
+
+  \item \textbf{Phase B --- Donor-cohort experience harvest.} A
+    \emph{diverse} pool of donor controllers runs on the TRAIN
+    slice with \texttt{--promote-runtime-memory=auto}. The default
+    cohort is $\{\texttt{act}, \texttt{react}, \texttt{cot},
+    \texttt{plan-solve}, \texttt{reflexion-lite}, \texttt{praxis}\}$.
+    Each donor contributes Process Memory Cards from a distinct
+    prompting prior; cards accumulate (deduplicated, quality-scored)
+    in the shared bank. The donor cohort is configurable via the
+    \texttt{DONOR\_CONTROLLERS} environment variable.
+
+  \item \textbf{Phase C --- PRAXIS evaluation.} With the warm,
+    diverse bank from Phase B, PRAXIS is scored on the same TEST
+    slice the Phase A baselines saw. Promotion remains gated on
+    test (Section~\ref{sec:fairness}), so PRAXIS cannot learn from
+    its own evaluation.
+\end{enumerate}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.92\columnwidth}{\centering\small
+\textbf{Phase A}\ (TEST, no recording) \\
+$\{$baseline, act, react$\}$ $\;\longrightarrow$ metrics \\[4pt]
+\textbf{Phase B}\ (TRAIN, donor harvest) \\
+$\{$act, react, cot, plan-solve, reflexion-lite, praxis$\}$ \\
+$\longrightarrow$ distill $\longrightarrow$ Memory Bank \\[4pt]
+\textbf{Phase C}\ (TEST, warm bank) \\
+praxis $\longrightarrow$ metrics
+}}
+\caption{Three-phase execution protocol. Phase A and Phase C
+operate on the same held-out test set, ensuring a like-for-like
+comparison; Phase B is strictly confined to the train slice.}
+\label{fig:phases}
+\end{figure}
+
+\subsection{Why a diverse donor cohort?}
+
+A self-distilling agent that learns only from its own trajectories
+exhibits two pathologies: (i)~it amplifies its own biases, since
+every card it stores reflects the same prompting prior; and
+(ii)~it has no path to discover procedures that its own prior
+makes inaccessible. By harvesting from a heterogeneous cohort that
+spans short-form Act, ReAct's interleaved reasoning, Chain-of-Thought's
+verbose plans, Plan-and-Solve's explicit sub-goal structure, and
+Reflexion-lite's per-step self-critique, the bank acquires
+procedural patterns that no single donor could produce alone.
+PRAXIS itself participates as a donor on TRAIN so its own
+successes also enter the bank.
+
 \section{Experimental Setup}
 
 \subsection{Base Model and Controllers}
 
-All four controllers share one frozen base LLM served via an
-OpenAI-compatible local endpoint. The four conditions are:
+All controllers share one frozen base LLM served via an
+OpenAI-compatible local endpoint. We distinguish two roles:
 
+\paragraph{Evaluation controllers (Phase A and C)}
 \begin{itemize}
   \item \textbf{baseline} --- vanilla native tool-calling with a
     minimal policy prompt.
-  \item \textbf{act} --- Act-only ablation: tool calls without any
-    reasoning prose.
+  \item \textbf{act} --- Act-only ablation~\cite{react}: tool
+    calls without any reasoning prose.
   \item \textbf{react} --- ReAct~\cite{react}: a single short
     \texttt{Thought:} before each tool call.
   \item \textbf{praxis} --- PRAXIS controller as described in
-    Section~\ref{sec:method}.
+    Section~\ref{sec:method} (Phase C only).
 \end{itemize}
 
+\paragraph{Donor-only controllers (Phase B)}
+\begin{itemize}
+  \item \textbf{cot} --- Chain-of-Thought~\cite{cot}: a short
+    numbered reasoning chain before the first tool call of each
+    sub-task.
+  \item \textbf{plan-solve} --- Plan-and-Solve~\cite{plansolve}:
+    an explicit numbered plan up front, with revisions when
+    observations invalidate it.
+  \item \textbf{reflexion-lite} --- in-episode variant of
+    Reflexion~\cite{reflexion}: a one-line ``Reflect:'' note
+    after every tool observation.
+\end{itemize}
+
+Donor-only controllers exist solely to widen the experience pool
+and are not reported in the main results table.
 Temperature, maximum steps per task, tool schemas, and the
-litellm-truncation patch are identical across conditions.
+litellm-truncation patch are identical across all controllers.
 
 \subsection{Benchmarks and Metrics}
 
@@ -471,6 +557,16 @@ Information Retrieval}, vol.~3, no.~4, pp.~333--389, 2009.
 \bibitem{toolformer}
 T. Schick \textit{et al.}, ``Toolformer: Language models can teach
 themselves to use tools,'' in \emph{Proc. NeurIPS}, 2023.
+
+\bibitem{cot}
+J. Wei \textit{et al.}, ``Chain-of-thought prompting elicits
+reasoning in large language models,'' in \emph{Proc. NeurIPS},
+2022.
+
+\bibitem{plansolve}
+L. Wang \textit{et al.}, ``Plan-and-Solve prompting: Improving
+zero-shot chain-of-thought reasoning by large language models,''
+in \emph{Proc. ACL}, 2023.
 
 \end{thebibliography}
 
